@@ -1,0 +1,10 @@
+#compdef get_app_mem
+
+_get_app_mem() {
+  autoload -Uz _comp_process_names
+  _arguments -S \
+    '(-h --help)'{-h,--help}'[pokaż help]' \
+    '1:process/pattern:_comp_process_names'
+}
+
+_get_app_mem "$@"

@@ -1,0 +1,21 @@
+#compdef jlog
+
+_jlog() {
+  autoload -Uz _comp_user_services
+
+  if (( CURRENT == 2 )); then
+    _arguments -S \
+      '(-h --help)'{-h,--help}'[pokaż help]' \
+      '1:user service:_comp_user_services'
+    return
+  fi
+
+  _arguments -S \
+    '(-h --help)'{-h,--help}'[pokaż help]'
+
+  if (( CURRENT > 2 )); then
+    _message 'jlog przyjmuje tylko jeden argument: nazwę user service'
+  fi
+}
+
+_jlog "$@"

@@ -1,0 +1,9 @@
+#compdef branchclear
+
+_branchclear() {
+  _arguments \
+    '(-h --help)'{-h,--help}'[pokaż help]' \
+    '(-f --force)'{-f,--force}'[force remove worktree jeśli potrzebne]'
+}
+
+_branchclear "$@"

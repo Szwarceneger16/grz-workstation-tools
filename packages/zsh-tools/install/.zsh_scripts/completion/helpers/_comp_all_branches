@@ -1,0 +1,12 @@
+_comp_all_branches() {
+  local -a loc rem out
+  loc=(${(f)"$(git for-each-ref --format='%(refname:short)' refs/heads 2>/dev/null | sort -u)"})
+  rem=(${(f)"$(
+    git for-each-ref --format='%(refname:short)' refs/remotes/origin 2>/dev/null \
+    | sed 's#^origin/##' \
+    | grep -v '^HEAD$' \
+    | sort -u
+  )"})
+  out=(${(u)loc} ${(u)rem})
+  _describe -t branches 'branches' out
+}

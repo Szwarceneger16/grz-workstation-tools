@@ -1,3 +1,5 @@
+# shellcheck shell=sh
+# shellcheck disable=SC1090
 # Load per-module profile fragments.
 if [ -d "$HOME/.config/profile.d" ]; then
   for profile_file in "$HOME"/.config/profile.d/*.sh; do

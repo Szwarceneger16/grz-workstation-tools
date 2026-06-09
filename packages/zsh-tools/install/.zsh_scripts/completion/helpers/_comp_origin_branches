@@ -1,0 +1,11 @@
+
+_comp_origin_branches() {
+  local -a out
+  out=(${(f)"$(
+    git for-each-ref --format='%(refname:short)' refs/remotes/origin 2>/dev/null \
+    | sed 's#^origin/##' \
+    | grep -v '^HEAD$' \
+    | sort -u
+  )"})
+  _describe -t branches 'origin branches' out
+}

@@ -1,0 +1,62 @@
+#compdef battery-ac-watch
+
+local curcontext="$curcontext" state line
+typeset -A opt_args
+
+local -a battery_items interval_items
+local ps_entry battery_name battery_desc battery_vendor battery_model
+
+battery_items=()
+
+for ps_entry in /sys/class/power_supply/*(N); do
+  [[ -r "$ps_entry/type" ]] || continue
+  [[ "$(<"$ps_entry/type")" == 'Battery' ]] || continue
+
+  battery_name="${ps_entry:t}"
+  battery_vendor=''
+  battery_model=''
+  battery_desc='bateria z /sys/class/power_supply'
+
+  [[ -r "$ps_entry/manufacturer" ]] && battery_vendor="$(<"$ps_entry/manufacturer")"
+  [[ -r "$ps_entry/model_name" ]] && battery_model="$(<"$ps_entry/model_name")"
+
+  if [[ -n "$battery_vendor" || -n "$battery_model" ]]; then
+    battery_desc="${battery_vendor:+$battery_vendor }${battery_model}"
+  fi
+
+  battery_desc="${battery_desc//:/\\:}"
+  battery_items+=("${battery_name}:${battery_desc}")
+done
+
+interval_items=(
+  '0.5:szybkie odświeżanie'
+  '1:częste odświeżanie'
+  '2:domyślny interwał'
+  '5:spokojniejszy podgląd'
+  '10:długi interwał'
+)
+
+_arguments -s -S \
+  '(-h --help)'{-h,--help}'[pokaż help polecenia]' \
+  '(-i --interval)'{-i,--interval}'[interwał odświeżania w sekundach]:sekundy:->interval' \
+  '(-b --battery)'{-b,--battery}'[wybierz konkretną baterię]:bateria:->battery' \
+  '--once[pokaż pojedynczy odczyt i zakończ działanie]' \
+  '*::arg:->extra'
+
+case "$state" in
+  interval)
+    _describe -t intervals 'interwały' interval_items
+    ;;
+  battery)
+    if (( ${#battery_items} )); then
+      _describe -t batteries 'baterie' battery_items
+    else
+      _message 'brak wykrytych baterii w /sys/class/power_supply'
+    fi
+    ;;
+  extra)
+    _message 'to polecenie nie przyjmuje dodatkowych argumentów pozycyjnych'
+    ;;
+esac
+
+return 0

@@ -1,0 +1,12 @@
+#compdef zshreloadcomp
+
+_zshreloadcomp() {
+  _arguments -S \
+    '(-h --help)'{-h,--help}'[pokaż help]'
+
+  if (( CURRENT > 2 )); then
+    _message 'zshreloadcomp nie przyjmuje dodatkowych argumentów'
+  fi
+}
+
+_zshreloadcomp "$@"

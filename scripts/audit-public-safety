@@ -1,0 +1,18 @@
+#!/usr/bin/env zsh
+emulate -L zsh
+set -euo pipefail
+
+repo_root="${0:A:h:h}"
+scan_root="$repo_root/packages/zsh-tools/install"
+
+if command -v rg >/dev/null 2>&1; then
+  rg -n --hidden \
+    '(/home/user|BEGIN (OPENSSH|RSA|EC) PRIVATE KEY|API[_-]?KEY|access[_-]?token|refresh[_-]?token|password|passwd|secret)' \
+    "$scan_root" && exit 1 || true
+else
+  grep -RInE \
+    '(/home/user|BEGIN (OPENSSH|RSA|EC) PRIVATE KEY|API[_-]?KEY|access[_-]?token|refresh[_-]?token|password|passwd|secret)' \
+    "$scan_root" && exit 1 || true
+fi
+
+print -- 'audit-public-safety: ok'

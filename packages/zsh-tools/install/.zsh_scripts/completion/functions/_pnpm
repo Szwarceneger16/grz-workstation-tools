@@ -1,0 +1,93 @@
+#compdef pnpm
+###-begin-pnpm-completion-###
+if type compdef &>/dev/null; then
+  _pnpm_completion () {
+    emulate -L zsh
+    setopt noshwordsplit
+
+    local -a reply
+    local si=$IFS
+    local _pnpm_bin
+
+    # 1) Znajdź realną binarkę pnpm (Corepack > system PATH)
+    _pnpm_bin="$(corepack which pnpm 2>/dev/null)" || _pnpm_bin="$(command -v pnpm)"
+
+    # 2) Zapytaj completion-server o podpowiedzi
+    IFS=$'\n'
+    reply=($(
+      COMP_CWORD="$((CURRENT-1))" \
+      COMP_LINE="$BUFFER" \
+      COMP_POINT="$CURSOR" \
+      SHELL=zsh \
+      "$_pnpm_bin" completion-server -- "${words[@]}"
+    ))
+    IFS=$si
+
+    # 2.6) Krótkie aliasy dla popularnych subkomend (dopinka do odpowiedzi serwera)
+    # Działa tylko, gdy aktualny token zaczyna się od '-'
+    local _subcmd="${words[2]:-}"
+    if [[ "${words[CURRENT]}" == -* && -n "$_subcmd" ]]; then
+      # normalizacja aliasów subkomend
+      case "$_subcmd" in
+        rm)        _subcmd=remove ;;
+        up|upgrade) _subcmd=update ;;
+        i)         _subcmd=install ;;
+      esac
+
+      local -a _short_flags
+      case "$_subcmd" in
+        add)
+          # -D (--save-dev), -E (--save-exact), -P (--save-prod), -O (--save-optional)
+          # oraz typowe przełączniki pracy w monorepo
+          _short_flags=(-D -E -P -O -g -w -r -F)
+          ;;
+        remove)
+          _short_flags=(-g -w -r -F)
+          ;;
+        update)
+          # -L (--latest), -i (--interactive) + workspace’owe
+          _short_flags=(-L -i -w -r -F)
+          ;;
+        install)
+          # instalacja w workspace: bezpieczny zestaw
+          _short_flags=(-w -r -F)
+          ;;
+      esac
+
+      if (( ${#_short_flags[@]} )); then
+        reply+=("${(@)_short_flags}")
+        typeset -U reply   # usuń duplikaty
+      fi
+    fi
+
+    # 3) Obsłuż oba możliwe „znaczniki plików”
+    if [[ ${#reply[@]} -eq 1 && ( $reply[1] == "__tabtab_complete_files__" || $reply[1] == "_complete_files__" ) ]]; then
+      _files
+      return
+    fi
+
+    # 4) Jeśli pusto – fallback (statyczna lista najczęstszych komend)
+    if [[ ${#reply[@]} -eq 0 ]]; then
+      local -a fallback
+      fallback=(
+        add install i remove rm uninstall update up upgrade
+        dlx run exec create init link unlink list ls why
+        prune rebuild fetch install-test pack publish packlist
+        outdated audit config env setup store import deploy
+        ci dedupe migrate install-peers
+      )
+      compadd -a fallback
+      return
+    fi
+
+    # 5) Normalny opisany listing (jeśli serwer coś zwrócił)
+    compadd -a reply
+  }
+
+  if [[ $zsh_eval_context == *func ]]; then
+    _pnpm_completion "$@"
+  else
+    compdef _pnpm_completion pnpm
+  fi
+fi
+###-end-pnpm-completion-###

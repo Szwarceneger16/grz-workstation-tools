@@ -1,0 +1,56 @@
+#compdef make_icon_set
+
+_make_icon_set() {
+  local -a image_patterns
+  local src_file suggested_name
+
+  image_patterns=(
+    '*.png'
+    '*.svg'
+    '*.jpg'
+    '*.jpeg'
+    '*.webp'
+    '*.ico'
+    '*.bmp'
+    '*.tif'
+    '*.tiff'
+    '*.xpm'
+  )
+
+  if (( CURRENT == 2 )); then
+    _arguments -S \
+      '(-h --help)'{-h,--help}'[pokaż help]' \
+      '1:plik źródłowy:_files -g '"'"'*.png'"'"' -g '"'"'*.svg'"'"' -g '"'"'*.jpg'"'"' -g '"'"'*.jpeg'"'"' -g '"'"'*.webp'"'"' -g '"'"'*.ico'"'"' -g '"'"'*.bmp'"'"' -g '"'"'*.tif'"'"' -g '"'"'*.tiff'"'"' -g '"'"'*.xpm'"'"''
+    return
+  fi
+
+  if (( CURRENT == 3 )); then
+    src_file="${words[2]}"
+
+    _arguments -S \
+      '(-h --help)'{-h,--help}'[pokaż help]' \
+      '1:plik źródłowy:_files -g '"'"'*.png'"'"' -g '"'"'*.svg'"'"' -g '"'"'*.jpg'"'"' -g '"'"'*.jpeg'"'"' -g '"'"'*.webp'"'"' -g '"'"'*.ico'"'"' -g '"'"'*.bmp'"'"' -g '"'"'*.tif'"'"' -g '"'"'*.tiff'"'"' -g '"'"'*.xpm'"'"'' \
+      '2:nazwa ikony:->icon_name'
+
+    case "$state" in
+      icon_name)
+        suggested_name="${${src_file:t}%.*}"
+        if [[ -n "$suggested_name" && "$suggested_name" != "$src_file" ]]; then
+          compadd -Q -- "$suggested_name"
+        else
+          _message 'nazwa ikony'
+        fi
+        ;;
+    esac
+    return
+  fi
+
+  _arguments -S \
+    '(-h --help)'{-h,--help}'[pokaż help]'
+
+  if (( CURRENT > 3 )); then
+    _message 'make_icon_set przyjmuje tylko 2 argumenty: plik źródłowy i nazwę ikony'
+  fi
+}
+
+_make_icon_set "$@"

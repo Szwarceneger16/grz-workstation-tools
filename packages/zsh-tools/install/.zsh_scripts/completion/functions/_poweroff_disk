@@ -1,0 +1,10 @@
+#compdef poweroff_disk
+
+_poweroff_disk() {
+  autoload -Uz _comp_block_devices
+  _arguments -S \
+    '(-h --help)'{-h,--help}'[pokaż help]' \
+    '1:block device:_comp_block_devices'
+}
+
+_poweroff_disk "$@"

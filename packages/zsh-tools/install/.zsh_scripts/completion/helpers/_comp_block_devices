@@ -1,0 +1,5 @@
+_comp_block_devices() {
+  local -a out
+  out=(${(f)"$(lsblk -dpno NAME 2>/dev/null | sort -u)"})
+  _describe -t devices 'block device' out
+}

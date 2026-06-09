@@ -1,0 +1,10 @@
+#compdef gfr
+
+_gfr() {
+  autoload -Uz _comp_origin_branches
+  _arguments \
+    '(-h --help)'{-h,--help}'[pokaż help]' \
+    '1:branch:_comp_origin_branches'
+}
+
+_gfr "$@"

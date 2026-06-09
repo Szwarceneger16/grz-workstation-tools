@@ -1,0 +1,11 @@
+#compdef pnpmls
+
+_pnpmls() {
+  _arguments -S \
+    '(-h --help)'{-h,--help}'[pokaż help]' \
+    '1:pattern:_guard "[wzorzec]"' \
+    '2:depth:(0 1 2 3 4 5 10)'
+  ;;
+}
+
+_pnpmls "$@"

@@ -1,0 +1,9 @@
+#compdef clear_file_content
+
+_clear_file_content() {
+    _arguments -S \
+      '(-h --help)'{-h,--help}'[pokaż help]' \
+      '1:file:_files'
+}
+
+_clear_file_content "$@"

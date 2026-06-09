@@ -1,0 +1,120 @@
+#compdef cmdhelp
+
+emulate -L zsh
+setopt local_options noshwordsplit null_glob extended_glob bare_glob_qual
+
+local cmdhelp_root cmdhelp_functions_root cmdhelp_bin_root
+local file name word cur
+local has_list_option=0
+local first_non_option=""
+local -a topics scopes global_options post_topic_options
+
+cmdhelp_root="${__CMDHELP_ROOT:-$HOME/.zsh_scripts/cmdhelp}"
+cmdhelp_functions_root="${__CMDHELP_FUNCTIONS_ROOT:-$HOME/.zsh_scripts/functions}"
+cmdhelp_bin_root="${__CMDHELP_BIN_ROOT:-$HOME/.local/my-custom-bin}"
+
+topics=()
+
+if [[ -d "$cmdhelp_root/functions" ]]; then
+  for file in "$cmdhelp_root"/functions/*.help.zsh(.N) "$cmdhelp_root"/functions/*.md(.N); do
+    name="${file:t}"
+    name="${name%.help.zsh}"
+    name="${name%.md}"
+    topics+=("$name")
+  done
+fi
+
+if [[ -d "$cmdhelp_root/bin" ]]; then
+  for file in "$cmdhelp_root"/bin/*.help.zsh(.N) "$cmdhelp_root"/bin/*.md(.N); do
+    name="${file:t}"
+    name="${name%.help.zsh}"
+    name="${name%.md}"
+    topics+=("$name")
+  done
+fi
+
+if [[ -d "$cmdhelp_functions_root" ]]; then
+  for file in "$cmdhelp_functions_root"/*(.N); do
+    name="${file:t}"
+    name="${name%.zsh}"
+    topics+=("$name")
+  done
+fi
+
+topics+=("cmdhelp" "audit")
+
+if [[ -d "$cmdhelp_bin_root" ]]; then
+  for file in "$cmdhelp_bin_root"/*(N); do
+    [[ -x "$file" && ! -d "$file" ]] || continue
+    name="${file:t}"
+    topics+=("$name")
+  done
+fi
+
+topics=("${(@ou)topics}")
+
+scopes=(
+  "functions:function help scope"
+  "bin:binary help scope"
+)
+
+global_options=(
+  "--audit:run consistency audit"
+  "--help:show cmdhelp help"
+  "-h:show cmdhelp help"
+  "--less:render output through less"
+  "--list:list real entrypoints"
+  "-l:list real entrypoints"
+)
+
+post_topic_options=(
+  "--less:render output through less"
+)
+
+cur="${words[CURRENT]}"
+
+for word in "${words[@]:1:$(( CURRENT - 1 ))}"; do
+  case "$word" in
+    -l|--list)
+      has_list_option=1
+      ;;
+    -*)
+      ;;
+    *)
+      if [[ -z "$first_non_option" ]]; then
+        first_non_option="$word"
+      fi
+      ;;
+  esac
+done
+
+if (( has_list_option )); then
+  if [[ "$cur" == -* ]]; then
+    _describe -t cmdhelp-options "options" post_topic_options
+  else
+    _describe -t cmdhelp-scopes "list scopes" scopes
+  fi
+  return
+fi
+
+if (( CURRENT == 2 )); then
+  if [[ "$cur" == -* ]]; then
+    _describe -t cmdhelp-options "options" global_options
+  else
+    compadd -a topics
+  fi
+  return
+fi
+
+case "$first_non_option" in
+  audit|--audit)
+    if [[ "$cur" == -* ]]; then
+      _describe -t cmdhelp-options "options" post_topic_options
+    fi
+    ;;
+  *)
+    if [[ "$cur" == -* ]]; then
+      _describe -t cmdhelp-options "options" post_topic_options
+    fi
+    ;;
+esac

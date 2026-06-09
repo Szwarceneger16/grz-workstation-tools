@@ -1,0 +1,6 @@
+
+_comp_process_names() {
+  local -a out
+  out=(${(f)"$(ps -eo comm= 2>/dev/null | sort -u)"})
+  _describe -t procs 'process' out
+}

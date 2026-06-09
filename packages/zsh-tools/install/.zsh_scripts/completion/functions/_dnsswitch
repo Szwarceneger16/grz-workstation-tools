@@ -1,0 +1,26 @@
+#compdef dnsswitch
+
+_dnsswitch() {
+  local -a commands
+  commands=(
+    'status:pokaż bieżący stan DNS'
+    'current:alias dla status'
+    'list:wypisz dostępne profile'
+    'auto:wróć do DNS z DHCP / routera'
+    'mullvad:czysty Mullvad DNS'
+    'mullvad-adblock:Mullvad z blokowaniem reklam / trackerów'
+    'mullvad-base:Mullvad Base'
+    'mullvad-extended:Mullvad Extended'
+    'mullvad-family:Mullvad Family'
+    'mullvad-all:Mullvad All'
+    'quad9:przełącz na Quad9'
+    'cloudflare:przełącz na Cloudflare'
+    '--help:pokaż help'
+    '-h:pokaż help'
+    'help:pokaż help'
+  )
+
+  _describe -t dnsswitch-commands 'dnsswitch commands' commands
+}
+
+_dnsswitch "$@"

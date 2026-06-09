@@ -1,0 +1,4 @@
+#compdef lsfp
+
+_arguments -s -S \
+  '(-h --help)'{-h,--help}'[pokaż pomoc]'
