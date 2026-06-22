@@ -2,7 +2,7 @@ dnsswitch() {
   emulate -L zsh -o pipefail
 
   local action="${1:-status}"
-  local conf_file="/etc/systemd/resolved.conf.d/90-dnsswitch.conf"
+  local conf_file="/etc/systemd/resolved.conf.d/99-dnsswitch.conf"
   local temp_file=""
   local status_excerpt=""
 
@@ -76,13 +76,17 @@ dnsswitch() {
   fi
 
   if [[ "$action" == 'auto' ]]; then
-    sudo rm -f -- "$conf_file" || return 1
+    sudo rm -f -- "$conf_file" \
+      /etc/systemd/resolved.conf.d/90-dnsswitch.conf || return 1
   else
     temp_file="$(mktemp)" || return 1
-    cat > "$temp_file" <<EOFCONF
+cat > "$temp_file" <<EOFCONF
 [Resolve]
-${profile_lines[$action]}
+DNS=
 FallbackDNS=
+Domains=
+
+${profile_lines[$action]}
 DNSSEC=no
 DNSOverTLS=yes
 Domains=~.
