@@ -41,7 +41,7 @@ dnsswitch cloudflare
 Komenda zapisuje albo usuwa plik:
 
 ```text
-/etc/systemd/resolved.conf.d/90-dnsswitch.conf
+/etc/systemd/resolved.conf.d/99-dnsswitch.conf
 ```
 
 Następnie:
