@@ -1,0 +1,21 @@
+#!/usr/bin/env zsh
+emulate -L zsh
+set -euo pipefail
+
+repo_root="${0:A:h:h}"
+ignore_all_file="$repo_root/manifests/ignore-all-install.txt"
+
+print -- "all-install ignored packages:"
+if [[ -f "$ignore_all_file" ]]; then
+  while IFS= read -r package || [[ -n "$package" ]]; do
+    [[ -z "$package" || "$package" == \#* ]] && continue
+    print -- "  $package"
+  done < "$ignore_all_file"
+fi
+
+print -- ""
+print -- "stow packages:"
+for package_path in "$repo_root"/stow/*(N); do
+  package="${package_path:t}"
+  print -- "  $package"
+done

@@ -1,0 +1,14 @@
+# System paths that a package manifest may never manage (install/uninstall).
+# One zsh glob per line, relative to / and without a leading slash.
+# Lines starting with # are comments. Empty file = nothing protected.
+#
+# These guard against a package accidentally clobbering credential or
+# certificate state. Add app-specific protected paths as needed, e.g.:
+#   etc/brother-cert-push/brother-cert-push.env
+#   var/lib/brother-cert-push
+#   var/lib/brother-cert-push/*
+
+etc/letsencrypt/live
+etc/letsencrypt/live/*
+etc/letsencrypt/archive
+etc/letsencrypt/archive/*
