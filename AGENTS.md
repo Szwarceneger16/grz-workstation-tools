@@ -52,14 +52,19 @@ Report only file path and category of concern — never print matching values.
 ## Repository layout
 
 ```text
-packages/<package>/install/         # source of truth for user (stow) files
-packages/<package>/system-install/  # source of truth for system files (sudo)
-stow/<package>                      # symlink -> ../packages/<package>/install
-manifests/ignore-all-install.txt    # packages excluded from `all`
-manifests/protected-system-paths.txt # paths a system manifest may never manage
-scripts/                            # repository helper scripts
-docs/                               # explanations, design notes
-bootstrap/                          # ~/.zshrc / ~/.profile snippets for users
+packages/<package>/install/             # source of truth for user (stow) files
+packages/<package>/system-install/      # source of truth for system files (sudo)
+packages/<package>/system-install.manifest   # files -> /  (rel_path mode owner group)
+packages/<package>/system-config.manifest    # required secret configs (dest mode owner group)
+packages/<package>/system-units.manifest     # systemd units to activate (one name per line)
+packages/<package>/*.hook.sh            # closed set of user-layer hooks (see rules)
+stow/<package>                          # symlink -> ../packages/<package>/install
+manifests/ignore-all-install.txt        # packages excluded from `all`
+manifests/protected-system-paths.txt    # paths a system manifest may never manage
+scripts/                                # repository helper scripts (incl. check-repo)
+githooks/pre-push                       # runs check-repo before push (opt-in via core.hooksPath)
+docs/                                   # explanations, design notes
+bootstrap/                              # ~/.zshrc / ~/.profile snippets for users
 ```
 
 File path mapping:
@@ -93,31 +98,38 @@ These commands modify live files in `$HOME`. Do not run them unless the user exp
 ```
 
 Package structure rules:
-- `packages/<package>/install` is the source of truth.
+- `packages/<package>/install` is the source of truth for the user layer.
 - `stow/<package>` must point to `../packages/<package>/install`.
 - `all` selects all packages under `stow/`, except names listed in `manifests/ignore-all-install.txt`.
 
-## Package hook rules
+## System layer rules (declarative)
 
-Packages may provide optional executable hook scripts:
+The privileged layer is **data, not code**. Describe it with manifests; do not hardcode
+package-specific behavior into `scripts/system-copy-select` or `run.sh`.
 
-| Hook | Trigger |
+- `system-install.manifest` — every file under `system-install/` must be listed (and vice versa).
+- `system-config.manifest` — real root-only secrets. The repo holds only `*.example`; the real
+  destination is never committed. At install the engine prompts for a path and copies with
+  `install` (it never reads the contents); empty answer = create in place with `sudoedit`.
+- `system-units.manifest` — units to activate. `.timer` → `enable --now`, `.service` → `start`;
+  uninstall reverses it.
+- There are **no system hooks**. If something privileged isn't expressible as a manifest, raise it
+  with the user rather than adding a sudo hook.
+
+## Package hook rules (user layer only)
+
+Hooks are an escape hatch for **user-session** steps only, recognised by a closed set of filenames
+(no manifest). `check-repo` rejects any other `*.hook.sh`.
+
+| Hook (in `packages/<pkg>/`) | Trigger |
 |---|---|
-| `packages/<pkg>/user-activate.sh` | `./run.sh activate <pkg>` |
-| `packages/<pkg>/user-deactivate.sh` | `./run.sh uninstall <pkg>` |
-| `packages/<pkg>/verify-installed.sh` | `./run.sh verify <pkg>` |
-| `packages/<pkg>/system-activate.sh` | `./run.sh activate <pkg>` (system layer, sudo) |
-| `packages/<pkg>/system-deactivate.sh` | `./run.sh uninstall <pkg>` (system layer) |
-| `packages/<pkg>/system-verify.sh` | `./run.sh verify <pkg>` (system layer) |
+| `user-activate.hook.sh` | `./run.sh activate <pkg>`, after system units, only when `STOW_TARGET=HOME` |
+| `user-deactivate.hook.sh` | `./run.sh uninstall <pkg>`, before files removed, only when `STOW_TARGET=HOME` |
+| `verify.hook.sh` | `./run.sh verify <pkg>`, after stow-link verification |
 
-Hooks receive environment variables: `GRZ_REPO_ROOT`, `GRZ_PACKAGE`, `STOW_TARGET`.
-The system-activate hook also receives `GRZ_CONFIG_SOURCE` (from `./run.sh activate --config PATH`).
-
-System hooks run under an already-active sudo session and may call `sudo`. Per-package
-systemd activation, config installation, and service teardown belong in these hooks — do not
-hardcode package-specific behavior into `scripts/system-copy-select`.
-
-Do not run these hooks directly to inspect them — prefer reading them.
+Rules: executable; run as the normal user with **no `sudo`**; idempotent; exit non-zero to abort;
+must live in the package root (never under `install/`). Hooks receive `GRZ_REPO_ROOT`,
+`GRZ_PACKAGE`, `STOW_TARGET`. Do not run hooks to inspect them — read them.
 
 ## Shell script rules
 
@@ -198,6 +210,9 @@ shellcheck path/to/script
 
 # Secrets
 ./scripts/audit-public-safety
+
+# Manifest/hook consistency (system layer + hooks)
+./scripts/check-repo
 
 # systemd
 systemd-analyze --user verify path/to/unit

@@ -22,7 +22,7 @@ trap finish_run_sudo_session EXIT
 usage() {
   print -u2 -- "usage: $script_name install [--verbose] [--verify] [--test] all|all-user|all-system|<package>"
   print -u2 -- "       $script_name uninstall [--verbose] all|all-user|all-system|<package>"
-  print -u2 -- "       $script_name activate [--config PATH] all|all-user|all-system|<package>"
+  print -u2 -- "       $script_name activate all|all-user|all-system|<package>"
   print -u2 -- "       $script_name verify all|all-user|all-system|<package>"
   print -u2 -- "       $script_name test all|all-user|all-system|<package>"
 }
@@ -234,7 +234,7 @@ verify_user_package() {
     return 1
   fi
 
-  hook="$repo_root/packages/$package/verify-installed.sh"
+  hook="$repo_root/packages/$package/verify.hook.sh"
   if [[ -f "$hook" ]]; then
     [[ -x "$hook" ]] || die "verify hook is not executable: $hook"
     GRZ_REPO_ROOT="$repo_root" GRZ_PACKAGE="$package" STOW_TARGET="$target" "$hook"
@@ -370,26 +370,174 @@ load_system_target_metadata() {
 
 run_user_activate_hook() {
   local package="$1"
-  local hook="$repo_root/packages/$package/user-activate.sh"
+  local hook="$repo_root/packages/$package/user-activate.hook.sh"
   [[ -f "$hook" ]] || return 0
   [[ -x "$hook" ]] || die "user-activate hook is not executable: $hook"
+  if [[ "$target" != "$HOME" ]]; then
+    print -- "Skipping user-activate hook for $package because STOW_TARGET is not HOME: $target"
+    return 0
+  fi
   GRZ_REPO_ROOT="$repo_root" GRZ_PACKAGE="$package" STOW_TARGET="$target" "$hook"
 }
 
 run_user_deactivate_hook() {
   local package="$1"
-  local hook="$repo_root/packages/$package/user-deactivate.sh"
+  local hook="$repo_root/packages/$package/user-deactivate.hook.sh"
   [[ -f "$hook" ]] || return 0
   [[ -x "$hook" ]] || die "user-deactivate hook is not executable: $hook"
+  if [[ "$target" != "$HOME" ]]; then
+    print -- "Skipping user-deactivate hook for $package because STOW_TARGET is not HOME: $target"
+    return 0
+  fi
   GRZ_REPO_ROOT="$repo_root" GRZ_PACKAGE="$package" STOW_TARGET="$target" "$hook"
 }
 
-run_system_verify_hook() {
+load_system_config_metadata() {
   local package="$1"
-  local hook="$repo_root/packages/$package/system-verify.sh"
-  [[ -f "$hook" ]] || return 0
-  [[ -x "$hook" ]] || die "system-verify hook is not executable: $hook"
-  GRZ_REPO_ROOT="$repo_root" GRZ_PACKAGE="$package" "$hook"
+  local manifest="$repo_root/packages/$package/system-config.manifest"
+  local line rel_path mode owner group extra normalized_mode
+  local line_no=0
+  typeset -gA config_modes config_owners config_groups
+  config_modes=()
+  config_owners=()
+  config_groups=()
+
+  [[ -f "$manifest" ]] || return 0
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line_no=$(( line_no + 1 ))
+    [[ -z "$line" || "$line" == \#* ]] && continue
+
+    rel_path=""
+    mode=""
+    owner=""
+    group=""
+    extra=""
+    read -r rel_path mode owner group extra <<< "$line"
+
+    [[ -n "$rel_path" && -n "$mode" && -n "$owner" && -n "$group" && -z "$extra" ]] ||
+      die "invalid system-config manifest line $manifest:$line_no"
+    [[ "$rel_path" != /* && "$rel_path" != *../* && "$rel_path" != ../* ]] ||
+      die "invalid system-config manifest path $manifest:$line_no: $rel_path"
+    normalized_mode="$(normalize_mode "$mode")" ||
+      die "invalid system-config manifest mode $manifest:$line_no: $mode"
+    [[ -z "${config_modes[$rel_path]-}" ]] ||
+      die "duplicate system-config manifest path $manifest:$line_no: $rel_path"
+
+    config_modes[$rel_path]="$normalized_mode"
+    config_owners[$rel_path]="$owner"
+    config_groups[$rel_path]="$group"
+  done < "$manifest"
+}
+
+load_system_units_metadata() {
+  local package="$1"
+  local manifest="$repo_root/packages/$package/system-units.manifest"
+  local line unit extra
+  local line_no=0
+  typeset -ga system_units
+  system_units=()
+
+  [[ -f "$manifest" ]] || return 0
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line_no=$(( line_no + 1 ))
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    unit=""
+    extra=""
+    read -r unit extra <<< "$line"
+    [[ -n "$unit" && -z "$extra" ]] ||
+      die "invalid system-units manifest line $manifest:$line_no"
+    [[ "$unit" != */* ]] ||
+      die "system-units manifest must list unit names, not paths $manifest:$line_no: $unit"
+    case "$unit" in
+      *.service|*.timer|*.path|*.socket|*.mount|*.target) ;;
+      *) die "unsupported unit type in system-units manifest $manifest:$line_no: $unit" ;;
+    esac
+    system_units+=("$unit")
+  done < "$manifest"
+}
+
+verify_system_config_paths() {
+  local package="$1"
+  local rel_path dest uid mode
+  local failures=0
+
+  load_system_config_metadata "$package"
+  (( ${#config_modes[@]} > 0 )) || return 0
+
+  for rel_path in "${(@k)config_modes}"; do
+    dest="/$rel_path"
+
+    if [[ ! -e "$dest" && ! -L "$dest" ]]; then
+      print -u2 -- "not ok - missing required config path: $dest"
+      failures=$(( failures + 1 ))
+      continue
+    fi
+    if [[ ! -f "$dest" || -L "$dest" ]]; then
+      print -u2 -- "not ok - config path is not a regular file: $dest"
+      failures=$(( failures + 1 ))
+      continue
+    fi
+    uid="$(stat -c '%u' -- "$dest" 2>/dev/null)" || {
+      print -u2 -- "not ok - cannot stat config owner: $dest"
+      failures=$(( failures + 1 ))
+      continue
+    }
+    mode="$(stat -c '%a' -- "$dest" 2>/dev/null)" || {
+      print -u2 -- "not ok - cannot stat config mode: $dest"
+      failures=$(( failures + 1 ))
+      continue
+    }
+    if [[ "$uid" != "0" ]]; then
+      print -u2 -- "not ok - config path must be owned by root: $dest"
+      failures=$(( failures + 1 ))
+      continue
+    fi
+    if (( (8#$mode & 8#077) != 0 )); then
+      print -u2 -- "not ok - config path must be root-only, for example mode 0600: $dest"
+      failures=$(( failures + 1 ))
+      continue
+    fi
+    print -- "ok - required root-only config path exists: $dest"
+  done
+
+  (( failures == 0 )) || return 1
+}
+
+verify_system_live_units() {
+  local package="$1"
+  local unit unit_path
+  local failures=0
+  typeset -a unit_paths
+  unit_paths=()
+
+  load_system_units_metadata "$package"
+  (( ${#system_units[@]} > 0 )) || return 0
+
+  for unit in "${system_units[@]}"; do
+    unit_path="/etc/systemd/system/$unit"
+    if [[ ! -f "$unit_path" || -L "$unit_path" ]]; then
+      print -u2 -- "not ok - missing live systemd unit for verification: $unit_path"
+      failures=$(( failures + 1 ))
+      continue
+    fi
+    unit_paths+=("$unit_path")
+  done
+
+  (( failures == 0 )) || return 1
+
+  command -v systemd-analyze >/dev/null 2>&1 || {
+    print -u2 -- "warn - systemd-analyze is unavailable; skipped live systemd verification for $package"
+    return 0
+  }
+
+  ensure_system_verify_sudo || return 1
+  print -- "Verifying live systemd units for $package with sudo"
+  sudo -n systemd-analyze verify "${unit_paths[@]}" || {
+    print -u2 -- "not ok - live systemd unit verification failed: $package"
+    return 1
+  }
 }
 
 verify_system_package() {
@@ -417,7 +565,12 @@ verify_system_package() {
       failures=$(( failures + 1 ))
   done
 
-  run_system_verify_hook "$package" || failures=$(( failures + 1 ))
+  if [[ "$verify_context" == "install" ]]; then
+    print -- "Skipping live config verification during install-time verify; activation creates it."
+  else
+    verify_system_config_paths "$package" || failures=$(( failures + 1 ))
+  fi
+  verify_system_live_units "$package" || failures=$(( failures + 1 ))
 
   if (( failures > 0 )); then
     finish_system_verify_sudo
@@ -674,22 +827,14 @@ run_system_action() {
 
 run_system_activation() {
   local selector="$1"
-  local config_source="$2"
   local system_selector
-  local config_args=()
 
   select_system_packages "$selector"
-  if (( ${#selected_system_packages[@]} == 0 )); then
-    [[ -z "$config_source" ]] || die "--config is only valid when activating a system package"
-    return 0
-  fi
+  (( ${#selected_system_packages[@]} > 0 )) || return 0
 
   system_selector="$(selector_system_arg "$selector")"
-  if [[ -n "$config_source" ]]; then
-    config_args=(--config "$config_source")
-  fi
   run_sudo_cleanup=1
-  GRZ_KEEP_SUDO_SESSION=1 "$repo_root/scripts/system-copy-select" activate "${config_args[@]}" -- "$system_selector"
+  GRZ_KEEP_SUDO_SESSION=1 "$repo_root/scripts/system-copy-select" activate -- "$system_selector"
 }
 
 parse_install() {
@@ -753,16 +898,10 @@ parse_install() {
 
 parse_activate() {
   local selector=""
-  local config_source=""
+  local package
 
   while (( $# > 0 )); do
     case "$1" in
-      --config)
-        shift
-        (( $# > 0 )) || die "--config requires a path"
-        [[ -z "$config_source" ]] || die "--config can be provided only once"
-        config_source="$1"
-        ;;
       --)
         shift
         (( $# == 1 )) || {
@@ -799,7 +938,7 @@ parse_activate() {
     *) validate_any_package "$selector" ;;
   esac
 
-  run_system_activation "$selector" "$config_source"
+  run_system_activation "$selector"
 
   select_user_packages "$selector"
   for package in "${selected_user_packages[@]}"; do
@@ -810,6 +949,7 @@ parse_activate() {
 parse_uninstall() {
   local selector=""
   local verbose=0
+  local package
 
   while (( $# > 0 )); do
     case "$1" in

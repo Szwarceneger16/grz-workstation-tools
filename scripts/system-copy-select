@@ -25,7 +25,7 @@ trap finish_sudo_session EXIT
 
 usage() {
   print -u2 -- "usage: $script_name install|uninstall [--verbose] all|all-system|<package>"
-  print -u2 -- "       $script_name activate [--config PATH] all|all-system|<package>"
+  print -u2 -- "       $script_name activate all|all-system|<package>"
 }
 
 die() {
@@ -401,33 +401,192 @@ collect_selected_files() {
   (( ${#batch_sources[@]} > 0 )) || die "no files selected for system copy"
 }
 
-run_system_activate_hooks() {
-  local package hook
-  local ran_any=0
+load_config_metadata() {
+  local package="$1"
+  local manifest="$packages_dir/$package/system-config.manifest"
+  local line rel_path mode owner group extra normalized_mode
+  local line_no=0
+  typeset -gA config_modes config_owners config_groups
+  config_modes=()
+  config_owners=()
+  config_groups=()
 
-  for package in "${selected_packages[@]}"; do
-    hook="$packages_dir/$package/system-activate.sh"
-    [[ -f "$hook" ]] || continue
-    [[ -x "$hook" ]] || die "system-activate hook is not executable: $hook"
-    ran_any=1
-    print -- "Running system-activate hook: $package"
-    GRZ_REPO_ROOT="$repo_root" GRZ_PACKAGE="$package" GRZ_CONFIG_SOURCE="$config_source" "$hook"
-  done
+  [[ -f "$manifest" ]] || return 0
 
-  if [[ -n "$config_source" ]] && (( ! ran_any )); then
-    die "--config was provided but no selected system package has a system-activate.sh hook"
-  fi
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line_no=$(( line_no + 1 ))
+    [[ -z "$line" || "$line" == \#* ]] && continue
+
+    rel_path=""
+    mode=""
+    owner=""
+    group=""
+    extra=""
+    read -r rel_path mode owner group extra <<< "$line"
+
+    [[ -n "$rel_path" && -n "$mode" && -n "$owner" && -n "$group" && -z "$extra" ]] ||
+      die "invalid system-config manifest line $manifest:$line_no"
+    [[ "$rel_path" != /* && "$rel_path" != *../* && "$rel_path" != ../* ]] ||
+      die "invalid system-config manifest path $manifest:$line_no: $rel_path"
+    normalized_mode="$(normalize_mode "$mode")" ||
+      die "invalid system-config manifest mode $manifest:$line_no: $mode"
+    [[ -z "${config_modes[$rel_path]-}" ]] ||
+      die "duplicate system-config manifest path $manifest:$line_no: $rel_path"
+
+    config_modes[$rel_path]="$normalized_mode"
+    config_owners[$rel_path]="$owner"
+    config_groups[$rel_path]="$group"
+  done < "$manifest"
 }
 
-run_system_deactivate_hooks() {
-  local package hook
+load_units_metadata() {
+  local package="$1"
+  local manifest="$packages_dir/$package/system-units.manifest"
+  local line unit extra
+  local line_no=0
+  typeset -ga system_units
+  system_units=()
 
+  [[ -f "$manifest" ]] || return 0
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line_no=$(( line_no + 1 ))
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    unit=""
+    extra=""
+    read -r unit extra <<< "$line"
+    [[ -n "$unit" && -z "$extra" ]] ||
+      die "invalid system-units manifest line $manifest:$line_no"
+    [[ "$unit" != */* ]] ||
+      die "system-units manifest must list unit names, not paths $manifest:$line_no: $unit"
+    case "$unit" in
+      *.service|*.timer|*.path|*.socket|*.mount|*.target) ;;
+      *) die "unsupported unit type in system-units manifest $manifest:$line_no: $unit" ;;
+    esac
+    system_units+=("$unit")
+  done < "$manifest"
+}
+
+batch_has_units() {
+  local package
   for package in "${selected_packages[@]}"; do
-    hook="$packages_dir/$package/system-deactivate.sh"
-    [[ -f "$hook" ]] || continue
-    [[ -x "$hook" ]] || die "system-deactivate hook is not executable: $hook"
-    print -- "Running system-deactivate hook: $package"
-    GRZ_REPO_ROOT="$repo_root" GRZ_PACKAGE="$package" "$hook"
+    [[ -f "$packages_dir/$package/system-units.manifest" ]] && return 0
+  done
+  return 1
+}
+
+prompt_path() {
+  local prompt="$1"
+  local answer=""
+
+  [[ -r /dev/tty && -w /dev/tty ]] || die "interactive config prompt requires a TTY"
+  printf '%s: ' "$prompt" > /dev/tty
+  IFS= read -r answer < /dev/tty
+  print -r -- "$answer"
+}
+
+# Copies a secret config WITHOUT reading its contents (install does the byte copy).
+process_package_configs() {
+  local package="$1"
+  local rel_path dest src mode owner group
+
+  load_config_metadata "$package"
+  (( ${#config_modes[@]} > 0 )) || return 0
+
+  for rel_path in "${(@k)config_modes}"; do
+    dest="/$rel_path"
+    mode="${config_modes[$rel_path]}"
+    owner="${config_owners[$rel_path]}"
+    group="${config_groups[$rel_path]}"
+
+    if [[ -e "$dest" || -L "$dest" ]]; then
+      [[ -f "$dest" && ! -L "$dest" ]] ||
+        die "config path exists but is not a regular file: $dest"
+      print -- "Detected existing config (left as-is): $dest"
+      continue
+    fi
+
+    print -- "Package '$package' needs a root-only config at: $dest ($owner:$group mode $mode)"
+    src="$(prompt_path "Path to source config for $dest (empty = skip and create it yourself)")"
+
+    if [[ -z "$src" ]]; then
+      print -- "Skipped. To create it in place (most secure; contents never copied):"
+      print -- "    sudoedit $dest"
+      print -- "    sudo chown $owner:$group $dest && sudo chmod $mode $dest"
+      print -- "Then activate later: ./run.sh activate $package"
+      configs_missing=$(( configs_missing + 1 ))
+      continue
+    fi
+
+    [[ -f "$src" && ! -L "$src" ]] || die "config source must be a regular non-symlink file: $src"
+    [[ -s "$src" ]] || die "config source is empty: $src"
+    print -- "Installing config to $dest (root-only; contents are not read by this script)"
+    sudo -n install -D -m "$mode" -o "$owner" -g "$group" -- "$src" "$dest"
+  done
+}
+
+require_configs_present() {
+  local package="$1"
+  local rel_path dest uid mode
+
+  load_config_metadata "$package"
+  (( ${#config_modes[@]} > 0 )) || return 0
+
+  for rel_path in "${(@k)config_modes}"; do
+    dest="/$rel_path"
+    [[ -f "$dest" && ! -L "$dest" ]] ||
+      die "cannot activate $package: required config missing or not a regular file: $dest (create it, e.g. sudoedit $dest)"
+    uid="$(sudo -n stat -c '%u' -- "$dest")" || die "cannot stat config owner: $dest"
+    mode="$(sudo -n stat -c '%a' -- "$dest")" || die "cannot stat config mode: $dest"
+    [[ "$uid" == "0" ]] || die "config must be owned by root: $dest"
+    (( (8#$mode & 8#077) == 0 )) || die "config must be root-only, for example mode 0600: $dest"
+  done
+}
+
+activate_units() {
+  local package="$1"
+  local unit
+
+  load_units_metadata "$package"
+  (( ${#system_units[@]} > 0 )) || return 0
+  command -v systemctl >/dev/null 2>&1 || die "systemctl is required to activate units for $package"
+
+  print -- "Reloading systemd manager for $package units"
+  sudo -n systemctl daemon-reload
+  for unit in "${system_units[@]}"; do
+    case "$unit" in
+      *.timer|*.path|*.socket)
+        print -- "Enabling and starting $unit"
+        sudo -n systemctl enable --now "$unit"
+        sudo -n systemctl restart "$unit"
+        ;;
+      *)
+        print -- "Starting $unit"
+        sudo -n systemctl start "$unit"
+        ;;
+    esac
+  done
+}
+
+deactivate_units() {
+  local package="$1"
+  local unit
+
+  load_units_metadata "$package"
+  (( ${#system_units[@]} > 0 )) || return 0
+  command -v systemctl >/dev/null 2>&1 || die "systemctl is required to deactivate units for $package"
+
+  for unit in "${system_units[@]}"; do
+    case "$unit" in
+      *.timer|*.path|*.socket)
+        print -- "Disabling and stopping $unit"
+        sudo -n systemctl disable --now "$unit" || print -u2 -- "warning: failed to disable $unit (ignored)"
+        ;;
+      *)
+        print -- "Stopping $unit"
+        sudo -n systemctl stop "$unit" || print -u2 -- "warning: failed to stop $unit (ignored)"
+        ;;
+    esac
   done
 }
 
@@ -440,7 +599,6 @@ action="$1"
 shift
 selector=""
 verbose=0
-config_source=""
 
 case "$action" in
   install|uninstall|activate) ;;
@@ -455,13 +613,6 @@ while (( $# > 0 )); do
     --verbose|-v)
       [[ "$action" != "activate" ]] || die "--verbose is not supported for activate"
       verbose=1
-      ;;
-    --config)
-      [[ "$action" == "activate" ]] || die "--config is only supported for activate"
-      shift
-      (( $# > 0 )) || die "--config requires a path"
-      [[ -z "$config_source" ]] || die "--config can be provided only once"
-      config_source="$1"
       ;;
     --)
       shift
@@ -502,10 +653,13 @@ fi
 
 command -v sudo >/dev/null 2>&1 || die "sudo is required for system copy-install"
 command -v stat >/dev/null 2>&1 || die "stat is required"
-if [[ "$action" != "activate" || -n "$config_source" ]]; then
+if [[ "$action" == "install" ]]; then
   command -v install >/dev/null 2>&1 || die "install is required"
 fi
 command -v cmp >/dev/null 2>&1 || die "cmp is required"
+
+# Fail fast on repo/manifest inconsistencies before touching the live system.
+"$repo_root/scripts/check-repo" -- "${selected_packages[@]}"
 
 load_protected_paths
 collect_selected_files
@@ -519,10 +673,30 @@ case "$action" in
     else
       die "system install aborted before copying files"
     fi
+
+    configs_missing=0
+    for package in "${selected_packages[@]}"; do
+      process_package_configs "$package"
+    done
+
+    if (( configs_missing > 0 )); then
+      print -u2 -- "warning - some required config(s) were skipped; services were not activated."
+      print -u2 -- "warning - create the missing config(s) shown above, then run: ./run.sh activate <package>"
+    elif batch_has_units; then
+      if confirm_action "Activate services for: ${selected_packages[*]} now?"; then
+        for package in "${selected_packages[@]}"; do
+          activate_units "$package"
+        done
+      else
+        print -- "Skipped activation. Run later: ./run.sh activate <package>"
+      fi
+    fi
     ;;
   uninstall)
     print -- "Uninstalling system package(s): ${selected_packages[*]}"
-    run_system_deactivate_hooks
+    for package in "${selected_packages[@]}"; do
+      deactivate_units "$package"
+    done
     if confirm_action "Remove matching system files from /?"; then
       uninstall_selected_files
     else
@@ -532,6 +706,11 @@ case "$action" in
   activate)
     print -- "Activating system package service(s): ${selected_packages[*]}"
     verify_selected_files_installed_for_activation
-    run_system_activate_hooks
+    for package in "${selected_packages[@]}"; do
+      require_configs_present "$package"
+    done
+    for package in "${selected_packages[@]}"; do
+      activate_units "$package"
+    done
     ;;
 esac

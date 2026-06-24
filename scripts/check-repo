@@ -1,0 +1,160 @@
+#!/usr/bin/env zsh
+emulate -L zsh
+set -euo pipefail
+
+# Static consistency linter for package declarations.
+# Verifies (without sudo, without touching the live system):
+#   - every system-install file is declared in system-install.manifest (and vice versa),
+#   - every installed systemd unit is declared in system-units.manifest,
+#   - every *.example config has its real destination declared in system-config.manifest,
+#   - no real (non-.example) secret config is committed in the repo,
+#   - only the allowed *.hook.sh files exist, are executable, and contain no sudo.
+#
+# Usage: check-repo [--] [<package> ...]   (no package = check all)
+
+script_name="${0:t}"
+repo_root="${0:A:h:h}"
+packages_dir="$repo_root/packages"
+
+errors=0
+allowed_hooks=(user-activate.hook.sh user-deactivate.hook.sh verify.hook.sh)
+
+err() {
+  print -u2 -- "$script_name: ERROR: $*"
+  errors=$(( errors + 1 ))
+}
+
+is_meta_file() {
+  local rel="$1"
+  case "$rel" in
+    .gitkeep|*/.gitkeep|.stow-local-ignore|*/.stow-local-ignore) return 0 ;;
+  esac
+  return 1
+}
+
+load_manifest_paths() {
+  # Sets assoc array `manifest_paths` to the set of first-column values.
+  local manifest="$1" line p extra
+  typeset -gA manifest_paths
+  manifest_paths=()
+  [[ -f "$manifest" ]] || return 0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    p=""
+    extra=""
+    read -r p extra <<< "$line"
+    [[ -n "$p" ]] && manifest_paths[$p]=1
+  done < "$manifest"
+}
+
+check_hooks() {
+  local package="$1"
+  local pkg_dir="$packages_dir/$package"
+  local f base hook ok
+
+  for f in "$pkg_dir"/*.hook.sh(N); do
+    base="${f:t}"
+    ok=0
+    for hook in "${allowed_hooks[@]}"; do
+      [[ "$base" == "$hook" ]] && { ok=1; break; }
+    done
+    if (( ! ok )); then
+      err "$package: unknown hook file (allowed: ${allowed_hooks[*]}): $base"
+      continue
+    fi
+    [[ -x "$f" ]] || err "$package: hook is not executable: $base"
+    if grep -nE '(^|[[:space:];&|(])sudo([[:space:]]|$)' -- "$f" >/dev/null 2>&1; then
+      err "$package: hook must not use sudo (user-level only): $base"
+    fi
+  done
+
+  for f in "$pkg_dir"/install/**/*.hook.sh(N.); do
+    err "$package: hook must live in package root, not under install/: ${f#$pkg_dir/}"
+  done
+}
+
+check_system_layer() {
+  local package="$1"
+  local sys_dir="$packages_dir/$package/system-install"
+  local install_manifest="$packages_dir/$package/system-install.manifest"
+  local units_manifest="$packages_dir/$package/system-units.manifest"
+  local config_manifest="$packages_dir/$package/system-config.manifest"
+  local f rel base real_rel
+  typeset -A install_paths config_paths unit_names
+
+  [[ -d "$sys_dir" ]] || return 0
+
+  if [[ ! -f "$install_manifest" ]]; then
+    err "$package: has system-install/ but no system-install.manifest"
+    return 0
+  fi
+
+  load_manifest_paths "$install_manifest"
+  install_paths=("${(@kv)manifest_paths}")
+
+  # Check 1: every system-install file is declared.
+  for f in "$sys_dir"/**/*(DN.); do
+    rel="${f#$sys_dir/}"
+    is_meta_file "$rel" && continue
+    [[ -n "${install_paths[$rel]-}" ]] || err "$package: system file not in system-install.manifest: $rel"
+  done
+  # Reverse: every manifest entry has a repo file.
+  for rel in "${(@k)install_paths}"; do
+    [[ -f "$sys_dir/$rel" ]] || err "$package: system-install.manifest entry has no repo file: $rel"
+  done
+
+  # Check 2: every installed systemd unit is declared in system-units.manifest.
+  load_manifest_paths "$units_manifest"
+  unit_names=("${(@kv)manifest_paths}")
+  for f in "$sys_dir"/etc/systemd/system/*(N.); do
+    base="${f:t}"
+    case "$base" in
+      *.service|*.timer|*.path|*.socket|*.mount|*.target)
+        [[ -n "${unit_names[$base]-}" ]] || err "$package: systemd unit not in system-units.manifest: $base"
+        ;;
+    esac
+  done
+
+  load_manifest_paths "$config_manifest"
+  config_paths=("${(@kv)manifest_paths}")
+
+  # Check 3: every *.example config maps to a declared real destination.
+  for f in "$sys_dir"/**/*.example(DN.); do
+    rel="${f#$sys_dir/}"
+    real_rel="${rel%.example}"
+    [[ -n "${config_paths[$real_rel]-}" ]] ||
+      err "$package: example config without system-config.manifest entry for real dest: $real_rel (from $rel)"
+  done
+
+  # Check 4: a real (non-.example) secret config must never be committed.
+  for rel in "${(@k)config_paths}"; do
+    [[ -e "$sys_dir/$rel" ]] &&
+      err "$package: secret config must not be committed; found real file: system-install/$rel"
+  done
+}
+
+typeset -a packages_to_check
+packages_to_check=()
+(( $# > 0 )) && [[ "$1" == "--" ]] && shift
+
+if (( $# > 0 )); then
+  packages_to_check=("$@")
+else
+  local d
+  for d in "$packages_dir"/*(N/); do
+    packages_to_check+=("${d:t}")
+  done
+fi
+
+for package in "${packages_to_check[@]}"; do
+  [[ -d "$packages_dir/$package" ]] || { err "unknown package: $package"; continue; }
+  check_hooks "$package"
+  check_system_layer "$package"
+done
+
+if (( errors > 0 )); then
+  print -u2 -- "$script_name: FAILED with $errors error(s)"
+  exit 1
+fi
+
+print -- "$script_name: ok (${#packages_to_check[@]} package(s) checked)"
