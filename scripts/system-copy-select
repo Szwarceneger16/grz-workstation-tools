@@ -252,7 +252,7 @@ install_selected_files() {
     group="${batch_groups[$i]}"
     dest="/$rel_path"
     (( verbose )) && print -- "install -D -m $mode -o $owner -g $group -- $source $dest"
-    sudo -n install -D -m "$mode" -o "$owner" -g "$group" -- "$source" "$dest"
+    sudo -n install -D -T -m "$mode" -o "$owner" -g "$group" -- "$source" "$dest"
   done
 }
 
@@ -378,9 +378,15 @@ collect_selected_files() {
   batch_modes=()
   batch_owners=()
   batch_groups=()
+  typeset -A _seen=()
 
   for package in "${selected_packages[@]}"; do
     collect_package_files "$package"
+    for rel_path in "${package_rel_paths[@]}"; do
+      (( ${+_seen[$rel_path]} )) &&
+        die "duplicate system destination /$rel_path: claimed by both '${_seen[$rel_path]}' and '$package'"
+      _seen[$rel_path]="$package"
+    done
     for source in "${package_sources[@]}"; do
       batch_sources+=("$source")
     done
@@ -514,15 +520,18 @@ process_package_configs() {
       continue
     fi
 
+    [[ "$owner" == "root" || "$owner" == "0" ]] ||
+      die "refusing to install secret config with non-root owner: $dest (manifest owner: $owner; system-config.manifest entries must be root-owned)"
+
     print -- "Package '$package' needs a root-only config at: $dest ($owner:$group mode $mode)"
-    src="$(prompt_path "Path to source config for $dest (empty = skip and create it yourself)")"
+    src="$(prompt_path "Path to source config for $dest (empty = create in place with sudoedit)")"
 
     if [[ -z "$src" ]]; then
-      print -- "Skipped. To create it in place (most secure; contents never copied):"
-      print -- "    sudoedit $dest"
-      print -- "    sudo chown $owner:$group $dest && sudo chmod $mode $dest"
-      print -- "Then activate later: ./run.sh activate $package"
-      configs_missing=$(( configs_missing + 1 ))
+      print -- "Creating $dest in place with sudoedit (contents never copied)..."
+      sudo -e -- "$dest" || die "sudoedit cancelled or failed for $dest"
+      sudo -n test -f "$dest" || die "config was not saved: $dest"
+      sudo -n chmod "$mode" "$dest" || die "cannot set mode on $dest"
+      sudo -n chown "$owner:$group" "$dest" || die "cannot set owner on $dest"
       continue
     fi
 
@@ -712,6 +721,10 @@ case "$action" in
       deactivate_units "$package"
     done
     uninstall_selected_files
+    if batch_has_units; then
+      sudo -n systemctl daemon-reload ||
+        print -u2 -- "warning: systemctl daemon-reload failed after uninstall"
+    fi
     ;;
   activate)
     print -- "Activating system package service(s): ${selected_packages[*]}"

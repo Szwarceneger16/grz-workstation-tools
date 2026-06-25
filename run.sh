@@ -254,13 +254,28 @@ verify_system_file() {
   local actual_mode actual_owner actual_group owner_group
   local owner_stat_format="%U" group_stat_format="%G"
   local cmp_status=0
+  typeset -a _sudo=()
 
   if [[ ! -e "$dest" && ! -L "$dest" ]]; then
-    print -u2 -- "not ok - missing system path: $dest"
-    return 1
+    ensure_system_verify_sudo || return 2
+    sudo -n stat -- "$dest" >/dev/null 2>&1 || {
+      print -u2 -- "not ok - missing system path: $dest"
+      return 1
+    }
+    _sudo=(sudo -n)
   fi
 
-  if [[ ! -f "$dest" || -L "$dest" ]]; then
+  if (( ${#_sudo[@]} > 0 )); then
+    local dest_type
+    dest_type="$("${_sudo[@]}" stat -c '%F' -- "$dest" 2>/dev/null)" || {
+      print -u2 -- "not ok - cannot stat system path: $dest"
+      return 1
+    }
+    [[ "$dest_type" == "regular file" ]] || {
+      print -u2 -- "not ok - system path is not a regular file: $dest"
+      return 1
+    }
+  elif [[ ! -f "$dest" || -L "$dest" ]]; then
     print -u2 -- "not ok - system path is not a regular file: $dest"
     return 1
   fi
@@ -272,11 +287,11 @@ verify_system_file() {
     group_stat_format="%g"
   fi
 
-  actual_owner="$(stat -c "$owner_stat_format" -- "$dest" 2>/dev/null)" || {
+  actual_owner="$("${_sudo[@]}" stat -c "$owner_stat_format" -- "$dest" 2>/dev/null)" || {
     print -u2 -- "not ok - cannot stat owner/group: $dest"
     return 1
   }
-  actual_group="$(stat -c "$group_stat_format" -- "$dest" 2>/dev/null)" || {
+  actual_group="$("${_sudo[@]}" stat -c "$group_stat_format" -- "$dest" 2>/dev/null)" || {
     print -u2 -- "not ok - cannot stat owner/group: $dest"
     return 1
   }
@@ -288,7 +303,7 @@ verify_system_file() {
     return 1
   fi
 
-  actual_mode="$(stat -c '%a' -- "$dest" 2>/dev/null)" || {
+  actual_mode="$("${_sudo[@]}" stat -c '%a' -- "$dest" 2>/dev/null)" || {
     print -u2 -- "not ok - cannot stat system mode: $dest"
     return 1
   }
@@ -634,9 +649,11 @@ test_repo_systemd_timer_unit() {
   local install_dir="$repo_root/packages/$package/system-install"
   local line unit_ref
   local failures=0
+  local found_unit=0
 
   while IFS= read -r line || [[ -n "$line" ]]; do
     [[ "$line" == Unit=* ]] || continue
+    found_unit=1
     unit_ref="${line#Unit=}"
     if [[ "$unit_ref" == */* ]]; then
       print -u2 -- "not ok - repo timer Unit must be a unit name, not a path: ${unit_source#$install_dir/}: $line"
@@ -648,6 +665,14 @@ test_repo_systemd_timer_unit() {
       failures=$(( failures + 1 ))
     fi
   done < "$unit_source"
+
+  if (( !found_unit )); then
+    local default_service="${${unit_source:t}%.timer}.service"
+    if [[ ! -f "$install_dir/etc/systemd/system/$default_service" ]]; then
+      print -u2 -- "not ok - repo timer has no Unit= and default service is missing from package: ${unit_source#$install_dir/}: $default_service"
+      failures=$(( failures + 1 ))
+    fi
+  fi
 
   return "$failures"
 }
