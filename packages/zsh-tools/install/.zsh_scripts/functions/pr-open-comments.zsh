@@ -1,10 +1,18 @@
 pr-open-comments() {
+  emulate -L zsh
+
   local pr="$1"
   local mode="${2:-latest}" # latest albo all
-  local owner repo number remote_url tmp
+  local owner repo number remote_url repo_path tmp threads_tmp pr_tmp page_tmp
+  local cursor has_next page_count jq_status
 
   if [[ -z "$pr" ]]; then
     echo "Usage: pr-open-comments <PR_URL|PR_NUMBER> [latest|all]" >&2
+    return 2
+  fi
+
+  if [[ "$mode" != "latest" && "$mode" != "all" ]]; then
+    echo "Expected mode: latest or all, got: $mode" >&2
     return 2
   fi
 
@@ -29,28 +37,50 @@ pr-open-comments() {
       return 1
     }
 
-    owner="$(printf '%s\n' "$remote_url" | sed -E 's#.*github.com[:/]([^/]+)/([^/.]+)(\.git)?#\1#')"
-    repo="$(printf '%s\n' "$remote_url" | sed -E 's#.*github.com[:/]([^/]+)/([^/.]+)(\.git)?#\2#')"
+    repo_path="$(printf '%s\n' "$remote_url" \
+      | sed -E 's#^git@github\.com:##; s#^https?://github\.com/##; s#^ssh://git@github\.com/##; s#\.git$##')"
+
+    owner="${repo_path%%/*}"
+    repo="${repo_path#*/}"
+
+    if [[ -z "$owner" || -z "$repo" || "$owner" == "$repo" || "$repo_path" != */* ]]; then
+      echo "Cannot infer GitHub owner/repo from origin remote: $remote_url" >&2
+      return 1
+    fi
   else
     echo "Expected GitHub PR URL or PR number, got: $pr" >&2
     return 2
   fi
 
   tmp="$(mktemp -t pr-review-threads.XXXXXX.json)"
+  threads_tmp="$(mktemp -t pr-review-thread-nodes.XXXXXX.json)"
+  pr_tmp="$(mktemp -t pr-review-pr.XXXXXX.json)"
+  page_tmp="$(mktemp -t pr-review-page.XXXXXX.json)"
 
-  gh api graphql \
-    -f owner="$owner" \
-    -f name="$repo" \
-    -F number="$number" \
-    -f query='
-query($owner: String!, $name: String!, $number: Int!) {
+  : > "$threads_tmp"
+  cursor="null"
+  has_next="true"
+  page_count=0
+
+  while [[ "$has_next" == "true" ]]; do
+    gh api graphql \
+      -f owner="$owner" \
+      -f name="$repo" \
+      -F number="$number" \
+      -F cursor="$cursor" \
+      -f query='
+query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
       title
       url
       headRefName
       headRefOid
-      reviewThreads(first: 100) {
+      reviewThreads(first: 100, after: $cursor) {
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
         nodes {
           id
           isResolved
@@ -84,15 +114,50 @@ query($owner: String!, $name: String!, $number: Int!) {
     }
   }
 }
-' > "$tmp" || {
-    rm -f "$tmp"
+' > "$page_tmp" || {
+      rm -f "$tmp" "$threads_tmp" "$pr_tmp" "$page_tmp"
+      return 1
+    }
+
+    if (( page_count == 0 )); then
+      jq '.data.repository.pullRequest | {title, url, headRefName, headRefOid}' "$page_tmp" > "$pr_tmp" || {
+        rm -f "$tmp" "$threads_tmp" "$pr_tmp" "$page_tmp"
+        return 1
+      }
+    fi
+
+    jq -c '.data.repository.pullRequest.reviewThreads.nodes[]' "$page_tmp" >> "$threads_tmp" || {
+      rm -f "$tmp" "$threads_tmp" "$pr_tmp" "$page_tmp"
+      return 1
+    }
+
+    has_next="$(jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.hasNextPage' "$page_tmp")"
+    cursor="$(jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.endCursor // "null"' "$page_tmp")"
+    (( page_count++ ))
+  done
+
+  jq -n --slurpfile pr "$pr_tmp" --slurpfile threads "$threads_tmp" '
+    {
+      data: {
+        repository: {
+          pullRequest: ($pr[0] + {reviewThreads: {nodes: $threads}})
+        }
+      }
+    }
+  ' > "$tmp" || {
+    rm -f "$tmp" "$threads_tmp" "$pr_tmp" "$page_tmp"
     return 1
   }
+
+  rm -f "$threads_tmp" "$pr_tmp" "$page_tmp"
 
   jq -r --arg mode "$mode" '
     def clean_title:
       split("\n")
-      | map(gsub("^[[:space:]>#*\\-]+", ""))
+      | map(gsub("\\*"; ""))
+      | map(gsub("</?sub>"; ""))
+      | map(gsub("!\\[[^\\]]*\\]\\([^)]*\\)[[:space:]]*"; ""))
+      | map(gsub("^[[:space:]>#*\\-]+"; ""))
       | map(gsub("^[[:space:]]+"; ""))
       | map(gsub("[[:space:]]+$"; ""))
       | map(select(length > 0))
@@ -127,18 +192,20 @@ query($owner: String!, $name: String!, $number: Int!) {
         | .[0].reviewId // null
       ) as $latestReviewId
 
-    | if ($mode == "all") then
-        $open | sort_by(.reviewSubmittedAt, .rootCreatedAt) | reverse
-      else
-        if $latestReviewId == null then
+    | (
+        if ($mode == "all") then
           $open | sort_by(.reviewSubmittedAt, .rootCreatedAt) | reverse
         else
-          $open
-          | map(select(.reviewId == $latestReviewId))
-          | sort_by(.reviewSubmittedAt, .rootCreatedAt)
-          | reverse
+          if $latestReviewId == null then
+            $open | sort_by(.reviewSubmittedAt, .rootCreatedAt) | reverse
+          else
+            $open
+            | map(select(.reviewId == $latestReviewId))
+            | sort_by(.reviewSubmittedAt, .rootCreatedAt)
+            | reverse
+          end
         end
-      end as $selected
+      ) as $selected
 
     | "## Latest unresolved PR review comments\n"
       + "\nPR: " + $pr.url
@@ -176,8 +243,10 @@ query($owner: String!, $name: String!, $number: Int!) {
           | join("")
         )
   ' "$tmp"
+  jq_status=$?
 
   rm -f "$tmp"
+  return $jq_status
 }
 
 pr-open-comments-copyq() {
@@ -203,10 +272,9 @@ pr-open-comments-copyq() {
   fi
 
   # Add markdown output as a new top item in the dedicated tab.
-  if ! copyq tab "$tab" write text/plain - < "$tmp"; then
+  if ! copyq tab "$tab" add - < "$tmp"; then
     rm -f "$tmp"
-    echo "Failed to write to CopyQ tab: $tab" >&2
-    echo "If the tab does not exist, create it once in CopyQ as: $tab" >&2
+    echo "Failed to add item to CopyQ tab: $tab" >&2
     return 1
   fi
 
