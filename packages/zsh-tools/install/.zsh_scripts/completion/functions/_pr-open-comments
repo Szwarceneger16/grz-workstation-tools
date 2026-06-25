@@ -1,0 +1,42 @@
+#compdef pr-open-comments pr-open-comments-copyq
+
+_pr_open_comments_target() {
+  local -a targets
+
+  targets=(
+    'https://github.com/OWNER/REPO/pull/NUMBER:wklej URL do PR'
+    'PR_NUMBER:podaj numer PR, jeśli jesteś w repo'
+  )
+
+  _describe -t pr-targets 'PR URL albo numer PR' targets
+}
+
+_pr_open_comments_mode() {
+  local -a modes
+
+  modes=(
+    'latest:tylko najnowszy otwarty batch komentarzy'
+    'all:wszystkie otwarte komentarze'
+  )
+
+  _describe -t modes 'tryb pobierania komentarzy' modes
+}
+
+_pr_open_comments() {
+  local context state state_descr line
+  typeset -A opt_args
+
+  _arguments -C -s -S \
+    '(-h --help)'{-h,--help}'[pokaż pomoc]' \
+    '1:PR URL albo numer PR:_pr_open_comments_target' \
+    '2:tryb pobierania komentarzy:_pr_open_comments_mode' \
+    '*:: :->extra'
+
+  case "$state" in
+    extra)
+      _message 'użycie: pr-open-comments <PR_URL|PR_NUMBER> [latest|all]'
+      ;;
+  esac
+}
+
+_pr_open_comments "$@"

@@ -15,7 +15,6 @@ pr-open-comments() {
     echo
     echo "Usage:"
     echo "  pr-open-comments <PR_URL|PR_NUMBER> [latest|all]"
-    echo "  pr-open-comments-copy <PR_URL|PR_NUMBER> [latest|all]"
     echo "  pr-open-comments-copyq <PR_URL|PR_NUMBER> [latest|all]"
     echo
     echo "Modes:"
@@ -327,7 +326,3 @@ pr-open-comments-copyq() {
   echo "Copied PR comments to CopyQ tab '$tab' and focused item 0."
 }
 
-# Replace old generic clipboard helper with CopyQ behavior.
-pr-open-comments-copy() {
-  pr-open-comments-copyq "$@"
-}

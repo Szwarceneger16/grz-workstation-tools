@@ -6,7 +6,6 @@ Fetch unresolved, non-outdated GitHub PR review comments and print a compact Mar
 
 ```sh
 pr-open-comments <PR_URL|PR_NUMBER> [latest|all]
-pr-open-comments-copy <PR_URL|PR_NUMBER> [latest|all]
 pr-open-comments-copyq <PR_URL|PR_NUMBER> [latest|all]
 ```
 
@@ -22,12 +21,12 @@ pr-open-comments-copyq <PR_URL|PR_NUMBER> [latest|all]
 pr-open-comments https://github.com/owner/repo/pull/123
 pr-open-comments 123
 pr-open-comments 123 all
-pr-open-comments-copy 123
+pr-open-comments-copyq 123
 ```
 
 ## CopyQ
 
-`pr-open-comments-copy` stores the generated Markdown in the CopyQ tab configured by `PR_COMMENTS_COPYQ_TAB`.
+`pr-open-comments-copyq` stores the generated Markdown in the CopyQ tab configured by `PR_COMMENTS_COPYQ_TAB`.
 
 Default tab:
 
@@ -45,4 +44,4 @@ export PR_COMMENTS_COPYQ_TAB="AI_PR_comments"
 
 - `gh`
 - `jq`
-- `copyq` for `pr-open-comments-copy` / `pr-open-comments-copyq`
+- `copyq` for `pr-open-comments-copyq`
