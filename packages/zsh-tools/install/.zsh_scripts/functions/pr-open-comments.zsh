@@ -25,6 +25,10 @@ pr-open-comments() {
 
   if [[ -z "$pr" ]]; then
     echo "Usage: pr-open-comments <PR_URL|PR_NUMBER> [latest|all]" >&2
+    echo "Hint: wklej URL do PR albo podaj jego numer, np.:" >&2
+    echo "  pr-open-comments https://github.com/owner/repo/pull/123" >&2
+    echo "  pr-open-comments 123" >&2
+    echo "  pr-open-comments 123 all" >&2
     return 2
   fi
 
@@ -291,8 +295,13 @@ query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
 pr-open-comments-copyq() {
   emulate -L zsh
 
+  if [[ "$1" == "-h" || "$1" == "--help" ]]; then
+    pr-open-comments --help
+    return $?
+  fi
+
   local tab="${PR_COMMENTS_COPYQ_TAB:-PR_comments}"
-  local output tmp
+  local output tmp size limit cache_dir saved
 
   if ! command -v copyq >/dev/null 2>&1; then
     echo "Missing dependency: copyq" >&2
@@ -311,10 +320,36 @@ pr-open-comments-copyq() {
   fi
 
   # Add markdown output as a new top item in the dedicated tab.
-  if ! copyq tab "$tab" add "$(cat "$tmp")"; then
-    rm -f "$tmp"
-    echo "Failed to add item to CopyQ tab: $tab" >&2
-    return 1
+  # For very large reports, avoid passing megabytes through argv.
+  size="$(wc -c < "$tmp" | tr -d '[:space:]')"
+  limit="${PR_COMMENTS_COPYQ_ARG_LIMIT:-900000}"
+
+  if (( size > limit )); then
+    cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/pr-open-comments"
+    mkdir -p "$cache_dir" || {
+      rm -f "$tmp"
+      echo "Failed to create cache directory: $cache_dir" >&2
+      return 1
+    }
+
+    saved="$cache_dir/pr-comments-$(date +%Y%m%d-%H%M%S).md"
+    cp "$tmp" "$saved" || {
+      rm -f "$tmp"
+      echo "Failed to save large PR comments output to: $saved" >&2
+      return 1
+    }
+
+    if ! copyq tab "$tab" add "PR comments output is too large for safe CopyQ argv insertion. Markdown saved to: $saved"; then
+      rm -f "$tmp"
+      echo "Failed to add pointer item to CopyQ tab: $tab" >&2
+      return 1
+    fi
+  else
+    if ! copyq tab "$tab" add "$(cat "$tmp")"; then
+      rm -f "$tmp"
+      echo "Failed to add item to CopyQ tab: $tab" >&2
+      return 1
+    fi
   fi
 
   rm -f "$tmp"

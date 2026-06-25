@@ -40,6 +40,14 @@ Override:
 export PR_COMMENTS_COPYQ_TAB="AI_PR_comments"
 ```
 
+Large outputs:
+
+```sh
+export PR_COMMENTS_COPYQ_ARG_LIMIT=900000
+```
+
+If the generated report is larger than this limit, `pr-open-comments-copyq` stores the Markdown under `${XDG_CACHE_HOME:-$HOME/.cache}/pr-open-comments` and adds a CopyQ item pointing to that file.
+
 ## Dependencies
 
 - `gh`

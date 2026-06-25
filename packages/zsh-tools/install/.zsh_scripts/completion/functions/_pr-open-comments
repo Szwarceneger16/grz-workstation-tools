@@ -1,14 +1,18 @@
 #compdef pr-open-comments pr-open-comments-copyq
 
 _pr_open_comments_target() {
-  local -a targets
+  local -a prs
 
-  targets=(
-    'https://github.com/OWNER/REPO/pull/NUMBER:wklej URL do PR'
-    'PR_NUMBER:podaj numer PR, jeśli jesteś w repo'
-  )
+  if command -v gh >/dev/null 2>&1; then
+    prs=("${(@f)$(gh pr list --limit 20 --json number,title --jq '.[] | "\(.number):#\(.number) \(.title)"' 2>/dev/null)}")
 
-  _describe -t pr-targets 'PR URL albo numer PR' targets
+    if (( ${#prs[@]} )); then
+      _describe -t open-prs 'otwarte PR-y w tym repo albo wklej URL do PR' prs
+      return
+    fi
+  fi
+
+  _message -e pr-target 'wklej URL do PR albo podaj jego nr'
 }
 
 _pr_open_comments_mode() {
