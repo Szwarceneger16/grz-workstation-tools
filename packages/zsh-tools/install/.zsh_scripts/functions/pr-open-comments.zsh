@@ -34,34 +34,30 @@ pr-open-comments() {
     return 1
   fi
 
-  # If no PR target is given, infer the open PR for the current branch.
-  # Also allow: pr-open-comments all
+  # Resolve PR target → owner, repo, number.
+  # Three paths: (1) auto-detect from current branch, (2) explicit URL, (3) explicit number.
   if [[ -z "$pr" || "$pr" == "latest" || "$pr" == "all" ]]; then
-    if [[ "$pr" == "latest" || "$pr" == "all" ]]; then
-      mode="$pr"
-    fi
+    [[ "$pr" == "latest" || "$pr" == "all" ]] && [[ -z "$2" ]] && mode="$pr"
 
-    pr="$(gh pr view --json url --jq .url 2>/dev/null)" || {
+    local pr_json
+    pr_json="$(gh pr view --json number,headRepository 2>/dev/null)" || {
       echo "Cannot infer PR for current branch." >&2
-      echo "Hint: run this inside a branch with an open PR, or pass PR URL/number explicitly, np.:" >&2
+      echo "Hint: run this inside a branch with an open PR, or pass PR URL/number e.g.:" >&2
       echo "  pr-open-comments https://github.com/owner/repo/pull/123" >&2
       echo "  pr-open-comments 123" >&2
       echo "  pr-open-comments all" >&2
       return 2
     }
 
-    if [[ -z "$pr" ]]; then
-      echo "Cannot infer PR for current branch: gh returned an empty PR URL." >&2
+    number="$(jq -r .number <<< "$pr_json")"
+    owner="$(jq -r .headRepository.owner.login <<< "$pr_json")"
+    repo="$(jq -r .headRepository.name <<< "$pr_json")"
+
+    if [[ -z "$number" || "$number" == "null" || -z "$owner" || "$owner" == "null" || -z "$repo" || "$repo" == "null" ]]; then
+      echo "Cannot infer PR for current branch: gh returned incomplete data." >&2
       return 2
     fi
-  fi
-
-  if [[ "$mode" != "latest" && "$mode" != "all" ]]; then
-    echo "Expected mode: latest or all, got: $mode" >&2
-    return 2
-  fi
-
-  if [[ "$pr" =~ '^https://github.com/([^/]+)/([^/]+)/pull/([0-9]+)' ]]; then
+  elif [[ "$pr" =~ '^https://github.com/([^/]+)/([^/]+)/pull/([0-9]+)' ]]; then
     owner="${match[1]}"
     repo="${match[2]}"
     number="${match[3]}"
@@ -105,6 +101,11 @@ pr-open-comments() {
     fi
   else
     echo "Expected GitHub PR URL or PR number, got: $pr" >&2
+    return 2
+  fi
+
+  if [[ "$mode" != "latest" && "$mode" != "all" ]]; then
+    echo "Expected mode: latest or all, got: $mode" >&2
     return 2
   fi
 
