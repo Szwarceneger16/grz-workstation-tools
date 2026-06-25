@@ -14,27 +14,14 @@ pr-open-comments() {
     echo "pr-open-comments - fetch unresolved GitHub PR review comments"
     echo
     echo "Usage:"
-    echo "  pr-open-comments <PR_URL|PR_NUMBER> [latest|all]"
-    echo "  pr-open-comments-copyq <PR_URL|PR_NUMBER> [latest|all]"
+    echo "  pr-open-comments [PR_URL|PR_NUMBER] [latest|all]"
+    echo "  pr-open-comments [latest|all]"
+    echo "  pr-open-comments-copyq [PR_URL|PR_NUMBER] [latest|all]"
     echo
     echo "Modes:"
     echo "  latest  Fetch unresolved non-outdated comments from the latest review batch."
     echo "  all     Fetch all unresolved non-outdated comments."
     return 0
-  fi
-
-  if [[ -z "$pr" ]]; then
-    echo "Usage: pr-open-comments <PR_URL|PR_NUMBER> [latest|all]" >&2
-    echo "Hint: wklej URL do PR albo podaj jego numer, np.:" >&2
-    echo "  pr-open-comments https://github.com/owner/repo/pull/123" >&2
-    echo "  pr-open-comments 123" >&2
-    echo "  pr-open-comments 123 all" >&2
-    return 2
-  fi
-
-  if [[ "$mode" != "latest" && "$mode" != "all" ]]; then
-    echo "Expected mode: latest or all, got: $mode" >&2
-    return 2
   fi
 
   if ! command -v gh >/dev/null 2>&1; then
@@ -45,6 +32,33 @@ pr-open-comments() {
   if ! command -v jq >/dev/null 2>&1; then
     echo "Missing dependency: jq" >&2
     return 1
+  fi
+
+  # If no PR target is given, infer the open PR for the current branch.
+  # Also allow: pr-open-comments all
+  if [[ -z "$pr" || "$pr" == "latest" || "$pr" == "all" ]]; then
+    if [[ "$pr" == "latest" || "$pr" == "all" ]]; then
+      mode="$pr"
+    fi
+
+    pr="$(gh pr view --json url --jq .url 2>/dev/null)" || {
+      echo "Cannot infer PR for current branch." >&2
+      echo "Hint: run this inside a branch with an open PR, or pass PR URL/number explicitly, np.:" >&2
+      echo "  pr-open-comments https://github.com/owner/repo/pull/123" >&2
+      echo "  pr-open-comments 123" >&2
+      echo "  pr-open-comments all" >&2
+      return 2
+    }
+
+    if [[ -z "$pr" ]]; then
+      echo "Cannot infer PR for current branch: gh returned an empty PR URL." >&2
+      return 2
+    fi
+  fi
+
+  if [[ "$mode" != "latest" && "$mode" != "all" ]]; then
+    echo "Expected mode: latest or all, got: $mode" >&2
+    return 2
   fi
 
   if [[ "$pr" =~ '^https://github.com/([^/]+)/([^/]+)/pull/([0-9]+)' ]]; then

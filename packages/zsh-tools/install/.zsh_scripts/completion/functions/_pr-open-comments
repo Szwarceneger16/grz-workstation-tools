@@ -1,7 +1,14 @@
 #compdef pr-open-comments pr-open-comments-copyq
 
-_pr_open_comments_target() {
-  local -a prs
+_pr_open_comments_target_or_mode() {
+  local -a prs modes
+
+  modes=(
+    'latest:aktualny branch PR, tylko najnowszy otwarty batch komentarzy'
+    'all:aktualny branch PR, wszystkie otwarte komentarze'
+  )
+
+  _describe -t modes 'tryb dla PR-a aktualnego brancha' modes
 
   if command -v gh >/dev/null 2>&1; then
     prs=("${(@f)$(gh pr list --limit 20 --json number,title --jq '.[] | "\(.number):#\(.number) \(.title)"' 2>/dev/null)}")
@@ -12,7 +19,7 @@ _pr_open_comments_target() {
     fi
   fi
 
-  _message -e pr-target 'wklej URL do PR albo podaj jego nr'
+  _message -e pr-target 'enter: PR aktualnego brancha, albo wklej URL do PR / podaj nr'
 }
 
 _pr_open_comments_mode() {
@@ -32,13 +39,13 @@ _pr_open_comments() {
 
   _arguments -C -s -S \
     '(-h --help)'{-h,--help}'[pokaż pomoc]' \
-    '1:PR URL albo numer PR:_pr_open_comments_target' \
+    '1:PR URL, numer PR albo tryb dla aktualnego brancha:_pr_open_comments_target_or_mode' \
     '2:tryb pobierania komentarzy:_pr_open_comments_mode' \
     '*:: :->extra'
 
   case "$state" in
     extra)
-      _message 'użycie: pr-open-comments <PR_URL|PR_NUMBER> [latest|all]'
+      _message 'użycie: pr-open-comments [PR_URL|PR_NUMBER] [latest|all]'
       ;;
   esac
 }
