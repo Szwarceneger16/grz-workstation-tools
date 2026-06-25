@@ -82,7 +82,8 @@ select_user_packages() {
         [[ -n "${ignored_packages[$package]-}" ]] && continue
         selected_user_packages+=("$package")
       done
-      (( ${#selected_user_packages[@]} > 0 )) || die "no user packages selected from: $stow_dir"
+      [[ "$selector" == "all-user" ]] &&
+        { (( ${#selected_user_packages[@]} > 0 )) || die "no user packages selected from: $stow_dir"; }
       ;;
     all-system)
       ;;
@@ -799,9 +800,9 @@ run_stow_action() {
   stow_selector="$(selector_stow_arg "$selector")"
 
   if (( verbose )); then
-    "$repo_root/scripts/stow-select" "$action" --verbose -- "$stow_selector"
+    STOW_TARGET="$target" "$repo_root/scripts/stow-select" "$action" --verbose -- "$stow_selector"
   else
-    "$repo_root/scripts/stow-select" "$action" -- "$stow_selector"
+    STOW_TARGET="$target" "$repo_root/scripts/stow-select" "$action" -- "$stow_selector"
   fi
 }
 

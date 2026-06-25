@@ -26,6 +26,10 @@ load_ignored_packages() {
   while IFS= read -r line || [[ -n "$line" ]]; do
     [[ -z "$line" || "$line" == \#* ]] && continue
     package="$line"
+    [[ "$package" =~ '^[A-Za-z0-9._-]+$' ]] || die "invalid package name: $package"
+    if [[ ! -e "$stow_dir/$package" ]]; then
+      continue
+    fi
     validate_package "$package"
     ignored_packages[$package]=1
   done < "$ignore_all_file"

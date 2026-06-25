@@ -32,18 +32,61 @@ is_meta_file() {
   return 1
 }
 
-load_manifest_paths() {
-  # Sets assoc array `manifest_paths` to the set of first-column values.
-  local manifest="$1" line p extra
+load_4col_manifest() {
+  local manifest="$1" line rel_path mode owner group extra
+  local line_no=0
   typeset -gA manifest_paths
   manifest_paths=()
   [[ -f "$manifest" ]] || return 0
   while IFS= read -r line || [[ -n "$line" ]]; do
+    line_no=$(( line_no + 1 ))
     [[ -z "$line" || "$line" == \#* ]] && continue
-    p=""
-    extra=""
-    read -r p extra <<< "$line"
-    [[ -n "$p" ]] && manifest_paths[$p]=1
+    rel_path="" mode="" owner="" group="" extra=""
+    read -r rel_path mode owner group extra <<< "$line"
+    if [[ -z "$rel_path" || -z "$mode" || -z "$owner" || -z "$group" || -n "$extra" ]]; then
+      err "invalid manifest row (expected: path mode owner group) at $manifest:$line_no"
+      continue
+    fi
+    if ! [[ "$mode" =~ '^[0-7]{3,4}$' ]]; then
+      err "invalid mode '$mode' at $manifest:$line_no"
+      continue
+    fi
+    if ! [[ "$owner" =~ '^[A-Za-z_][A-Za-z0-9_-]*$|^[0-9]+$' ]]; then
+      err "invalid owner '$owner' at $manifest:$line_no"
+      continue
+    fi
+    if ! [[ "$group" =~ '^[A-Za-z_][A-Za-z0-9_-]*$|^[0-9]+$' ]]; then
+      err "invalid group '$group' at $manifest:$line_no"
+      continue
+    fi
+    if [[ -n "${manifest_paths[$rel_path]-}" ]]; then
+      err "duplicate manifest entry '$rel_path' at $manifest:$line_no"
+      continue
+    fi
+    manifest_paths[$rel_path]=1
+  done < "$manifest"
+}
+
+load_units_manifest() {
+  local manifest="$1" line unit extra
+  local line_no=0
+  typeset -gA manifest_paths
+  manifest_paths=()
+  [[ -f "$manifest" ]] || return 0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line_no=$(( line_no + 1 ))
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    unit="" extra=""
+    read -r unit extra <<< "$line"
+    if [[ -z "$unit" || -n "$extra" ]]; then
+      err "invalid manifest row (expected: unit-name) at $manifest:$line_no"
+      continue
+    fi
+    if [[ -n "${manifest_paths[$unit]-}" ]]; then
+      err "duplicate unit '$unit' at $manifest:$line_no"
+      continue
+    fi
+    manifest_paths[$unit]=1
   done < "$manifest"
 }
 
@@ -68,7 +111,7 @@ check_hooks() {
     fi
   done
 
-  for f in "$pkg_dir"/install/**/*.hook.sh(N.); do
+  for f in "$pkg_dir"/install/**/*.hook.sh(ND.); do
     err "$package: hook must live in package root, not under install/: ${f#$pkg_dir/}"
   done
 }
@@ -89,7 +132,7 @@ check_system_layer() {
     return 0
   fi
 
-  load_manifest_paths "$install_manifest"
+  load_4col_manifest "$install_manifest"
   install_paths=("${(@kv)manifest_paths}")
 
   # Check 1: every system-install file is declared.
@@ -104,7 +147,7 @@ check_system_layer() {
   done
 
   # Check 2: every installed systemd unit is declared in system-units.manifest.
-  load_manifest_paths "$units_manifest"
+  load_units_manifest "$units_manifest"
   unit_names=("${(@kv)manifest_paths}")
   for f in "$sys_dir"/etc/systemd/system/*(N.); do
     base="${f:t}"
@@ -114,8 +157,13 @@ check_system_layer() {
         ;;
     esac
   done
+  # Reverse: every manifest unit has a repo unit file.
+  for base in "${(@k)unit_names}"; do
+    [[ -f "$sys_dir/etc/systemd/system/$base" ]] ||
+      err "$package: system-units.manifest entry has no repo unit file: $base"
+  done
 
-  load_manifest_paths "$config_manifest"
+  load_4col_manifest "$config_manifest"
   config_paths=("${(@kv)manifest_paths}")
 
   # Check 3: every *.example config maps to a declared real destination.
@@ -140,7 +188,7 @@ packages_to_check=()
 if (( $# > 0 )); then
   packages_to_check=("$@")
 else
-  local d
+  typeset d
   for d in "$packages_dir"/*(N/); do
     packages_to_check+=("${d:t}")
   done

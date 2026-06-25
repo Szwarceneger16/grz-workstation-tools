@@ -499,8 +499,8 @@ process_package_configs() {
     owner="${config_owners[$rel_path]}"
     group="${config_groups[$rel_path]}"
 
-    if [[ -e "$dest" || -L "$dest" ]]; then
-      [[ -f "$dest" && ! -L "$dest" ]] ||
+    if sudo -n test -e "$dest" || sudo -n test -L "$dest"; then
+      { sudo -n test -f "$dest" && ! sudo -n test -L "$dest"; } ||
         die "config path exists but is not a regular file: $dest"
       print -- "Detected existing config (left as-is): $dest"
       continue
