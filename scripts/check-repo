@@ -18,6 +18,26 @@ packages_dir="$repo_root/packages"
 
 errors=0
 allowed_hooks=(user-activate.hook.sh user-deactivate.hook.sh verify.hook.sh)
+protected_paths_file="$repo_root/manifests/protected-system-paths.txt"
+typeset -a protected_paths
+protected_paths=()
+
+_load_protected_paths() {
+  local line
+  [[ -f "$protected_paths_file" ]] || return 0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    protected_paths+=("$line")
+  done < "$protected_paths_file"
+}
+
+_is_protected_rel_path() {
+  local rel_path="$1" pattern
+  for pattern in "${protected_paths[@]}"; do
+    [[ "$rel_path" == ${~pattern} ]] && return 0
+  done
+  return 1
+}
 
 err() {
   print -u2 -- "$script_name: ERROR: $*"
@@ -134,6 +154,10 @@ check_system_layer() {
 
   load_4col_manifest "$install_manifest"
   install_paths=("${(@kv)manifest_paths}")
+  for rel in "${(@k)install_paths}"; do
+    _is_protected_rel_path "$rel" &&
+      err "$package: protected system path in system-install.manifest: $rel"
+  done
 
   # Check 1: every system-install file is declared.
   for f in "$sys_dir"/**/*(DN.); do
@@ -165,6 +189,10 @@ check_system_layer() {
 
   load_4col_manifest "$config_manifest"
   config_paths=("${(@kv)manifest_paths}")
+  for rel in "${(@k)config_paths}"; do
+    _is_protected_rel_path "$rel" &&
+      err "$package: protected system path in system-config.manifest: $rel"
+  done
 
   # Check 3: every *.example config maps to a declared real destination.
   for f in "$sys_dir"/**/*.example(DN.); do
@@ -193,6 +221,8 @@ else
     packages_to_check+=("${d:t}")
   done
 fi
+
+_load_protected_paths
 
 for package in "${packages_to_check[@]}"; do
   [[ -d "$packages_dir/$package" ]] || { err "unknown package: $package"; continue; }

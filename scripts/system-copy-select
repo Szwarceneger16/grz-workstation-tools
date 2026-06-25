@@ -398,7 +398,6 @@ collect_selected_files() {
     done
   done
 
-  (( ${#batch_sources[@]} > 0 )) || die "no files selected for system copy"
 }
 
 load_config_metadata() {
@@ -529,6 +528,8 @@ process_package_configs() {
 
     [[ -f "$src" && ! -L "$src" ]] || die "config source must be a regular non-symlink file: $src"
     [[ -s "$src" ]] || die "config source is empty: $src"
+    (( (8#$mode & 8#077) == 0 )) ||
+      die "refusing to install secret config with group/world-readable mode: $dest (mode $mode; fix the manifest entry to use 0600 or 0400)"
     print -- "Installing config to $dest (root-only; contents are not read by this script)"
     sudo -n install -D -m "$mode" -o "$owner" -g "$group" -- "$src" "$dest"
   done
@@ -677,10 +678,12 @@ start_sudo_session "System package changes require sudo. The password is request
 case "$action" in
   install)
     print -- "Installing system package(s): ${selected_packages[*]}"
-    if confirm_action "Copy selected system files to / using manifest ownership and modes?"; then
-      install_selected_files
-    else
-      die "system install aborted before copying files"
+    if (( ${#batch_sources[@]} > 0 )); then
+      if confirm_action "Copy selected system files to / using manifest ownership and modes?"; then
+        install_selected_files
+      else
+        die "system install aborted before copying files"
+      fi
     fi
 
     configs_missing=0
