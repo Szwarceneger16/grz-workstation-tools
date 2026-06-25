@@ -58,8 +58,29 @@ pr-open-comments() {
       return 1
     }
 
-    repo_path="$(printf '%s\n' "$remote_url" \
-      | sed -E 's#^git@github\.com:##; s#^https?://github\.com/##; s#^ssh://git@github\.com/##; s#\.git$##')"
+    repo_path="$remote_url"
+
+    # Strip URL query/fragment if present.
+    repo_path="${repo_path%%\?*}"
+    repo_path="${repo_path%%#*}"
+
+    # Normalize common Git remote forms while accepting arbitrary SSH host aliases:
+    #   git@alias:owner/repo.git
+    #   ssh://git@alias/owner/repo.git
+    #   https://host/owner/repo.git
+    #   owner/repo.git
+    if [[ "$repo_path" == *"://"* ]]; then
+      repo_path="${repo_path#*://}"
+      repo_path="${repo_path#*@}"
+      repo_path="${repo_path#*/}"
+    elif [[ "$repo_path" == *@*:* ]]; then
+      repo_path="${repo_path#*:}"
+    elif [[ "$repo_path" == *:* && "$repo_path" != */* ]]; then
+      echo "Cannot infer GitHub owner/repo from origin remote: $remote_url" >&2
+      return 1
+    fi
+
+    repo_path="${repo_path%.git}"
 
     owner="${repo_path%%/*}"
     repo="${repo_path#*/}"
