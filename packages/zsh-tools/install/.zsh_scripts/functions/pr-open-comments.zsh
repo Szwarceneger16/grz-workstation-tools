@@ -39,8 +39,8 @@ pr-open-comments() {
   if [[ -z "$pr" || "$pr" == "latest" || "$pr" == "all" ]]; then
     [[ "$pr" == "latest" || "$pr" == "all" ]] && [[ -z "$2" ]] && mode="$pr"
 
-    local pr_json
-    pr_json="$(gh pr view --json number,headRepository 2>/dev/null)" || {
+    local pr_json pr_url
+    pr_json="$(gh pr view --json url 2>/dev/null)" || {
       echo "Cannot infer PR for current branch." >&2
       echo "Hint: run this inside a branch with an open PR, or pass PR URL/number e.g.:" >&2
       echo "  pr-open-comments https://github.com/owner/repo/pull/123" >&2
@@ -49,11 +49,13 @@ pr-open-comments() {
       return 2
     }
 
-    number="$(jq -r .number <<< "$pr_json")"
-    owner="$(jq -r .headRepository.owner.login <<< "$pr_json")"
-    repo="$(jq -r .headRepository.name <<< "$pr_json")"
+    pr_url="$(jq -r .url <<< "$pr_json")"
 
-    if [[ -z "$number" || "$number" == "null" || -z "$owner" || "$owner" == "null" || -z "$repo" || "$repo" == "null" ]]; then
+    if [[ "$pr_url" =~ '^https://github.com/([^/]+)/([^/]+)/pull/([0-9]+)' ]]; then
+      owner="${match[1]}"
+      repo="${match[2]}"
+      number="${match[3]}"
+    else
       echo "Cannot infer PR for current branch: gh returned incomplete data." >&2
       return 2
     fi
