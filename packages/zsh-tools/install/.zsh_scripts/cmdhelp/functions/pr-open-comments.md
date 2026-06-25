@@ -26,7 +26,7 @@ pr-open-comments-copyq 123
 
 ## CopyQ
 
-`pr-open-comments-copyq` stores the generated Markdown in the CopyQ tab configured by `PR_COMMENTS_COPYQ_TAB`.
+`pr-open-comments-copyq` stores the generated Markdown in the CopyQ tab configured by `PR_COMMENTS_COPYQ_TAB` and sets the active system clipboard.
 
 Default tab:
 
