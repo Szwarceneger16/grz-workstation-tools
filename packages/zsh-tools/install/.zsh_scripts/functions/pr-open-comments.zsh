@@ -6,6 +6,24 @@ pr-open-comments() {
   local owner repo number remote_url repo_path tmp threads_tmp pr_tmp page_tmp
   local cursor has_next page_count jq_status
 
+  if [[ "$pr" == "-h" || "$pr" == "--help" ]]; then
+    if command -v cmdhelp >/dev/null 2>&1; then
+      cmdhelp pr-open-comments && return 0
+    fi
+
+    echo "pr-open-comments - fetch unresolved GitHub PR review comments"
+    echo
+    echo "Usage:"
+    echo "  pr-open-comments <PR_URL|PR_NUMBER> [latest|all]"
+    echo "  pr-open-comments-copy <PR_URL|PR_NUMBER> [latest|all]"
+    echo "  pr-open-comments-copyq <PR_URL|PR_NUMBER> [latest|all]"
+    echo
+    echo "Modes:"
+    echo "  latest  Fetch unresolved non-outdated comments from the latest review batch."
+    echo "  all     Fetch all unresolved non-outdated comments."
+    return 0
+  fi
+
   if [[ -z "$pr" ]]; then
     echo "Usage: pr-open-comments <PR_URL|PR_NUMBER> [latest|all]" >&2
     return 2
@@ -88,7 +106,7 @@ query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
           path
           line
           originalLine
-          comments(first: 30) {
+          comments(first: 100) {
             nodes {
               id
               databaseId
@@ -133,7 +151,7 @@ query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
 
     has_next="$(jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.hasNextPage' "$page_tmp")"
     cursor="$(jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.endCursor // "null"' "$page_tmp")"
-    (( page_count++ ))
+    (( ++page_count ))
   done
 
   jq -n --slurpfile pr "$pr_tmp" --slurpfile threads "$threads_tmp" '
@@ -173,6 +191,16 @@ query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
             isOutdated,
             path,
             line: (.line // .originalLine),
+            location: (
+              (.path // "?")
+              + (
+                  if (.line // .originalLine) == null then
+                    " (file-level)"
+                  else
+                    ":" + ((.line // .originalLine) | tostring)
+                  end
+                )
+            ),
             rootAuthor: (.comments.nodes[0].author.login // "unknown"),
             rootCreatedAt: (.comments.nodes[0].createdAt // ""),
             reviewId: (.comments.nodes[0].pullRequestReview.databaseId // null),
@@ -180,6 +208,19 @@ query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
             url: (.comments.nodes[0].url // ""),
             title: ((.comments.nodes[0].body // "") | clean_title),
             body: (.comments.nodes[0].body // ""),
+            commentThread: (
+              .comments.nodes
+              | to_entries
+              | map(
+                  "#### Comment " + ((.key + 1) | tostring)
+                  + "\n\n**Author:** " + (.value.author.login // "unknown")
+                  + "\n**Created:** " + (.value.createdAt // "")
+                  + "\n**URL:** " + (.value.url // "")
+                  + "\n\n**Body:**\n\n"
+                  + ((.value.body // "") | split("\n") | map("> " + .) | join("\n"))
+                )
+              | join("\n\n")
+            ),
             comments: .comments.nodes
           })
         | map(select(.isResolved == false and .isOutdated == false))
@@ -229,16 +270,15 @@ query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
               "\n---\n"
               + "\n### " + ((.key + 1) | tostring) + ". " + .value.title
               + "\n"
-              + "\n**File:** `" + (.value.path // "?") + ":" + ((.value.line // 0) | tostring) + "`"
+              + "\n**File:** `" + (.value.location // "?") + "`"
               + "\n**Reviewer:** " + (.value.rootAuthor // "unknown")
               + "\n**Review ID:** " + ((.value.reviewId // "none") | tostring)
               + "\n**Created:** " + (.value.rootCreatedAt // "")
               + "\n**URL:** " + (.value.url // "")
               + "\n"
-              + "\n**Comment body:**\n"
-              + "\n```markdown\n"
-              + (.value.body // "")
-              + "\n```\n"
+              + "\n**Comment thread:**\n\n"
+              + (.value.commentThread // "")
+              + "\n"
             )
           | join("")
         )
@@ -272,7 +312,7 @@ pr-open-comments-copyq() {
   fi
 
   # Add markdown output as a new top item in the dedicated tab.
-  if ! copyq tab "$tab" add - < "$tmp"; then
+  if ! copyq tab "$tab" add "$(cat "$tmp")"; then
     rm -f "$tmp"
     echo "Failed to add item to CopyQ tab: $tab" >&2
     return 1
