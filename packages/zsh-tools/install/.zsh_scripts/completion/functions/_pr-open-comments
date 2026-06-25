@@ -1,0 +1,46 @@
+#compdef pr-open-comments pr-open-comments-copyq
+
+_pr_open_comments_target() {
+  local -a prs
+
+  if command -v gh >/dev/null 2>&1; then
+    prs=("${(@f)$(gh pr list --limit 20 --json number,title --jq '.[] | "\(.number):#\(.number) \(.title)"' 2>/dev/null)}")
+
+    if (( ${#prs[@]} )); then
+      _describe -t open-prs 'otwarte PR-y w tym repo albo wklej URL do PR' prs
+      return
+    fi
+  fi
+
+  _message -e pr-target 'wklej URL do PR albo podaj jego nr'
+}
+
+_pr_open_comments_mode() {
+  local -a modes
+
+  modes=(
+    'latest:tylko najnowszy otwarty batch komentarzy'
+    'all:wszystkie otwarte komentarze'
+  )
+
+  _describe -t modes 'tryb pobierania komentarzy' modes
+}
+
+_pr_open_comments() {
+  local context state state_descr line
+  typeset -A opt_args
+
+  _arguments -C -s -S \
+    '(-h --help)'{-h,--help}'[pokaż pomoc]' \
+    '1:PR URL albo numer PR:_pr_open_comments_target' \
+    '2:tryb pobierania komentarzy:_pr_open_comments_mode' \
+    '*:: :->extra'
+
+  case "$state" in
+    extra)
+      _message 'użycie: pr-open-comments <PR_URL|PR_NUMBER> [latest|all]'
+      ;;
+  esac
+}
+
+_pr_open_comments "$@"
