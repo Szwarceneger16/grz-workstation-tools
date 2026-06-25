@@ -173,6 +173,10 @@ query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
   rm -f "$threads_tmp" "$pr_tmp" "$page_tmp"
 
   jq -r --arg mode "$mode" '
+    def trim:
+      gsub("^[[:space:]]+"; "")
+      | gsub("[[:space:]]+$"; "");
+
     def clean_title:
       split("\n")
       | map(gsub("\\*"; ""))
@@ -184,6 +188,20 @@ query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
       | map(select(length > 0))
       | .[0] // "Untitled review comment"
       | if length > 120 then .[0:117] + "..." else . end;
+
+    def clean_comment_body:
+      (split("\n") | map(gsub("\\r$"; ""))) as $lines
+      | (
+          if (($lines[0] // "") | test("^\\*\\*<sub><sub>!\\[[^\\]]*Badge\\]\\([^)]*\\)</sub></sub>[[:space:]]+.*\\*\\*$")) then
+            $lines[1:]
+          else
+            $lines
+          end
+        )
+      | map(select(((. | trim) | test("^Useful\\? React with")) | not))
+      | while(length > 0 and ((.[0] | trim) == ""); .[1:])
+      | while(length > 0 and ((.[-1] | trim) == ""); .[0:-1])
+      | join("\n");
 
     .data.repository.pullRequest as $pr
     | (
@@ -211,18 +229,14 @@ query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
             url: (.comments.nodes[0].url // ""),
             title: ((.comments.nodes[0].body // "") | clean_title),
             body: (.comments.nodes[0].body // ""),
-            commentThread: (
+            commentText: (
               .comments.nodes
-              | to_entries
-              | map(
-                  "#### Comment " + ((.key + 1) | tostring)
-                  + "\n\n**Author:** " + (.value.author.login // "unknown")
-                  + "\n**Created:** " + (.value.createdAt // "")
-                  + "\n**URL:** " + (.value.url // "")
-                  + "\n\n**Body:**\n\n"
-                  + ((.value.body // "") | split("\n") | map("> " + .) | join("\n"))
-                )
-              | join("\n\n")
+              | map((.body // "") | clean_comment_body)
+              | map(select(length > 0))
+              | join("
+
+Reply:
+")
             ),
             comments: .comments.nodes
           })
@@ -251,7 +265,7 @@ query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
         end
       ) as $selected
 
-    | "## Latest unresolved PR review comments\n"
+    | "## Latest unresolved PR review comments"
       + "\nPR: " + $pr.url
       + "\nTitle: " + $pr.title
       + "\nHead: " + $pr.headRefName + " / " + $pr.headRefOid
@@ -271,17 +285,11 @@ query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
           | to_entries
           | map(
               "\n---\n"
-              + "\n### " + ((.key + 1) | tostring) + ". " + .value.title
+              + "### " + ((.key + 1) | tostring) + ". " + .value.title
+              + "\nFile: " + (.value.location // "?")
+              + "\nURL: " + (.value.url // "")
               + "\n"
-              + "\n**File:** `" + (.value.location // "?") + "`"
-              + "\n**Reviewer:** " + (.value.rootAuthor // "unknown")
-              + "\n**Review ID:** " + ((.value.reviewId // "none") | tostring)
-              + "\n**Created:** " + (.value.rootCreatedAt // "")
-              + "\n**URL:** " + (.value.url // "")
-              + "\n"
-              + "\n**Comment thread:**\n\n"
-              + (.value.commentThread // "")
-              + "\n"
+              + (.value.commentText // "")
             )
           | join("")
         )
@@ -301,7 +309,7 @@ pr-open-comments-copyq() {
   fi
 
   local tab="${PR_COMMENTS_COPYQ_TAB:-PR_comments}"
-  local output tmp size limit cache_dir saved
+  local output tmp size limit cache_dir saved copy_payload
 
   if ! command -v copyq >/dev/null 2>&1; then
     echo "Missing dependency: copyq" >&2
@@ -339,13 +347,17 @@ pr-open-comments-copyq() {
       return 1
     }
 
-    if ! copyq tab "$tab" add "PR comments output is too large for safe CopyQ argv insertion. Markdown saved to: $saved"; then
+    copy_payload="PR comments output is too large for safe CopyQ argv insertion. Markdown saved to: $saved"
+
+    if ! copyq tab "$tab" add "$copy_payload"; then
       rm -f "$tmp"
       echo "Failed to add pointer item to CopyQ tab: $tab" >&2
       return 1
     fi
   else
-    if ! copyq tab "$tab" add "$(cat "$tmp")"; then
+    copy_payload="$output"
+
+    if ! copyq tab "$tab" add "$copy_payload"; then
       rm -f "$tmp"
       echo "Failed to add item to CopyQ tab: $tab" >&2
       return 1
@@ -354,10 +366,12 @@ pr-open-comments-copyq() {
 
   rm -f "$tmp"
 
-  # Focus/select newest item and make it the active system clipboard item.
-  copyq tab "$tab" select 0 >/dev/null 2>&1
-  copyq tab "$tab" show >/dev/null 2>&1
+  # Set the active system clipboard without opening the CopyQ window.
+  if ! copyq copy "$copy_payload"; then
+    echo "Failed to set system clipboard with CopyQ" >&2
+    return 1
+  fi
 
-  echo "Copied PR comments to CopyQ tab '$tab' and focused item 0."
+  echo "Copied PR comments to system clipboard and CopyQ tab '$tab'."
 }
 
