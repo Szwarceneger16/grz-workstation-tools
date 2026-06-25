@@ -432,6 +432,8 @@ load_config_metadata() {
       die "invalid system-config manifest mode $manifest:$line_no: $mode"
     [[ -z "${config_modes[$rel_path]-}" ]] ||
       die "duplicate system-config manifest path $manifest:$line_no: $rel_path"
+    is_protected_rel_path "$rel_path" &&
+      die "refusing protected system path in config manifest: $package $rel_path"
 
     config_modes[$rel_path]="$normalized_mode"
     config_owners[$rel_path]="$owner"
@@ -502,6 +504,13 @@ process_package_configs() {
     if sudo -n test -e "$dest" || sudo -n test -L "$dest"; then
       { sudo -n test -f "$dest" && ! sudo -n test -L "$dest"; } ||
         die "config path exists but is not a regular file: $dest"
+      local existing_uid existing_mode
+      existing_uid="$(sudo -n stat -c '%u' -- "$dest")" || die "cannot stat config owner: $dest"
+      existing_mode="$(sudo -n stat -c '%a' -- "$dest")" || die "cannot stat config mode: $dest"
+      [[ "$existing_uid" == "0" ]] ||
+        die "existing config is not root-owned: $dest (fix: sudo chown root:root $dest && sudo chmod 600 $dest)"
+      (( (8#$existing_mode & 8#077) == 0 )) ||
+        die "existing config has insecure permissions: $dest (fix: sudo chmod 600 $dest)"
       print -- "Detected existing config (left as-is): $dest"
       continue
     fi
@@ -534,7 +543,7 @@ require_configs_present() {
 
   for rel_path in "${(@k)config_modes}"; do
     dest="/$rel_path"
-    [[ -f "$dest" && ! -L "$dest" ]] ||
+    { sudo -n test -f "$dest" && ! sudo -n test -L "$dest"; } ||
       die "cannot activate $package: required config missing or not a regular file: $dest (create it, e.g. sudoedit $dest)"
     uid="$(sudo -n stat -c '%u' -- "$dest")" || die "cannot stat config owner: $dest"
     mode="$(sudo -n stat -c '%a' -- "$dest")" || die "cannot stat config mode: $dest"
@@ -694,14 +703,12 @@ case "$action" in
     ;;
   uninstall)
     print -- "Uninstalling system package(s): ${selected_packages[*]}"
+    confirm_action "Remove matching system files from /?" ||
+      die "system uninstall aborted before removing files"
     for package in "${selected_packages[@]}"; do
       deactivate_units "$package"
     done
-    if confirm_action "Remove matching system files from /?"; then
-      uninstall_selected_files
-    else
-      die "system uninstall aborted before removing files"
-    fi
+    uninstall_selected_files
     ;;
   activate)
     print -- "Activating system package service(s): ${selected_packages[*]}"
