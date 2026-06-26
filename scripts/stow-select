@@ -73,6 +73,8 @@ validate_package() {
     local actual; actual="$(readlink -- "$stow_dir/$package")"
     [[ "$actual" == "../packages/$package/install" ]] ||
       die "stow/$package symlink points to wrong target (expected ../packages/$package/install, got $actual)"
+  else
+    die "stow/$package must be a symlink to ../packages/$package/install, not a real directory or file"
   fi
   [[ -d "$repo_root/packages/$package/install" ]] || die "missing install dir for package: $package"
 }

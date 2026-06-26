@@ -333,13 +333,13 @@ verify_selected_files_installed_for_activation() {
     owner_stat_format="%U"
     group_stat_format="%G"
 
-    if [[ ! -e "$dest" && ! -L "$dest" ]]; then
+    if ! sudo -n test -e "$dest" 2>/dev/null && ! sudo -n test -L "$dest" 2>/dev/null; then
       print -u2 -- "not ok - cannot activate because system path is missing: $dest"
       failures=$(( failures + 1 ))
       continue
     fi
 
-    if [[ ! -f "$dest" || -L "$dest" ]]; then
+    if ! sudo -n test -f "$dest" 2>/dev/null || sudo -n test -L "$dest" 2>/dev/null; then
       print -u2 -- "not ok - cannot activate because system path is not a regular file: $dest"
       failures=$(( failures + 1 ))
       continue
@@ -593,10 +593,15 @@ require_configs_present() {
 activate_units() {
   local package="$1"
   local unit
+  local -A timer_bases
 
   load_units_metadata "$package"
   (( ${#system_units[@]} > 0 )) || return 0
   command -v systemctl >/dev/null 2>&1 || die "systemctl is required to activate units for $package"
+
+  for unit in "${system_units[@]}"; do
+    [[ "$unit" == *.timer ]] && timer_bases["${unit%.timer}"]=1
+  done
 
   print -- "Reloading systemd manager for $package units"
   sudo -n systemctl daemon-reload
@@ -606,6 +611,14 @@ activate_units() {
         print -- "Enabling and starting $unit"
         sudo -n systemctl enable --now "$unit"
         sudo -n systemctl restart "$unit"
+        ;;
+      *.service)
+        if [[ -n "${timer_bases[${unit%.service}]+x}" ]]; then
+          print -- "Skipping $unit (managed by timer ${unit%.service}.timer)"
+        else
+          print -- "Starting $unit"
+          sudo -n systemctl start "$unit"
+        fi
         ;;
       *)
         print -- "Starting $unit"
