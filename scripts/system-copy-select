@@ -158,7 +158,7 @@ normalize_mode() {
   local mode="$1"
 
   [[ "$mode" =~ '^[0-7]{3,4}$' ]] || return 1
-  while [[ ${#mode} -gt 3 && "$mode" == 0* ]]; do
+  while [[ ${#mode} -gt 1 && "$mode" == 0* ]]; do
     mode="${mode#0}"
   done
   print -- "$mode"
@@ -253,6 +253,9 @@ install_selected_files() {
     owner="${batch_owners[$i]}"
     group="${batch_groups[$i]}"
     dest="/$rel_path"
+    if sudo -n test -L "$dest" 2>/dev/null; then
+      die "refusing to overwrite symlink at system destination: $dest"
+    fi
     (( verbose )) && print -- "install -D -m $mode -o $owner -g $group -- $source $dest"
     sudo -n install -D -T -m "$mode" -o "$owner" -g "$group" -- "$source" "$dest"
   done

@@ -147,7 +147,7 @@ check_hooks() {
     fi
   done
 
-  for f in "$pkg_dir"/**/*.hook.sh(ND.); do
+  for f in "$pkg_dir"/*/**/*.hook.sh(ND.); do
     err "$package: hook must live in package root, not in any subdirectory: ${f#$pkg_dir/}"
   done
 }

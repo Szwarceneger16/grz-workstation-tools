@@ -758,7 +758,7 @@ run_verify() {
   done
 
   for package in "${selected_system_packages[@]}"; do
-    verify_system_package "$package" "$verify_context" 1
+    verify_system_package "$package" "$verify_context" 1 || { finish_system_verify_sudo; return 1; }
   done
   finish_system_verify_sudo
 }
