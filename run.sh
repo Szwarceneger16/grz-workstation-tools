@@ -333,7 +333,7 @@ normalize_mode() {
   local mode="$1"
 
   [[ "$mode" =~ '^[0-7]{3,4}$' ]] || return 1
-  while [[ ${#mode} -gt 3 && "$mode" == 0* ]]; do
+  while [[ ${#mode} -gt 1 && "$mode" == 0* ]]; do
     mode="${mode#0}"
   done
   print -- "$mode"
@@ -365,7 +365,7 @@ load_system_target_metadata() {
 
     [[ -n "$rel_path" && -n "$mode" && -n "$owner" && -n "$group" && -z "$extra" ]] ||
       die "invalid manifest line $manifest:$line_no"
-    [[ "$rel_path" != /* && "$rel_path" != *../* && "$rel_path" != ../* ]] ||
+    [[ "$rel_path" != /* && "$rel_path" != *../* && "$rel_path" != ../* && "$rel_path" != *.. ]] ||
       die "invalid manifest path $manifest:$line_no: $rel_path"
     [[ "$owner" =~ '^[A-Za-z_][A-Za-z0-9_-]*$|^[0-9]+$' ]] ||
       die "invalid manifest owner $manifest:$line_no: $owner"
@@ -433,7 +433,7 @@ load_system_config_metadata() {
 
     [[ -n "$rel_path" && -n "$mode" && -n "$owner" && -n "$group" && -z "$extra" ]] ||
       die "invalid system-config manifest line $manifest:$line_no"
-    [[ "$rel_path" != /* && "$rel_path" != *../* && "$rel_path" != ../* ]] ||
+    [[ "$rel_path" != /* && "$rel_path" != *../* && "$rel_path" != ../* && "$rel_path" != *.. ]] ||
       die "invalid system-config manifest path $manifest:$line_no: $rel_path"
     normalized_mode="$(normalize_mode "$mode")" ||
       die "invalid system-config manifest mode $manifest:$line_no: $mode"

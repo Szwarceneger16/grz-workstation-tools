@@ -190,7 +190,7 @@ load_target_metadata() {
 
     [[ -n "$rel_path" && -n "$mode" && -n "$owner" && -n "$group" && -z "$extra" ]] ||
       die "invalid manifest line $manifest:$line_no"
-    [[ "$rel_path" != /* && "$rel_path" != *../* && "$rel_path" != ../* ]] ||
+    [[ "$rel_path" != /* && "$rel_path" != *../* && "$rel_path" != ../* && "$rel_path" != *.. ]] ||
       die "invalid manifest path $manifest:$line_no: $rel_path"
     [[ "$owner" =~ '^[A-Za-z_][A-Za-z0-9_-]*$|^[0-9]+$' ]] ||
       die "invalid manifest owner $manifest:$line_no: $owner"
@@ -268,8 +268,8 @@ validate_uninstall_batch() {
     source="${batch_sources[$i]}"
     rel_path="${batch_rel_paths[$i]}"
     dest="/$rel_path"
-    [[ ! -e "$dest" && ! -L "$dest" ]] && continue
-    if [[ ! -f "$dest" || -L "$dest" ]]; then
+    { sudo -n test -e "$dest" || sudo -n test -L "$dest"; } || continue
+    if ! sudo -n test -f "$dest" || sudo -n test -L "$dest"; then
       print -u2 -- "not ok - refusing to remove non-regular or symlinked system path: $dest"
       return 1
     fi
@@ -289,12 +289,12 @@ uninstall_selected_files() {
     rel_path="${batch_rel_paths[$i]}"
     dest="/$rel_path"
 
-    if [[ ! -e "$dest" && ! -L "$dest" ]]; then
+    if ! sudo -n test -e "$dest" && ! sudo -n test -L "$dest"; then
       (( verbose )) && print -- "skip missing: $dest"
       continue
     fi
 
-    if [[ ! -f "$dest" || -L "$dest" ]]; then
+    if ! sudo -n test -f "$dest" || sudo -n test -L "$dest"; then
       print -u2 -- "not ok - refusing to remove non-regular or symlinked system path: $dest"
       return 1
     fi
@@ -309,7 +309,7 @@ uninstall_selected_files() {
     rel_path="${batch_rel_paths[$i]}"
     dest="/$rel_path"
 
-    if [[ ! -e "$dest" && ! -L "$dest" ]]; then
+    if ! sudo -n test -e "$dest" && ! sudo -n test -L "$dest"; then
       continue
     fi
 
