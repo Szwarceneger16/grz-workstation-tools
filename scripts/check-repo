@@ -142,13 +142,13 @@ check_hooks() {
     fi
     [[ ! -L "$f" ]] || err "$package: hook must be a regular file, not a symlink: $base"
     [[ -x "$f" ]] || err "$package: hook is not executable: $base"
-    if grep -nE '(^|[[:space:];&|(])sudo([[:space:]]|$)' -- "$f" >/dev/null 2>&1; then
+    if grep -nE '(^|[[:space:];&|(])(/usr/bin/|/bin/)?sudo([[:space:]]|$)' -- "$f" >/dev/null 2>&1; then
       err "$package: hook must not use sudo (user-level only): $base"
     fi
   done
 
-  for f in "$pkg_dir"/install/**/*.hook.sh(ND.); do
-    err "$package: hook must live in package root, not under install/: ${f#$pkg_dir/}"
+  for f in "$pkg_dir"/**/*.hook.sh(ND.); do
+    err "$package: hook must live in package root, not in any subdirectory: ${f#$pkg_dir/}"
   done
 }
 
@@ -180,6 +180,11 @@ check_system_layer() {
     rel="${f#$sys_dir/}"
     is_meta_file "$rel" && continue
     [[ -n "${install_paths[$rel]-}" ]] || err "$package: system file not in system-install.manifest: $rel"
+  done
+  for f in "$sys_dir"/**/*(DN@); do
+    rel="${f#$sys_dir/}"
+    is_meta_file "$rel" && continue
+    err "$package: system-install must not contain symlinks: $rel"
   done
   # Reverse: every manifest entry has a repo file.
   for rel in "${(@k)install_paths}"; do

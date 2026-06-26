@@ -544,6 +544,9 @@ process_package_configs() {
     [[ "$owner" == "root" || "$owner" == "0" ]] ||
       die "refusing to install secret config with non-root owner: $dest (manifest owner: $owner; system-config.manifest entries must be root-owned)"
 
+    (( (8#$mode & 8#077) == 0 )) ||
+      die "refusing to install secret config with group/world-readable mode: $dest (mode $mode; fix the manifest entry to use 0600 or 0400)"
+
     print -- "Package '$package' needs a root-only config at: $dest ($owner:$group mode $mode)"
     src="$(prompt_path "Path to source config for $dest (empty = create in place with sudoedit)")"
 
@@ -561,8 +564,6 @@ process_package_configs() {
 
     [[ -f "$src" && ! -L "$src" ]] || die "config source must be a regular non-symlink file: $src"
     [[ -s "$src" ]] || die "config source is empty: $src"
-    (( (8#$mode & 8#077) == 0 )) ||
-      die "refusing to install secret config with group/world-readable mode: $dest (mode $mode; fix the manifest entry to use 0600 or 0400)"
     print -- "Installing config to $dest (root-only; contents are not read by this script)"
     sudo -n install -D -m "$mode" -o "$owner" -g "$group" -- "$src" "$dest"
   done

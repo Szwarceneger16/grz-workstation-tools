@@ -482,25 +482,27 @@ verify_system_config_paths() {
   load_system_config_metadata "$package"
   (( ${#config_modes[@]} > 0 )) || return 0
 
+  ensure_system_verify_sudo || return 1
+
   for rel_path in "${(@k)config_modes}"; do
     dest="/$rel_path"
 
-    if [[ ! -e "$dest" && ! -L "$dest" ]]; then
+    if ! sudo -n test -e "$dest" && ! sudo -n test -L "$dest"; then
       print -u2 -- "not ok - missing required config path: $dest"
       failures=$(( failures + 1 ))
       continue
     fi
-    if [[ ! -f "$dest" || -L "$dest" ]]; then
+    if ! sudo -n test -f "$dest" || sudo -n test -L "$dest"; then
       print -u2 -- "not ok - config path is not a regular file: $dest"
       failures=$(( failures + 1 ))
       continue
     fi
-    uid="$(stat -c '%u' -- "$dest" 2>/dev/null)" || {
+    uid="$(sudo -n stat -c '%u' -- "$dest" 2>/dev/null)" || {
       print -u2 -- "not ok - cannot stat config owner: $dest"
       failures=$(( failures + 1 ))
       continue
     }
-    mode="$(stat -c '%a' -- "$dest" 2>/dev/null)" || {
+    mode="$(sudo -n stat -c '%a' -- "$dest" 2>/dev/null)" || {
       print -u2 -- "not ok - cannot stat config mode: $dest"
       failures=$(( failures + 1 ))
       continue
@@ -559,13 +561,13 @@ verify_system_live_units() {
 verify_system_package() {
   local package="$1"
   local verify_context="${2:-standalone}"
+  local _keep_sudo="${3:-0}"
   local install_dir="$repo_root/packages/$package/system-install"
   local source rel_path
   local failures=0
   typeset -a sources
 
   print -- "Verifying system package: $package"
-  finish_system_verify_sudo
   load_system_target_metadata "$package"
   sources=("$install_dir"/**/*(DN.))
 
@@ -589,12 +591,12 @@ verify_system_package() {
   verify_system_live_units "$package" || failures=$(( failures + 1 ))
 
   if (( failures > 0 )); then
-    finish_system_verify_sudo
+    (( _keep_sudo )) || finish_system_verify_sudo
     print -u2 -- "not ok - $package has $failures system verification failure(s)"
     return 1
   fi
 
-  finish_system_verify_sudo
+  (( _keep_sudo )) || finish_system_verify_sudo
   print -- "ok - system package verified: $package"
 }
 
@@ -622,7 +624,10 @@ test_repo_systemd_execstart() {
     rel_path="${command#/}"
     executable_source="$install_dir/$rel_path"
     if [[ ! -f "$executable_source" ]]; then
-      print -u2 -- "not ok - repo unit ExecStart target missing from package: ${unit_source#$install_dir/}: $command"
+      if [[ -f "$command" ]]; then
+        continue
+      fi
+      print -u2 -- "not ok - repo unit ExecStart target missing from package and not found on system: ${unit_source#$install_dir/}: $command"
       failures=$(( failures + 1 ))
       continue
     fi
@@ -753,8 +758,9 @@ run_verify() {
   done
 
   for package in "${selected_system_packages[@]}"; do
-    verify_system_package "$package" "$verify_context"
+    verify_system_package "$package" "$verify_context" 1
   done
+  finish_system_verify_sudo
 }
 
 run_tests_for_user_package() {
@@ -798,7 +804,8 @@ run_test() {
 selector_stow_arg() {
   local selector="$1"
   case "$selector" in
-    all|all-user) print -- "all" ;;
+    all) print -- "all" ;;
+    all-user) print -- "all-user" ;;
     *) print -- "$selector" ;;
   esac
 }

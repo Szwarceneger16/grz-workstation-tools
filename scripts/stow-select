@@ -51,11 +51,29 @@ load_all_packages() {
   (( ${#selected_packages[@]} > 0 )) || die "no packages selected from: $stow_dir"
 }
 
+load_all_packages_noignore() {
+  local package_path package
+  typeset -ga selected_packages
+  selected_packages=()
+
+  for package_path in "$stow_dir"/*(N); do
+    package="${package_path:t}"
+    selected_packages+=("$package")
+  done
+
+  (( ${#selected_packages[@]} > 0 )) || die "no packages selected from: $stow_dir"
+}
+
 validate_package() {
   local package="$1"
 
   [[ "$package" =~ '^[A-Za-z0-9._-]+$' ]] || die "invalid package name: $package"
   [[ -e "$stow_dir/$package" ]] || die "unknown stow package: $package"
+  if [[ -L "$stow_dir/$package" ]]; then
+    local actual; actual="$(readlink -- "$stow_dir/$package")"
+    [[ "$actual" == "../packages/$package/install" ]] ||
+      die "stow/$package symlink points to wrong target (expected ../packages/$package/install, got $actual)"
+  fi
   [[ -d "$repo_root/packages/$package/install" ]] || die "missing install dir for package: $package"
 }
 
@@ -283,6 +301,8 @@ command -v stow >/dev/null 2>&1 || die "GNU Stow is required"
 
 if [[ "$selector" == "all" ]]; then
   load_all_packages
+elif [[ "$selector" == "all-user" ]]; then
+  load_all_packages_noignore
 else
   selected_packages=("$selector")
 fi
