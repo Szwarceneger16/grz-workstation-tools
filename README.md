@@ -60,13 +60,10 @@ it prompts for the **path** to your real config. The script copies it with `inst
 **never reads its contents**. Three outcomes per config:
 
 - **destination already exists** → left untouched (no overwrite);
-- **empty answer** → skipped; create it yourself, most securely in place with `sudoedit`:
-  ```sh
-  sudoedit /etc/<pkg>/secret.env
-  sudo chown root:root /etc/<pkg>/secret.env && sudo chmod 0600 /etc/<pkg>/secret.env
-  ```
-  `sudoedit` runs your editor as your normal user and writes back as root, so the editor
-  never runs privileged and the secret only ever lives at its final root-only path;
+- **empty answer** → opens `sudoedit` to create the file in place (cancelling the editor
+  aborts the install). `sudoedit` runs your editor as your normal user and writes back as
+  root, so the editor never runs privileged and the secret only ever lives at its final
+  root-only path;
 - **a path is given** → copied to the destination as declared (e.g. `root:root` `0600`).
 
 When all configs are present (or none are required) the installer offers to activate the

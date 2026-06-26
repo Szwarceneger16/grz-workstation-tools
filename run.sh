@@ -79,7 +79,7 @@ select_user_packages() {
       load_ignored_packages
       for package_path in "$stow_dir"/*(N); do
         package="${package_path:t}"
-        [[ -n "${ignored_packages[$package]-}" ]] && continue
+        [[ "$selector" == "all" && -n "${ignored_packages[$package]-}" ]] && continue
         selected_user_packages+=("$package")
       done
       [[ "$selector" == "all-user" ]] &&

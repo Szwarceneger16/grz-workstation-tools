@@ -67,6 +67,10 @@ load_4col_manifest() {
       err "invalid manifest row (expected: path mode owner group) at $manifest:$line_no"
       continue
     fi
+    if [[ "$rel_path" == /* || "$rel_path" == *../* || "$rel_path" == ../* ]]; then
+      err "invalid manifest path (absolute or traversal) at $manifest:$line_no: $rel_path"
+      continue
+    fi
     if ! [[ "$mode" =~ '^[0-7]{3,4}$' ]]; then
       err "invalid mode '$mode' at $manifest:$line_no"
       continue
@@ -102,6 +106,17 @@ load_units_manifest() {
       err "invalid manifest row (expected: unit-name) at $manifest:$line_no"
       continue
     fi
+    if [[ "$unit" == */* ]]; then
+      err "unit name must not contain a slash at $manifest:$line_no: $unit"
+      continue
+    fi
+    case "$unit" in
+      *.service|*.timer|*.path|*.socket|*.mount|*.target) ;;
+      *)
+        err "unsupported unit suffix at $manifest:$line_no: $unit"
+        continue
+        ;;
+    esac
     if [[ -n "${manifest_paths[$unit]-}" ]]; then
       err "duplicate unit '$unit' at $manifest:$line_no"
       continue
@@ -125,6 +140,7 @@ check_hooks() {
       err "$package: unknown hook file (allowed: ${allowed_hooks[*]}): $base"
       continue
     fi
+    [[ ! -L "$f" ]] || err "$package: hook must be a regular file, not a symlink: $base"
     [[ -x "$f" ]] || err "$package: hook is not executable: $base"
     if grep -nE '(^|[[:space:];&|(])sudo([[:space:]]|$)' -- "$f" >/dev/null 2>&1; then
       err "$package: hook must not use sudo (user-level only): $base"
@@ -168,6 +184,7 @@ check_system_layer() {
   # Reverse: every manifest entry has a repo file.
   for rel in "${(@k)install_paths}"; do
     [[ -f "$sys_dir/$rel" ]] || err "$package: system-install.manifest entry has no repo file: $rel"
+    [[ ! -L "$sys_dir/$rel" ]] || err "$package: system-install.manifest entry must not be a symlink: $rel"
   done
 
   # Check 2: every installed systemd unit is declared in system-units.manifest.

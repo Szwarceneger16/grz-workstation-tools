@@ -202,6 +202,8 @@ load_target_metadata() {
       die "duplicate manifest path $manifest:$line_no: $rel_path"
     [[ -f "$install_dir/$rel_path" ]] ||
       die "manifest path has no repo file $manifest:$line_no: $rel_path"
+    [[ ! -L "$install_dir/$rel_path" ]] ||
+      die "manifest path must not be a symlink $manifest:$line_no: $rel_path"
     is_protected_rel_path "$rel_path" &&
       die "refusing protected system path in manifest: $package $rel_path"
 
@@ -253,6 +255,25 @@ install_selected_files() {
     dest="/$rel_path"
     (( verbose )) && print -- "install -D -m $mode -o $owner -g $group -- $source $dest"
     sudo -n install -D -T -m "$mode" -o "$owner" -g "$group" -- "$source" "$dest"
+  done
+}
+
+validate_uninstall_batch() {
+  local source rel_path dest
+  local i
+  for (( i = 1; i <= ${#batch_sources[@]}; i++ )); do
+    source="${batch_sources[$i]}"
+    rel_path="${batch_rel_paths[$i]}"
+    dest="/$rel_path"
+    [[ ! -e "$dest" && ! -L "$dest" ]] && continue
+    if [[ ! -f "$dest" || -L "$dest" ]]; then
+      print -u2 -- "not ok - refusing to remove non-regular or symlinked system path: $dest"
+      return 1
+    fi
+    if ! sudo -n cmp -s -- "$source" "$dest"; then
+      print -u2 -- "not ok - refusing to remove drifted system path: $dest"
+      return 1
+    fi
   done
 }
 
@@ -495,7 +516,7 @@ prompt_path() {
 # Copies a secret config WITHOUT reading its contents (install does the byte copy).
 process_package_configs() {
   local package="$1"
-  local rel_path dest src mode owner group
+  local rel_path dest dest_parent src mode owner group
 
   load_config_metadata "$package"
   (( ${#config_modes[@]} > 0 )) || return 0
@@ -528,6 +549,9 @@ process_package_configs() {
 
     if [[ -z "$src" ]]; then
       print -- "Creating $dest in place with sudoedit (contents never copied)..."
+      dest_parent="${dest:h}"
+      sudo -n mkdir -p -- "$dest_parent" ||
+        die "cannot create config parent directory: $dest_parent"
       sudo -e -- "$dest" || die "sudoedit cancelled or failed for $dest"
       sudo -n test -f "$dest" || die "config was not saved: $dest"
       sudo -n chmod "$mode" "$dest" || die "cannot set mode on $dest"
@@ -717,6 +741,8 @@ case "$action" in
     print -- "Uninstalling system package(s): ${selected_packages[*]}"
     confirm_action "Remove matching system files from /?" ||
       die "system uninstall aborted before removing files"
+    validate_uninstall_batch ||
+      die "uninstall aborted: drift or unexpected state detected"
     for package in "${selected_packages[@]}"; do
       deactivate_units "$package"
     done
