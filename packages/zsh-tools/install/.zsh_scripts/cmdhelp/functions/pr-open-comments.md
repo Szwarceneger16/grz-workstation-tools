@@ -5,19 +5,26 @@ Fetch unresolved, non-outdated GitHub PR review comments and print a compact Mar
 ## Usage
 
 ```sh
+pr-open-comments [latest|all]
 pr-open-comments <PR_URL|PR_NUMBER> [latest|all]
+pr-open-comments-copyq [latest|all]
 pr-open-comments-copyq <PR_URL|PR_NUMBER> [latest|all]
 ```
 
 ## Arguments
 
-- `<PR_URL|PR_NUMBER>` — GitHub pull request URL, or a PR number when run inside a GitHub repository.
+- `<PR_URL|PR_NUMBER>` — GitHub pull request URL, or a PR number when run inside a GitHub repository. When omitted, the PR is inferred from the current branch via `gh pr view`.
 - `latest` — default; return unresolved, non-outdated comments from the latest review batch.
 - `all` — return all unresolved, non-outdated review comments.
 
 ## Examples
 
 ```sh
+# Auto-detect PR from the current branch
+pr-open-comments
+pr-open-comments all
+
+# Explicit PR URL or number
 pr-open-comments https://github.com/owner/repo/pull/123
 pr-open-comments 123
 pr-open-comments 123 all
