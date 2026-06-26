@@ -1,0 +1,843 @@
+#!/usr/bin/env zsh
+emulate -L zsh
+set -euo pipefail
+
+script_name="${0:t}"
+repo_root="${0:A:h:h}"
+packages_dir="$repo_root/packages"
+ignore_all_file="$repo_root/manifests/ignore-all-install.txt"
+protected_paths_file="$repo_root/manifests/protected-system-paths.txt"
+typeset -ga protected_paths
+protected_paths=()
+sudo_session_active=0
+
+finish_sudo_session() {
+  (( sudo_session_active )) || return 0
+  if [[ "${GRZ_KEEP_SUDO_SESSION:-0}" == "1" ]]; then
+    sudo_session_active=0
+    return 0
+  fi
+  sudo -k
+  sudo_session_active=0
+}
+
+trap finish_sudo_session EXIT
+
+usage() {
+  print -u2 -- "usage: $script_name install|uninstall [--verbose] all|all-system|<package>"
+  print -u2 -- "       $script_name activate all|all-system|<package>"
+}
+
+die() {
+  print -u2 -- "$script_name: $*"
+  exit 1
+}
+
+confirm_action() {
+  local prompt="$1"
+  local answer=""
+
+  [[ -r /dev/tty && -w /dev/tty ]] || die "interactive confirmation requires a TTY"
+  printf '%s [y/N] ' "$prompt" > /dev/tty
+  IFS= read -r answer < /dev/tty
+
+  case "$answer" in
+    y|Y|yes|YES)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+start_sudo_session() {
+  local description="$1"
+
+  (( sudo_session_active )) && return 0
+
+  print -- "$description"
+  sudo -k
+  sudo -v
+  sudo_session_active=1
+}
+
+validate_package_name() {
+  local package="$1"
+  [[ "$package" =~ '^[A-Za-z0-9._-]+$' ]] || die "invalid package name: $package"
+}
+
+package_has_system_install() {
+  local package="$1"
+  [[ -d "$packages_dir/$package/system-install" ]]
+}
+
+validate_system_package() {
+  local package="$1"
+  validate_package_name "$package"
+  package_has_system_install "$package" || die "unknown system package: $package"
+}
+
+load_ignored_packages() {
+  local line package
+  typeset -gA ignored_packages
+  ignored_packages=()
+
+  [[ -f "$ignore_all_file" ]] || return 0
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    package="$line"
+    validate_package_name "$package"
+    ignored_packages[$package]=1
+  done < "$ignore_all_file"
+}
+
+select_packages() {
+  local selector="$1"
+  local package_path package
+  typeset -ga selected_packages
+  selected_packages=()
+
+  case "$selector" in
+    all|all-system)
+      load_ignored_packages
+      for package_path in "$packages_dir"/*/system-install(N/); do
+        package="${package_path:h:t}"
+        [[ "$selector" == "all" && -n "${ignored_packages[$package]-}" ]] && continue
+        selected_packages+=("$package")
+      done
+      if [[ "$selector" == "all-system" ]]; then
+        (( ${#selected_packages[@]} > 0 )) || die "no system packages selected from: $packages_dir"
+      fi
+      ;;
+    all-user)
+      die "all-user is not a system selector"
+      ;;
+    *)
+      validate_system_package "$selector"
+      selected_packages=("$selector")
+      ;;
+  esac
+}
+
+is_meta_file() {
+  local rel_path="$1"
+  case "$rel_path" in
+    .gitkeep|*/.gitkeep)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+load_protected_paths() {
+  local line
+  protected_paths=()
+
+  [[ -f "$protected_paths_file" ]] || return 0
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    protected_paths+=("$line")
+  done < "$protected_paths_file"
+}
+
+is_protected_rel_path() {
+  local rel_path="$1"
+  local pattern
+
+  for pattern in "${protected_paths[@]}"; do
+    [[ "$rel_path" == ${~pattern} ]] && return 0
+  done
+
+  return 1
+}
+
+normalize_mode() {
+  local mode="$1"
+
+  [[ "$mode" =~ '^[0-7]{3,4}$' ]] || return 1
+  while [[ ${#mode} -gt 1 && "$mode" == 0* ]]; do
+    mode="${mode#0}"
+  done
+  print -- "$mode"
+}
+
+load_target_metadata() {
+  local package="$1"
+  local install_dir="$packages_dir/$package/system-install"
+  local manifest="$packages_dir/$package/system-install.manifest"
+  local line rel_path mode owner group extra normalized_mode
+  local line_no=0
+  typeset -gA target_modes target_owners target_groups
+  target_modes=()
+  target_owners=()
+  target_groups=()
+
+  [[ -f "$manifest" ]] || die "missing system install manifest: $manifest"
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line_no=$(( line_no + 1 ))
+    [[ -z "$line" || "$line" == \#* ]] && continue
+
+    rel_path=""
+    mode=""
+    owner=""
+    group=""
+    extra=""
+    read -r rel_path mode owner group extra <<< "$line"
+
+    [[ -n "$rel_path" && -n "$mode" && -n "$owner" && -n "$group" && -z "$extra" ]] ||
+      die "invalid manifest line $manifest:$line_no"
+    [[ "$rel_path" != /* && "$rel_path" != *../* && "$rel_path" != ../* && "$rel_path" != *.. ]] ||
+      die "invalid manifest path $manifest:$line_no: $rel_path"
+    [[ "$owner" =~ '^[A-Za-z_][A-Za-z0-9_-]*$|^[0-9]+$' ]] ||
+      die "invalid manifest owner $manifest:$line_no: $owner"
+    [[ "$group" =~ '^[A-Za-z_][A-Za-z0-9_-]*$|^[0-9]+$' ]] ||
+      die "invalid manifest group $manifest:$line_no: $group"
+    normalized_mode="$(normalize_mode "$mode")" ||
+      die "invalid manifest mode $manifest:$line_no: $mode"
+    [[ -z "${target_modes[$rel_path]-}" ]] ||
+      die "duplicate manifest path $manifest:$line_no: $rel_path"
+    [[ -f "$install_dir/$rel_path" ]] ||
+      die "manifest path has no repo file $manifest:$line_no: $rel_path"
+    [[ ! -L "$install_dir/$rel_path" ]] ||
+      die "manifest path must not be a symlink $manifest:$line_no: $rel_path"
+    is_protected_rel_path "$rel_path" &&
+      die "refusing protected system path in manifest: $package $rel_path"
+
+    target_modes[$rel_path]="$normalized_mode"
+    target_owners[$rel_path]="$owner"
+    target_groups[$rel_path]="$group"
+  done < "$manifest"
+}
+
+collect_package_files() {
+  local package="$1"
+  local install_dir="$packages_dir/$package/system-install"
+  local source rel_path
+  typeset -ga package_sources package_rel_paths package_modes package_owners package_groups
+  package_sources=()
+  package_rel_paths=()
+  package_modes=()
+  package_owners=()
+  package_groups=()
+
+  load_target_metadata "$package"
+
+  [[ ! -L "$install_dir" ]] || die "system-install must not be a symlink: $package"
+
+  for source in "$install_dir"/**/*(DN.); do
+    rel_path="${source#$install_dir/}"
+    is_meta_file "$rel_path" && continue
+    if is_protected_rel_path "$rel_path"; then
+      die "refusing protected system path in repo package: $package $rel_path"
+    fi
+    [[ -n "${target_modes[$rel_path]-}" ]] ||
+      die "missing manifest entry for system file: $package $rel_path"
+    package_sources+=("$source")
+    package_rel_paths+=("$rel_path")
+    package_modes+=("${target_modes[$rel_path]}")
+    package_owners+=("${target_owners[$rel_path]}")
+    package_groups+=("${target_groups[$rel_path]}")
+  done
+}
+
+install_selected_files() {
+  local source rel_path dest mode owner group
+  local i
+
+  for (( i = 1; i <= ${#batch_sources[@]}; i++ )); do
+    source="${batch_sources[$i]}"
+    rel_path="${batch_rel_paths[$i]}"
+    mode="${batch_modes[$i]}"
+    owner="${batch_owners[$i]}"
+    group="${batch_groups[$i]}"
+    dest="/$rel_path"
+    if sudo -n test -L "$dest" 2>/dev/null; then
+      die "refusing to overwrite symlink at system destination: $dest"
+    fi
+    (( verbose )) && print -- "install -D -m $mode -o $owner -g $group -- $source $dest"
+    sudo -n install -D -T -m "$mode" -o "$owner" -g "$group" -- "$source" "$dest"
+  done
+}
+
+validate_uninstall_batch() {
+  sudo -n -v || die "sudo session expired before uninstall validation; re-run to refresh"
+  local source rel_path dest
+  local i
+  for (( i = 1; i <= ${#batch_sources[@]}; i++ )); do
+    source="${batch_sources[$i]}"
+    rel_path="${batch_rel_paths[$i]}"
+    dest="/$rel_path"
+    { sudo -n test -e "$dest" || sudo -n test -L "$dest"; } || continue
+    if ! sudo -n test -f "$dest" || sudo -n test -L "$dest"; then
+      print -u2 -- "not ok - refusing to remove non-regular or symlinked system path: $dest"
+      return 1
+    fi
+    if ! sudo -n cmp -s -- "$source" "$dest"; then
+      print -u2 -- "not ok - refusing to remove drifted system path: $dest"
+      return 1
+    fi
+  done
+}
+
+uninstall_selected_files() {
+  local source rel_path dest
+  local i
+
+  for (( i = 1; i <= ${#batch_sources[@]}; i++ )); do
+    source="${batch_sources[$i]}"
+    rel_path="${batch_rel_paths[$i]}"
+    dest="/$rel_path"
+
+    if ! sudo -n test -e "$dest" && ! sudo -n test -L "$dest"; then
+      (( verbose )) && print -- "skip missing: $dest"
+      continue
+    fi
+
+    if ! sudo -n test -f "$dest" || sudo -n test -L "$dest"; then
+      print -u2 -- "not ok - refusing to remove non-regular or symlinked system path: $dest"
+      return 1
+    fi
+
+    if ! sudo -n cmp -s -- "$source" "$dest"; then
+      print -u2 -- "not ok - refusing to remove drifted system path: $dest"
+      return 1
+    fi
+  done
+
+  for (( i = 1; i <= ${#batch_sources[@]}; i++ )); do
+    rel_path="${batch_rel_paths[$i]}"
+    dest="/$rel_path"
+
+    if ! sudo -n test -e "$dest" && ! sudo -n test -L "$dest"; then
+      continue
+    fi
+
+    (( verbose )) && print -- "rm -f -- $dest"
+    sudo -n rm -f -- "$dest"
+  done
+}
+
+verify_selected_files_installed_for_activation() {
+  local source rel_path dest expected_mode expected_owner expected_group
+  local actual_mode actual_owner actual_group owner_stat_format group_stat_format
+  local i failures=0
+
+  for (( i = 1; i <= ${#batch_sources[@]}; i++ )); do
+    source="${batch_sources[$i]}"
+    rel_path="${batch_rel_paths[$i]}"
+    expected_mode="${batch_modes[$i]}"
+    expected_owner="${batch_owners[$i]}"
+    expected_group="${batch_groups[$i]}"
+    dest="/$rel_path"
+    owner_stat_format="%U"
+    group_stat_format="%G"
+
+    if ! sudo -n test -e "$dest" 2>/dev/null && ! sudo -n test -L "$dest" 2>/dev/null; then
+      print -u2 -- "not ok - cannot activate because system path is missing: $dest"
+      failures=$(( failures + 1 ))
+      continue
+    fi
+
+    if ! sudo -n test -f "$dest" 2>/dev/null || sudo -n test -L "$dest" 2>/dev/null; then
+      print -u2 -- "not ok - cannot activate because system path is not a regular file: $dest"
+      failures=$(( failures + 1 ))
+      continue
+    fi
+
+    if [[ "$expected_owner" =~ '^[0-9]+$' ]]; then
+      owner_stat_format="%u"
+    fi
+    if [[ "$expected_group" =~ '^[0-9]+$' ]]; then
+      group_stat_format="%g"
+    fi
+
+    actual_owner="$(sudo -n stat -c "$owner_stat_format" -- "$dest")" || {
+      print -u2 -- "not ok - cannot stat system path owner before activation: $dest"
+      failures=$(( failures + 1 ))
+      continue
+    }
+    actual_group="$(sudo -n stat -c "$group_stat_format" -- "$dest")" || {
+      print -u2 -- "not ok - cannot stat system path group before activation: $dest"
+      failures=$(( failures + 1 ))
+      continue
+    }
+    actual_mode="$(sudo -n stat -c '%a' -- "$dest")" || {
+      print -u2 -- "not ok - cannot stat system path mode before activation: $dest"
+      failures=$(( failures + 1 ))
+      continue
+    }
+
+    if [[ "$actual_owner:$actual_group" != "$expected_owner:$expected_group" ]]; then
+      print -u2 -- "not ok - cannot activate because system path owner/group differs from manifest: $dest"
+      print -u2 -- "         expected: $expected_owner:$expected_group"
+      print -u2 -- "         actual:   $actual_owner:$actual_group"
+      failures=$(( failures + 1 ))
+    fi
+
+    if [[ "$actual_mode" != "$expected_mode" ]]; then
+      print -u2 -- "not ok - cannot activate because system path mode differs from manifest: $dest"
+      print -u2 -- "         expected: $expected_mode"
+      print -u2 -- "         actual:   $actual_mode"
+      failures=$(( failures + 1 ))
+    fi
+
+    if ! sudo -n cmp -s -- "$source" "$dest"; then
+      print -u2 -- "not ok - cannot activate because system path content differs from repo: $dest"
+      failures=$(( failures + 1 ))
+    fi
+  done
+
+  if (( failures > 0 )); then
+    die "activation requires installed system files to match this repo; run ./run.sh install $selector first"
+  fi
+}
+
+collect_selected_files() {
+  local package source rel_path
+  local mode owner group
+  typeset -ga batch_sources batch_rel_paths batch_modes batch_owners batch_groups
+  batch_sources=()
+  batch_rel_paths=()
+  batch_modes=()
+  batch_owners=()
+  batch_groups=()
+  typeset -A _seen=()
+
+  for package in "${selected_packages[@]}"; do
+    collect_package_files "$package"
+    for rel_path in "${package_rel_paths[@]}"; do
+      (( ${+_seen[$rel_path]} )) &&
+        die "duplicate system destination /$rel_path: claimed by both '${_seen[$rel_path]}' and '$package'"
+      _seen[$rel_path]="$package"
+    done
+    for source in "${package_sources[@]}"; do
+      batch_sources+=("$source")
+    done
+    for rel_path in "${package_rel_paths[@]}"; do
+      batch_rel_paths+=("$rel_path")
+    done
+    for mode in "${package_modes[@]}"; do
+      batch_modes+=("$mode")
+    done
+    for owner in "${package_owners[@]}"; do
+      batch_owners+=("$owner")
+    done
+    for group in "${package_groups[@]}"; do
+      batch_groups+=("$group")
+    done
+  done
+
+}
+
+load_config_metadata() {
+  local package="$1"
+  local manifest="$packages_dir/$package/system-config.manifest"
+  local line rel_path mode owner group extra normalized_mode
+  local line_no=0
+  typeset -gA config_modes config_owners config_groups
+  config_modes=()
+  config_owners=()
+  config_groups=()
+
+  [[ -f "$manifest" ]] || return 0
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line_no=$(( line_no + 1 ))
+    [[ -z "$line" || "$line" == \#* ]] && continue
+
+    rel_path=""
+    mode=""
+    owner=""
+    group=""
+    extra=""
+    read -r rel_path mode owner group extra <<< "$line"
+
+    [[ -n "$rel_path" && -n "$mode" && -n "$owner" && -n "$group" && -z "$extra" ]] ||
+      die "invalid system-config manifest line $manifest:$line_no"
+    [[ "$rel_path" != /* && "$rel_path" != *../* && "$rel_path" != ../* ]] ||
+      die "invalid system-config manifest path $manifest:$line_no: $rel_path"
+    normalized_mode="$(normalize_mode "$mode")" ||
+      die "invalid system-config manifest mode $manifest:$line_no: $mode"
+    [[ -z "${config_modes[$rel_path]-}" ]] ||
+      die "duplicate system-config manifest path $manifest:$line_no: $rel_path"
+    is_protected_rel_path "$rel_path" &&
+      die "refusing protected system path in config manifest: $package $rel_path"
+
+    config_modes[$rel_path]="$normalized_mode"
+    config_owners[$rel_path]="$owner"
+    config_groups[$rel_path]="$group"
+  done < "$manifest"
+}
+
+load_units_metadata() {
+  local package="$1"
+  local manifest="$packages_dir/$package/system-units.manifest"
+  local line unit extra
+  local line_no=0
+  typeset -ga system_units
+  system_units=()
+
+  [[ -f "$manifest" ]] || return 0
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line_no=$(( line_no + 1 ))
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    unit=""
+    extra=""
+    read -r unit extra <<< "$line"
+    [[ -n "$unit" && -z "$extra" ]] ||
+      die "invalid system-units manifest line $manifest:$line_no"
+    [[ "$unit" != */* ]] ||
+      die "system-units manifest must list unit names, not paths $manifest:$line_no: $unit"
+    case "$unit" in
+      *.service|*.timer|*.path|*.socket|*.mount|*.target) ;;
+      *) die "unsupported unit type in system-units manifest $manifest:$line_no: $unit" ;;
+    esac
+    system_units+=("$unit")
+  done < "$manifest"
+}
+
+batch_has_units() {
+  local package
+  for package in "${selected_packages[@]}"; do
+    [[ -f "$packages_dir/$package/system-units.manifest" ]] && return 0
+  done
+  return 1
+}
+
+prompt_path() {
+  local prompt="$1"
+  local answer=""
+
+  [[ -r /dev/tty && -w /dev/tty ]] || die "interactive config prompt requires a TTY"
+  printf '%s: ' "$prompt" > /dev/tty
+  IFS= read -r answer < /dev/tty
+  print -r -- "$answer"
+}
+
+# Validates config manifest entries for root ownership and root-only modes before any files are copied.
+pre_validate_config_manifest() {
+  local package="$1"
+  local manifest="$packages_dir/$package/system-config.manifest"
+  local line rel_path mode owner group extra nm
+  local line_no=0
+  [[ -f "$manifest" ]] || return 0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line_no=$(( line_no + 1 ))
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    rel_path="" mode="" owner="" group="" extra=""
+    read -r rel_path mode owner group extra <<< "$line"
+    [[ -n "$rel_path" && -n "$mode" && -n "$owner" && -n "$group" && -z "$extra" ]] ||
+      die "invalid system-config manifest line $manifest:$line_no"
+    [[ "$owner" == "root" || "$owner" == "0" ]] ||
+      die "system-config.manifest entry must be root-owned: $package $rel_path (got $owner)"
+    nm="$(normalize_mode "$mode")" ||
+      die "invalid mode in system-config.manifest: $package $rel_path: $mode"
+    (( (8#$nm & 8#077) == 0 )) ||
+      die "system-config.manifest entry must be root-only mode: $package $rel_path (mode $mode)"
+  done < "$manifest"
+}
+
+# Copies a secret config WITHOUT reading its contents (install does the byte copy).
+process_package_configs() {
+  local package="$1"
+  local rel_path dest dest_parent src mode owner group
+
+  load_config_metadata "$package"
+  (( ${#config_modes[@]} > 0 )) || return 0
+
+  for rel_path in "${(@k)config_modes}"; do
+    dest="/$rel_path"
+    mode="${config_modes[$rel_path]}"
+    owner="${config_owners[$rel_path]}"
+    group="${config_groups[$rel_path]}"
+
+    if sudo -n test -e "$dest" || sudo -n test -L "$dest"; then
+      { sudo -n test -f "$dest" && ! sudo -n test -L "$dest"; } ||
+        die "config path exists but is not a regular file: $dest"
+      local existing_uid existing_mode
+      existing_uid="$(sudo -n stat -c '%u' -- "$dest")" || die "cannot stat config owner: $dest"
+      existing_mode="$(sudo -n stat -c '%a' -- "$dest")" || die "cannot stat config mode: $dest"
+      [[ "$existing_uid" == "0" ]] ||
+        die "existing config is not root-owned: $dest (fix: sudo chown root:root $dest && sudo chmod 600 $dest)"
+      (( (8#$existing_mode & 8#077) == 0 )) ||
+        die "existing config has insecure permissions: $dest (fix: sudo chmod 600 $dest)"
+      print -- "Detected existing config (left as-is): $dest"
+      continue
+    fi
+
+    [[ "$owner" == "root" || "$owner" == "0" ]] ||
+      die "refusing to install secret config with non-root owner: $dest (manifest owner: $owner; system-config.manifest entries must be root-owned)"
+
+    (( (8#$mode & 8#077) == 0 )) ||
+      die "refusing to install secret config with group/world-readable mode: $dest (mode $mode; fix the manifest entry to use 0600 or 0400)"
+
+    print -- "Package '$package' needs a root-only config at: $dest ($owner:$group mode $mode)"
+    src="$(prompt_path "Path to source config for $dest (enter path, empty = sudoedit, 'skip' = defer to later)")"
+
+    if [[ "$src" == "skip" ]]; then
+      print -u2 -- "warning - skipping config: $dest (run './run.sh activate $package' after creating it)"
+      (( configs_missing++ ))
+      continue
+    fi
+
+    if [[ -z "$src" ]]; then
+      print -- "Creating $dest in place with sudoedit (contents never copied)..."
+      dest_parent="${dest:h}"
+      sudo -n mkdir -p -- "$dest_parent" ||
+        die "cannot create config parent directory: $dest_parent"
+      sudo -e -- "$dest" || die "sudoedit cancelled or failed for $dest"
+      sudo -n test -f "$dest" || die "config was not saved: $dest"
+      sudo -n chmod "$mode" "$dest" || die "cannot set mode on $dest"
+      sudo -n chown "$owner:$group" "$dest" || die "cannot set owner on $dest"
+      continue
+    fi
+
+    [[ -f "$src" && ! -L "$src" ]] || die "config source must be a regular non-symlink file: $src"
+    [[ -s "$src" ]] || die "config source is empty: $src"
+    print -- "Installing config to $dest (root-only; contents are not read by this script)"
+    sudo -n install -D -m "$mode" -o "$owner" -g "$group" -- "$src" "$dest"
+  done
+}
+
+require_configs_present() {
+  local package="$1"
+  local rel_path dest uid mode
+
+  load_config_metadata "$package"
+  (( ${#config_modes[@]} > 0 )) || return 0
+
+  for rel_path in "${(@k)config_modes}"; do
+    dest="/$rel_path"
+    { sudo -n test -f "$dest" && ! sudo -n test -L "$dest"; } ||
+      die "cannot activate $package: required config missing or not a regular file: $dest (create it, e.g. sudoedit $dest)"
+    uid="$(sudo -n stat -c '%u' -- "$dest")" || die "cannot stat config owner: $dest"
+    mode="$(sudo -n stat -c '%a' -- "$dest")" || die "cannot stat config mode: $dest"
+    [[ "$uid" == "0" ]] || die "config must be owned by root: $dest"
+    (( (8#$mode & 8#077) == 0 )) || die "config must be root-only, for example mode 0600: $dest"
+  done
+}
+
+activate_units() {
+  local package="$1"
+  local unit unit_file managed_target
+  local -A activation_bases  # service bases that should not be started directly
+
+  load_units_metadata "$package"
+  (( ${#system_units[@]} > 0 )) || return 0
+  command -v systemctl >/dev/null 2>&1 || die "systemctl is required to activate units for $package"
+
+  for unit in "${system_units[@]}"; do
+    unit_file="$packages_dir/$package/system-install/etc/systemd/system/$unit"
+    case "$unit" in
+      *.timer)
+        managed_target="$(grep -m1 '^Unit=' "$unit_file" 2>/dev/null | cut -d= -f2- || :)"
+        if [[ -n "$managed_target" ]]; then
+          activation_bases["${managed_target%.service}"]=1
+        else
+          activation_bases["${unit%.timer}"]=1
+        fi
+        ;;
+      *.socket)
+        managed_target="$(grep -m1 '^Service=' "$unit_file" 2>/dev/null | cut -d= -f2- || :)"
+        if [[ -n "$managed_target" ]]; then
+          activation_bases["${managed_target%.service}"]=1
+        else
+          activation_bases["${unit%.socket}"]=1
+        fi
+        ;;
+      *.path)
+        managed_target="$(grep -m1 '^Unit=' "$unit_file" 2>/dev/null | cut -d= -f2- || :)"
+        if [[ -n "$managed_target" ]]; then
+          activation_bases["${managed_target%.service}"]=1
+        else
+          activation_bases["${unit%.path}"]=1
+        fi
+        ;;
+    esac
+  done
+
+  print -- "Reloading systemd manager for $package units"
+  sudo -n systemctl daemon-reload
+  for unit in "${system_units[@]}"; do
+    case "$unit" in
+      *.timer|*.path|*.socket)
+        print -- "Enabling and starting $unit"
+        sudo -n systemctl enable --now "$unit"
+        sudo -n systemctl restart "$unit"
+        ;;
+      *.service)
+        if [[ -n "${activation_bases[${unit%.service}]+x}" ]]; then
+          print -- "Skipping $unit (managed by a socket, path, or timer unit)"
+        else
+          print -- "Starting $unit"
+          sudo -n systemctl start "$unit"
+        fi
+        ;;
+      *)
+        print -- "Starting $unit"
+        sudo -n systemctl start "$unit"
+        ;;
+    esac
+  done
+}
+
+deactivate_units() {
+  local package="$1"
+  local unit
+
+  load_units_metadata "$package"
+  (( ${#system_units[@]} > 0 )) || return 0
+  command -v systemctl >/dev/null 2>&1 || die "systemctl is required to deactivate units for $package"
+
+  for unit in "${system_units[@]}"; do
+    case "$unit" in
+      *.timer|*.path|*.socket)
+        print -- "Disabling and stopping $unit"
+        sudo -n systemctl disable --now "$unit" || print -u2 -- "warning: failed to disable $unit (ignored)"
+        ;;
+      *)
+        print -- "Stopping $unit"
+        sudo -n systemctl stop "$unit" || print -u2 -- "warning: failed to stop $unit (ignored)"
+        ;;
+    esac
+  done
+}
+
+(( $# >= 2 )) || {
+  usage
+  exit 64
+}
+
+action="$1"
+shift
+selector=""
+verbose=0
+
+case "$action" in
+  install|uninstall|activate) ;;
+  *)
+    usage
+    exit 64
+    ;;
+esac
+
+while (( $# > 0 )); do
+  case "$1" in
+    --verbose|-v)
+      [[ "$action" != "activate" ]] || die "--verbose is not supported for activate"
+      verbose=1
+      ;;
+    --)
+      shift
+      (( $# == 1 )) || {
+        usage
+        exit 64
+      }
+      [[ -z "$selector" ]] || {
+        usage
+        exit 64
+      }
+      selector="$1"
+      ;;
+    -*)
+      die "unknown option: $1"
+      ;;
+    *)
+      [[ -z "$selector" ]] || {
+        usage
+        exit 64
+      }
+      selector="$1"
+      ;;
+  esac
+  shift
+done
+
+[[ -n "$selector" ]] || {
+  usage
+  exit 64
+}
+
+select_packages "$selector"
+if (( ${#selected_packages[@]} == 0 )); then
+  print -- "No system packages selected for: $selector"
+  exit 0
+fi
+
+command -v sudo >/dev/null 2>&1 || die "sudo is required for system copy-install"
+command -v stat >/dev/null 2>&1 || die "stat is required"
+if [[ "$action" == "install" ]]; then
+  command -v install >/dev/null 2>&1 || die "install is required"
+fi
+command -v cmp >/dev/null 2>&1 || die "cmp is required"
+
+# Fail fast on repo/manifest inconsistencies before touching the live system.
+"$repo_root/scripts/check-repo" -- "${selected_packages[@]}"
+
+load_protected_paths
+collect_selected_files
+start_sudo_session "System package changes require sudo. The password is requested once; later prompts are y/N decisions."
+
+case "$action" in
+  install)
+    print -- "Installing system package(s): ${selected_packages[*]}"
+    for package in "${selected_packages[@]}"; do
+      pre_validate_config_manifest "$package"
+    done
+    if (( ${#batch_sources[@]} > 0 )); then
+      if confirm_action "Copy selected system files to / using manifest ownership and modes?"; then
+        install_selected_files
+      else
+        die "system install aborted before copying files"
+      fi
+    fi
+
+    configs_missing=0
+    for package in "${selected_packages[@]}"; do
+      process_package_configs "$package"
+    done
+
+    if (( configs_missing > 0 )); then
+      print -u2 -- "warning - some required config(s) were skipped; services were not activated."
+      print -u2 -- "warning - create the missing config(s) shown above, then run: ./run.sh activate <package>"
+    elif batch_has_units; then
+      if confirm_action "Activate services for: ${selected_packages[*]} now?"; then
+        for package in "${selected_packages[@]}"; do
+          activate_units "$package"
+        done
+      else
+        print -- "Skipped activation. Run later: ./run.sh activate <package>"
+      fi
+    fi
+    ;;
+  uninstall)
+    print -- "Uninstalling system package(s): ${selected_packages[*]}"
+    confirm_action "Remove matching system files from /?" ||
+      die "system uninstall aborted before removing files"
+    validate_uninstall_batch ||
+      die "uninstall aborted: drift or unexpected state detected"
+    for package in "${selected_packages[@]}"; do
+      deactivate_units "$package"
+    done
+    uninstall_selected_files
+    if batch_has_units; then
+      sudo -n systemctl daemon-reload ||
+        print -u2 -- "warning: systemctl daemon-reload failed after uninstall"
+    fi
+    ;;
+  activate)
+    print -- "Activating system package service(s): ${selected_packages[*]}"
+    verify_selected_files_installed_for_activation
+    for package in "${selected_packages[@]}"; do
+      require_configs_present "$package"
+    done
+    for package in "${selected_packages[@]}"; do
+      activate_units "$package"
+    done
+    ;;
+esac

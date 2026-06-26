@@ -1,9 +1,0 @@
-#!/usr/bin/env zsh
-emulate -L zsh
-set -euo pipefail
-
-repo_root="${0:A:h:h}"
-manifest="$repo_root/manifests/stow-packages.txt"
-
-cd "$repo_root/stow"
-xargs stow --target="$HOME" --no-folding --restow < "$manifest"

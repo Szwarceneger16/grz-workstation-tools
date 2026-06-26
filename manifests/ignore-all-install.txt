@@ -1,0 +1,2 @@
+# Packages listed here are excluded from: ./run.sh install all
+# One package name per line; lines starting with # are comments.

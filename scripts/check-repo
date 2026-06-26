@@ -1,0 +1,289 @@
+#!/usr/bin/env zsh
+emulate -L zsh
+set -euo pipefail
+
+# Static consistency linter for package declarations.
+# Verifies (without sudo, without touching the live system):
+#   - every system-install file is declared in system-install.manifest (and vice versa),
+#   - every installed systemd unit is declared in system-units.manifest,
+#   - every *.example config has its real destination declared in system-config.manifest,
+#   - no real (non-.example) secret config is committed in the repo,
+#   - only the allowed *.hook.sh files exist, are executable, and contain no sudo.
+#
+# Usage: check-repo [--] [<package> ...]   (no package = check all)
+
+script_name="${0:t}"
+repo_root="${0:A:h:h}"
+packages_dir="$repo_root/packages"
+
+errors=0
+allowed_hooks=(user-activate.hook.sh user-deactivate.hook.sh verify.hook.sh)
+protected_paths_file="$repo_root/manifests/protected-system-paths.txt"
+typeset -a protected_paths
+protected_paths=()
+
+_load_protected_paths() {
+  local line
+  [[ -f "$protected_paths_file" ]] || return 0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    protected_paths+=("$line")
+  done < "$protected_paths_file"
+}
+
+_is_protected_rel_path() {
+  local rel_path="$1" pattern
+  for pattern in "${protected_paths[@]}"; do
+    [[ "$rel_path" == ${~pattern} ]] && return 0
+  done
+  return 1
+}
+
+err() {
+  print -u2 -- "$script_name: ERROR: $*"
+  errors=$(( errors + 1 ))
+}
+
+is_meta_file() {
+  local rel="$1"
+  case "$rel" in
+    .gitkeep|*/.gitkeep|.stow-local-ignore|*/.stow-local-ignore) return 0 ;;
+  esac
+  return 1
+}
+
+load_4col_manifest() {
+  local manifest="$1" line rel_path mode owner group extra
+  local line_no=0
+  typeset -gA manifest_paths
+  manifest_paths=()
+  [[ -f "$manifest" ]] || return 0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line_no=$(( line_no + 1 ))
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    rel_path="" mode="" owner="" group="" extra=""
+    read -r rel_path mode owner group extra <<< "$line"
+    if [[ -z "$rel_path" || -z "$mode" || -z "$owner" || -z "$group" || -n "$extra" ]]; then
+      err "invalid manifest row (expected: path mode owner group) at $manifest:$line_no"
+      continue
+    fi
+    if [[ "$rel_path" == /* || "$rel_path" == *../* || "$rel_path" == ../* || "$rel_path" == *.. ]]; then
+      err "invalid manifest path (absolute or traversal) at $manifest:$line_no: $rel_path"
+      continue
+    fi
+    if ! [[ "$mode" =~ '^[0-7]{3,4}$' ]]; then
+      err "invalid mode '$mode' at $manifest:$line_no"
+      continue
+    fi
+    if ! [[ "$owner" =~ '^[A-Za-z_][A-Za-z0-9_-]*$|^[0-9]+$' ]]; then
+      err "invalid owner '$owner' at $manifest:$line_no"
+      continue
+    fi
+    if ! [[ "$group" =~ '^[A-Za-z_][A-Za-z0-9_-]*$|^[0-9]+$' ]]; then
+      err "invalid group '$group' at $manifest:$line_no"
+      continue
+    fi
+    if [[ -n "${manifest_paths[$rel_path]-}" ]]; then
+      err "duplicate manifest entry '$rel_path' at $manifest:$line_no"
+      continue
+    fi
+    manifest_paths[$rel_path]=1
+  done < "$manifest"
+}
+
+_check_config_manifest_security() {
+  local manifest="$1" package="$2" line rel_path mode owner group extra
+  local line_no=0
+  [[ -f "$manifest" ]] || return 0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line_no=$(( line_no + 1 ))
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    rel_path="" mode="" owner="" group="" extra=""
+    read -r rel_path mode owner group extra <<< "$line"
+    [[ -n "$rel_path" && -n "$mode" && -n "$owner" && -n "$group" && -z "$extra" ]] || continue
+    [[ "$owner" == "root" || "$owner" == "0" ]] ||
+      err "$package: system-config.manifest entry must be root-owned: $rel_path (got: $owner)"
+    [[ "$mode" =~ '^[0-7]{3,4}$' ]] || continue
+    (( (8#$mode & 8#077) == 0 )) ||
+      err "$package: system-config.manifest entry must have root-only mode (no group/world bits): $rel_path (got: $mode)"
+  done < "$manifest"
+}
+
+load_units_manifest() {
+  local manifest="$1" line unit extra
+  local line_no=0
+  typeset -gA manifest_paths
+  manifest_paths=()
+  [[ -f "$manifest" ]] || return 0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line_no=$(( line_no + 1 ))
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    unit="" extra=""
+    read -r unit extra <<< "$line"
+    if [[ -z "$unit" || -n "$extra" ]]; then
+      err "invalid manifest row (expected: unit-name) at $manifest:$line_no"
+      continue
+    fi
+    if [[ "$unit" == */* ]]; then
+      err "unit name must not contain a slash at $manifest:$line_no: $unit"
+      continue
+    fi
+    case "$unit" in
+      *.service|*.timer|*.path|*.socket|*.mount|*.target) ;;
+      *)
+        err "unsupported unit suffix at $manifest:$line_no: $unit"
+        continue
+        ;;
+    esac
+    if [[ -n "${manifest_paths[$unit]-}" ]]; then
+      err "duplicate unit '$unit' at $manifest:$line_no"
+      continue
+    fi
+    manifest_paths[$unit]=1
+  done < "$manifest"
+}
+
+check_hooks() {
+  local package="$1"
+  local pkg_dir="$packages_dir/$package"
+  local f base hook ok
+
+  for f in "$pkg_dir"/*.hook.sh(N); do
+    base="${f:t}"
+    ok=0
+    for hook in "${allowed_hooks[@]}"; do
+      [[ "$base" == "$hook" ]] && { ok=1; break; }
+    done
+    if (( ! ok )); then
+      err "$package: unknown hook file (allowed: ${allowed_hooks[*]}): $base"
+      continue
+    fi
+    [[ ! -L "$f" ]] || err "$package: hook must be a regular file, not a symlink: $base"
+    [[ -x "$f" ]] || err "$package: hook is not executable: $base"
+    if grep -nE '(^|[[:space:];&|(])(/usr/bin/|/bin/)?sudo([[:space:]]|$)' -- "$f" >/dev/null 2>&1; then
+      err "$package: hook must not use sudo (user-level only): $base"
+    fi
+  done
+
+  for f in "$pkg_dir"/*/**/*.hook.sh(ND.); do
+    err "$package: hook must live in package root, not in any subdirectory: ${f#$pkg_dir/}"
+  done
+}
+
+check_system_layer() {
+  local package="$1"
+  local sys_dir="$packages_dir/$package/system-install"
+  local install_manifest="$packages_dir/$package/system-install.manifest"
+  local units_manifest="$packages_dir/$package/system-units.manifest"
+  local config_manifest="$packages_dir/$package/system-config.manifest"
+  local f rel base real_rel
+  typeset -A install_paths config_paths unit_names
+
+  [[ ! -L "$sys_dir" ]] || { err "$package: system-install must not be a symlink"; return 0; }
+  [[ -d "$sys_dir" ]] || return 0
+
+  if [[ ! -f "$install_manifest" ]]; then
+    err "$package: has system-install/ but no system-install.manifest"
+    return 0
+  fi
+
+  load_4col_manifest "$install_manifest"
+  install_paths=("${(@kv)manifest_paths}")
+  for rel in "${(@k)install_paths}"; do
+    _is_protected_rel_path "$rel" &&
+      err "$package: protected system path in system-install.manifest: $rel"
+  done
+
+  # Check 1: every system-install file is declared.
+  for f in "$sys_dir"/**/*(DN.); do
+    rel="${f#$sys_dir/}"
+    is_meta_file "$rel" && continue
+    [[ -n "${install_paths[$rel]-}" ]] || err "$package: system file not in system-install.manifest: $rel"
+  done
+  for f in "$sys_dir"/**/*(DN@); do
+    rel="${f#$sys_dir/}"
+    is_meta_file "$rel" && continue
+    err "$package: system-install must not contain symlinks: $rel"
+  done
+  # Reverse: every manifest entry has a repo file.
+  for rel in "${(@k)install_paths}"; do
+    [[ -f "$sys_dir/$rel" ]] || err "$package: system-install.manifest entry has no repo file: $rel"
+    [[ ! -L "$sys_dir/$rel" ]] || err "$package: system-install.manifest entry must not be a symlink: $rel"
+  done
+
+  # Check 2: every installed systemd unit is declared in system-units.manifest.
+  load_units_manifest "$units_manifest"
+  unit_names=("${(@kv)manifest_paths}")
+  for f in "$sys_dir"/etc/systemd/system/*(N.); do
+    base="${f:t}"
+    case "$base" in
+      *.service|*.timer|*.path|*.socket|*.mount|*.target)
+        [[ -n "${unit_names[$base]-}" ]] || err "$package: systemd unit not in system-units.manifest: $base"
+        ;;
+    esac
+  done
+  # Reverse: every manifest unit has a repo unit file.
+  for base in "${(@k)unit_names}"; do
+    [[ -f "$sys_dir/etc/systemd/system/$base" ]] ||
+      err "$package: system-units.manifest entry has no repo unit file: $base"
+  done
+
+  # Validate that custom timer Unit= targets are declared in the manifest.
+  local timer_custom_svc
+  for f in "$sys_dir"/etc/systemd/system/*.timer(N.); do
+    timer_custom_svc="$(grep -m1 '^Unit=' "$f" 2>/dev/null | cut -d= -f2- || :)"
+    [[ -n "$timer_custom_svc" ]] || continue
+    [[ -n "${unit_names[$timer_custom_svc]-}" ]] ||
+      err "$package: ${f:t} references Unit=$timer_custom_svc which is not in system-units.manifest"
+  done
+
+  load_4col_manifest "$config_manifest"
+  _check_config_manifest_security "$config_manifest" "$package"
+  config_paths=("${(@kv)manifest_paths}")
+  for rel in "${(@k)config_paths}"; do
+    _is_protected_rel_path "$rel" &&
+      err "$package: protected system path in system-config.manifest: $rel"
+  done
+
+  # Check 3: every *.example config maps to a declared real destination.
+  for f in "$sys_dir"/**/*.example(DN.); do
+    rel="${f#$sys_dir/}"
+    real_rel="${rel%.example}"
+    [[ -n "${config_paths[$real_rel]-}" ]] ||
+      err "$package: example config without system-config.manifest entry for real dest: $real_rel (from $rel)"
+  done
+
+  # Check 4: a real (non-.example) secret config must never be committed.
+  for rel in "${(@k)config_paths}"; do
+    [[ -e "$sys_dir/$rel" ]] &&
+      err "$package: secret config must not be committed; found real file: system-install/$rel"
+  done
+}
+
+typeset -a packages_to_check
+packages_to_check=()
+(( $# > 0 )) && [[ "$1" == "--" ]] && shift
+
+if (( $# > 0 )); then
+  packages_to_check=("$@")
+else
+  typeset d
+  for d in "$packages_dir"/*(N/); do
+    packages_to_check+=("${d:t}")
+  done
+fi
+
+_load_protected_paths
+
+for package in "${packages_to_check[@]}"; do
+  [[ -d "$packages_dir/$package" ]] || { err "unknown package: $package"; continue; }
+  check_hooks "$package"
+  check_system_layer "$package"
+done
+
+if (( errors > 0 )); then
+  print -u2 -- "$script_name: FAILED with $errors error(s)"
+  exit 1
+fi
+
+print -- "$script_name: ok (${#packages_to_check[@]} package(s) checked)"

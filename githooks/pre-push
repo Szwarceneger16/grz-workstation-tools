@@ -1,0 +1,18 @@
+#!/usr/bin/env sh
+# Pre-push hook: run the repo consistency linter before anything leaves this machine.
+#
+# Enable once with:
+#   git config core.hooksPath githooks
+#
+# To bypass for a single push (not recommended): git push --no-verify
+
+set -eu
+
+repo_root="$(git rev-parse --show-toplevel)"
+
+if [ ! -x "$repo_root/scripts/check-repo" ]; then
+  printf 'pre-push: scripts/check-repo is missing or not executable\n' >&2
+  exit 1
+fi
+
+exec "$repo_root/scripts/check-repo"

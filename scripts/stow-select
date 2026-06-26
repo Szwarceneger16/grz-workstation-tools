@@ -1,0 +1,339 @@
+#!/usr/bin/env zsh
+emulate -L zsh
+set -euo pipefail
+script_name="${0:t}"
+
+usage() {
+  print -u2 -- "usage: $script_name install|uninstall [--verbose] all|<package>"
+  print -u2 -- "       ./run.sh install [--verbose] all"
+  print -u2 -- "       ./run.sh install [--verbose] shell-bootstrap"
+  print -u2 -- "       ./run.sh uninstall [--verbose] all"
+  print -u2 -- "       ./run.sh uninstall [--verbose] shell-bootstrap"
+}
+
+die() {
+  print -u2 -- "$script_name: $*"
+  exit 1
+}
+
+load_ignored_packages() {
+  local line package
+  typeset -gA ignored_packages
+  ignored_packages=()
+
+  [[ -f "$ignore_all_file" ]] || return 0
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    package="$line"
+    [[ "$package" =~ '^[A-Za-z0-9._-]+$' ]] || die "invalid package name: $package"
+    if [[ ! -e "$stow_dir/$package" ]]; then
+      continue
+    fi
+    validate_package "$package"
+    ignored_packages[$package]=1
+  done < "$ignore_all_file"
+}
+
+load_all_packages() {
+  local package_path package
+  typeset -ga selected_packages
+  selected_packages=()
+
+  load_ignored_packages
+
+  for package_path in "$stow_dir"/*(N); do
+    package="${package_path:t}"
+    [[ -n "${ignored_packages[$package]-}" ]] && continue
+    selected_packages+=("$package")
+  done
+
+  (( ${#selected_packages[@]} > 0 )) || die "no packages selected from: $stow_dir"
+}
+
+load_all_packages_noignore() {
+  local package_path package
+  typeset -ga selected_packages
+  selected_packages=()
+
+  for package_path in "$stow_dir"/*(N); do
+    package="${package_path:t}"
+    selected_packages+=("$package")
+  done
+
+  (( ${#selected_packages[@]} > 0 )) || die "no packages selected from: $stow_dir"
+}
+
+validate_package() {
+  local package="$1"
+
+  [[ "$package" =~ '^[A-Za-z0-9._-]+$' ]] || die "invalid package name: $package"
+  [[ -e "$stow_dir/$package" ]] || die "unknown stow package: $package"
+  if [[ -L "$stow_dir/$package" ]]; then
+    local actual; actual="$(readlink -- "$stow_dir/$package")"
+    [[ "$actual" == "../packages/$package/install" ]] ||
+      die "stow/$package symlink points to wrong target (expected ../packages/$package/install, got $actual)"
+  else
+    die "stow/$package must be a symlink to ../packages/$package/install, not a real directory or file"
+  fi
+  [[ -d "$repo_root/packages/$package/install" ]] || die "missing install dir for package: $package"
+}
+
+run_stow() {
+  local terminal_width="${COLUMNS:-100}"
+
+  if (( verbose )); then
+    stow "$@" 2>&1 | awk -v package="$current_package" -v width="$terminal_width" '
+      function depth(path, parts, count) {
+        gsub(/^\.?\//, "", path)
+        gsub(/\/$/, "", path)
+        if (path == "" || path == ".") {
+          return 0
+        }
+        count = split(path, parts, "/")
+        return count
+      }
+
+      function break_at(line, limit, i, char, fallback) {
+        fallback = limit
+        for (i = limit; i >= 1; i--) {
+          char = substr(line, i, 1)
+          if (char == " " || char == "/") {
+            if (i >= int(limit * 0.45)) {
+              return i
+            }
+          }
+        }
+        return fallback
+      }
+
+      function print_indented(level, line, i, prefix, limit, cut, chunk, wrapped) {
+        prefix = ""
+        for (i = 0; i < level * 2; i++) {
+          prefix = prefix " "
+        }
+
+        limit = width - length(prefix)
+        if (limit < 24) {
+          limit = 24
+        }
+
+        wrapped = 0
+        while (length(line) > limit) {
+          wrapped = 1
+          cut = break_at(line, limit)
+          chunk = substr(line, 1, cut)
+          sub(/[[:space:]]+$/, "", chunk)
+          print prefix chunk
+          line = substr(line, cut + 1)
+          sub(/^[[:space:]]+/, "", line)
+        }
+
+        print prefix line
+        if (wrapped) {
+          print prefix
+        }
+      }
+
+      function package_relative_path(path, marker, pos) {
+        sub(/ \(cwd=.*/, "", path)
+        marker = "/" package "/"
+        pos = index(path, marker)
+        if (pos > 0) {
+          return substr(path, pos + length(marker))
+        }
+        if (path ~ "/" package "$" || path == package) {
+          return ""
+        }
+        return path
+      }
+
+      {
+        line = $0
+
+        if (line ~ /^(stow dir|cwd now|cwd restored|Planning |Processing tasks)/) {
+          print line
+          next
+        }
+
+        if (line ~ /^Stowing contents of / || line ~ /^Unstowing /) {
+          path = line
+          sub(/^Stowing contents of /, "", path)
+          sub(/^Unstowing /, "", path)
+          rel = package_relative_path(path)
+          print_indented(depth(rel), line)
+          next
+        }
+
+        marker = " / " package " / "
+        pos = index(line, marker)
+        if (pos > 0) {
+          rel = substr(line, pos + length(marker))
+          print_indented(depth(rel), line)
+          next
+        }
+
+        if (line ~ /^(LINK|UNLINK|MKDIR|RMDIR): /) {
+          path = line
+          sub(/^[A-Z]+: /, "", path)
+          sub(/ =>.*/, "", path)
+          sub(/ .*/, "", path)
+          print_indented(depth(path), line)
+          next
+        }
+
+        if (line ~ /^--- Is /) {
+          path = line
+          sub(/^--- Is /, "", path)
+          sub(/ foldable\?.*/, "", path)
+          last_meta_level = depth(path)
+          print_indented(last_meta_level, line)
+          next
+        }
+
+        if (line ~ /^--- /) {
+          print_indented(last_meta_level, line)
+          next
+        }
+
+        if (line ~ / did not exist to be unstowed$/) {
+          path = line
+          sub(/ did not exist.*/, "", path)
+          print_indented(depth(path), line)
+          next
+        }
+
+        print_indented(1, line)
+      }
+    '
+  else
+    stow "$@"
+  fi
+}
+
+print_package_header() {
+  local package="$1"
+
+  print -- ""
+  print -- "=== $package ==="
+  print -- ""
+}
+
+run_stow_for_packages() {
+  local stow_action="$1"
+  shift
+  local package
+
+  if (( verbose )); then
+    for package in "$@"; do
+      current_package="$package"
+      print_package_header "$package"
+      print -- "Running: stow ${stow_args[*]} $stow_action -- $package"
+      run_stow "${stow_args[@]}" "$stow_action" -- "$package"
+    done
+  else
+    run_stow "${stow_args[@]}" "$stow_action" -- "$@"
+  fi
+}
+
+(( $# >= 2 )) || {
+  usage
+  exit 64
+}
+
+action="$1"
+shift
+selector=""
+verbose=0
+
+case "$action" in
+  install|uninstall) ;;
+  *)
+    usage
+    exit 64
+    ;;
+esac
+
+while (( $# > 0 )); do
+  case "$1" in
+    --verbose|-v)
+      verbose=1
+      ;;
+    --)
+      shift
+      (( $# == 1 )) || {
+        usage
+        exit 64
+      }
+      [[ -z "$selector" ]] || {
+        usage
+        exit 64
+      }
+      selector="$1"
+      ;;
+    -*)
+      die "unknown option: $1"
+      ;;
+    *)
+      [[ -z "$selector" ]] || {
+        usage
+        exit 64
+      }
+      selector="$1"
+      ;;
+  esac
+  shift
+done
+
+[[ -n "$selector" ]] || {
+  usage
+  exit 64
+}
+
+repo_root="${0:A:h:h}"
+ignore_all_file="$repo_root/manifests/ignore-all-install.txt"
+stow_dir="$repo_root/stow"
+target="${STOW_TARGET:-$HOME}"
+typeset -a selected_packages
+typeset -A ignored_packages
+
+command -v stow >/dev/null 2>&1 || die "GNU Stow is required"
+[[ -d "$stow_dir" ]] || die "missing stow directory: $stow_dir"
+[[ -d "$target" ]] || die "target directory does not exist: $target"
+
+if [[ "$selector" == "all" ]]; then
+  load_all_packages
+elif [[ "$selector" == "all-user" ]]; then
+  load_all_packages_noignore
+else
+  selected_packages=("$selector")
+fi
+
+for package in "${selected_packages[@]}"; do
+  validate_package "$package"
+done
+
+cd "$stow_dir"
+
+typeset -a stow_args
+stow_args=(--target="$target" --no-folding)
+
+if (( verbose )); then
+  print -- "repo_root: $repo_root"
+  print -- "stow_dir: $stow_dir"
+  print -- "target: $target"
+  print -- "selector: $selector"
+  print -- "packages: ${selected_packages[*]}"
+  stow_args+=(--verbose=3)
+fi
+
+case "$action" in
+  install)
+    print -- "Installing: ${selected_packages[*]}"
+    run_stow_for_packages --restow "${selected_packages[@]}"
+    ;;
+  uninstall)
+    print -- "Uninstalling: ${selected_packages[*]}"
+    run_stow_for_packages --delete "${selected_packages[@]}"
+    ;;
+esac
