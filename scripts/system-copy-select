@@ -635,19 +635,27 @@ activate_units() {
     unit_file="$packages_dir/$package/system-install/etc/systemd/system/$unit"
     case "$unit" in
       *.timer)
-        managed_target="$(grep -m1 '^Unit=' "$unit_file" 2>/dev/null | cut -d= -f2-)"
+        managed_target="$(grep -m1 '^Unit=' "$unit_file" 2>/dev/null | cut -d= -f2- || :)"
         if [[ -n "$managed_target" ]]; then
           activation_bases["${managed_target%.service}"]=1
         else
           activation_bases["${unit%.timer}"]=1
         fi
         ;;
-      *.socket|*.path)
-        managed_target="$(grep -m1 '^Service=' "$unit_file" 2>/dev/null | cut -d= -f2-)"
+      *.socket)
+        managed_target="$(grep -m1 '^Service=' "$unit_file" 2>/dev/null | cut -d= -f2- || :)"
         if [[ -n "$managed_target" ]]; then
           activation_bases["${managed_target%.service}"]=1
         else
-          activation_bases["${unit%.*}"]=1
+          activation_bases["${unit%.socket}"]=1
+        fi
+        ;;
+      *.path)
+        managed_target="$(grep -m1 '^Unit=' "$unit_file" 2>/dev/null | cut -d= -f2- || :)"
+        if [[ -n "$managed_target" ]]; then
+          activation_bases["${managed_target%.service}"]=1
+        else
+          activation_bases["${unit%.path}"]=1
         fi
         ;;
     esac

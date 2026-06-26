@@ -583,11 +583,7 @@ verify_system_package() {
       failures=$(( failures + 1 ))
   done
 
-  if [[ "$verify_context" == "install" ]]; then
-    print -- "Skipping live config verification during install-time verify; activation creates it."
-  else
-    verify_system_config_paths "$package" || failures=$(( failures + 1 ))
-  fi
+  verify_system_config_paths "$package" || failures=$(( failures + 1 ))
   verify_system_live_units "$package" || failures=$(( failures + 1 ))
 
   if (( failures > 0 )); then

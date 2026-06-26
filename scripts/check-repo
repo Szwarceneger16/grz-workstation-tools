@@ -231,7 +231,7 @@ check_system_layer() {
   # Validate that custom timer Unit= targets are declared in the manifest.
   local timer_custom_svc
   for f in "$sys_dir"/etc/systemd/system/*.timer(N.); do
-    timer_custom_svc="$(grep -m1 '^Unit=' "$f" 2>/dev/null | cut -d= -f2-)"
+    timer_custom_svc="$(grep -m1 '^Unit=' "$f" 2>/dev/null | cut -d= -f2- || :)"
     [[ -n "$timer_custom_svc" ]] || continue
     [[ -n "${unit_names[$timer_custom_svc]-}" ]] ||
       err "$package: ${f:t} references Unit=$timer_custom_svc which is not in system-units.manifest"
