@@ -14,27 +14,14 @@ pr-open-comments() {
     echo "pr-open-comments - fetch unresolved GitHub PR review comments"
     echo
     echo "Usage:"
-    echo "  pr-open-comments <PR_URL|PR_NUMBER> [latest|all]"
-    echo "  pr-open-comments-copyq <PR_URL|PR_NUMBER> [latest|all]"
+    echo "  pr-open-comments [PR_URL|PR_NUMBER] [latest|all]"
+    echo "  pr-open-comments [latest|all]"
+    echo "  pr-open-comments-copyq [PR_URL|PR_NUMBER] [latest|all]"
     echo
     echo "Modes:"
     echo "  latest  Fetch unresolved non-outdated comments from the latest review batch."
     echo "  all     Fetch all unresolved non-outdated comments."
     return 0
-  fi
-
-  if [[ -z "$pr" ]]; then
-    echo "Usage: pr-open-comments <PR_URL|PR_NUMBER> [latest|all]" >&2
-    echo "Hint: wklej URL do PR albo podaj jego numer, np.:" >&2
-    echo "  pr-open-comments https://github.com/owner/repo/pull/123" >&2
-    echo "  pr-open-comments 123" >&2
-    echo "  pr-open-comments 123 all" >&2
-    return 2
-  fi
-
-  if [[ "$mode" != "latest" && "$mode" != "all" ]]; then
-    echo "Expected mode: latest or all, got: $mode" >&2
-    return 2
   fi
 
   if ! command -v gh >/dev/null 2>&1; then
@@ -47,7 +34,32 @@ pr-open-comments() {
     return 1
   fi
 
-  if [[ "$pr" =~ '^https://github.com/([^/]+)/([^/]+)/pull/([0-9]+)' ]]; then
+  # Resolve PR target → owner, repo, number.
+  # Three paths: (1) auto-detect from current branch, (2) explicit URL, (3) explicit number.
+  if [[ -z "$pr" || "$pr" == "latest" || "$pr" == "all" ]]; then
+    [[ "$pr" == "latest" || "$pr" == "all" ]] && [[ -z "$2" ]] && mode="$pr"
+
+    local pr_json pr_url
+    pr_json="$(gh pr view --json url 2>/dev/null)" || {
+      echo "Cannot infer PR for current branch." >&2
+      echo "Hint: run this inside a branch with an open PR, or pass PR URL/number e.g.:" >&2
+      echo "  pr-open-comments https://github.com/owner/repo/pull/123" >&2
+      echo "  pr-open-comments 123" >&2
+      echo "  pr-open-comments all" >&2
+      return 2
+    }
+
+    pr_url="$(jq -r .url <<< "$pr_json")"
+
+    if [[ "$pr_url" =~ '^https://github.com/([^/]+)/([^/]+)/pull/([0-9]+)' ]]; then
+      owner="${match[1]}"
+      repo="${match[2]}"
+      number="${match[3]}"
+    else
+      echo "Cannot infer PR for current branch: gh returned incomplete data." >&2
+      return 2
+    fi
+  elif [[ "$pr" =~ '^https://github.com/([^/]+)/([^/]+)/pull/([0-9]+)' ]]; then
     owner="${match[1]}"
     repo="${match[2]}"
     number="${match[3]}"
@@ -91,6 +103,11 @@ pr-open-comments() {
     fi
   else
     echo "Expected GitHub PR URL or PR number, got: $pr" >&2
+    return 2
+  fi
+
+  if [[ "$mode" != "latest" && "$mode" != "all" ]]; then
+    echo "Expected mode: latest or all, got: $mode" >&2
     return 2
   fi
 
