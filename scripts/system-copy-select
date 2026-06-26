@@ -226,6 +226,8 @@ collect_package_files() {
 
   load_target_metadata "$package"
 
+  [[ ! -L "$install_dir" ]] || die "system-install must not be a symlink: $package"
+
   for source in "$install_dir"/**/*(DN.); do
     rel_path="${source#$install_dir/}"
     is_meta_file "$rel_path" && continue
@@ -262,6 +264,7 @@ install_selected_files() {
 }
 
 validate_uninstall_batch() {
+  sudo -n -v || die "sudo session expired before uninstall validation; re-run to refresh"
   local source rel_path dest
   local i
   for (( i = 1; i <= ${#batch_sources[@]}; i++ )); do
@@ -516,6 +519,29 @@ prompt_path() {
   print -r -- "$answer"
 }
 
+# Validates config manifest entries for root ownership and root-only modes before any files are copied.
+pre_validate_config_manifest() {
+  local package="$1"
+  local manifest="$packages_dir/$package/system-config.manifest"
+  local line rel_path mode owner group extra nm
+  local line_no=0
+  [[ -f "$manifest" ]] || return 0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line_no=$(( line_no + 1 ))
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    rel_path="" mode="" owner="" group="" extra=""
+    read -r rel_path mode owner group extra <<< "$line"
+    [[ -n "$rel_path" && -n "$mode" && -n "$owner" && -n "$group" && -z "$extra" ]] ||
+      die "invalid system-config manifest line $manifest:$line_no"
+    [[ "$owner" == "root" || "$owner" == "0" ]] ||
+      die "system-config.manifest entry must be root-owned: $package $rel_path (got $owner)"
+    nm="$(normalize_mode "$mode")" ||
+      die "invalid mode in system-config.manifest: $package $rel_path: $mode"
+    (( (8#$nm & 8#077) == 0 )) ||
+      die "system-config.manifest entry must be root-only mode: $package $rel_path (mode $mode)"
+  done < "$manifest"
+}
+
 # Copies a secret config WITHOUT reading its contents (install does the byte copy).
 process_package_configs() {
   local package="$1"
@@ -551,7 +577,13 @@ process_package_configs() {
       die "refusing to install secret config with group/world-readable mode: $dest (mode $mode; fix the manifest entry to use 0600 or 0400)"
 
     print -- "Package '$package' needs a root-only config at: $dest ($owner:$group mode $mode)"
-    src="$(prompt_path "Path to source config for $dest (empty = create in place with sudoedit)")"
+    src="$(prompt_path "Path to source config for $dest (enter path, empty = sudoedit, 'skip' = defer to later)")"
+
+    if [[ "$src" == "skip" ]]; then
+      print -u2 -- "warning - skipping config: $dest (run './run.sh activate $package' after creating it)"
+      (( configs_missing++ ))
+      continue
+    fi
 
     if [[ -z "$src" ]]; then
       print -- "Creating $dest in place with sudoedit (contents never copied)..."
@@ -592,15 +624,33 @@ require_configs_present() {
 
 activate_units() {
   local package="$1"
-  local unit
-  local -A timer_bases
+  local unit unit_file managed_target
+  local -A activation_bases  # service bases that should not be started directly
 
   load_units_metadata "$package"
   (( ${#system_units[@]} > 0 )) || return 0
   command -v systemctl >/dev/null 2>&1 || die "systemctl is required to activate units for $package"
 
   for unit in "${system_units[@]}"; do
-    [[ "$unit" == *.timer ]] && timer_bases["${unit%.timer}"]=1
+    unit_file="$packages_dir/$package/system-install/etc/systemd/system/$unit"
+    case "$unit" in
+      *.timer)
+        managed_target="$(grep -m1 '^Unit=' "$unit_file" 2>/dev/null | cut -d= -f2-)"
+        if [[ -n "$managed_target" ]]; then
+          activation_bases["${managed_target%.service}"]=1
+        else
+          activation_bases["${unit%.timer}"]=1
+        fi
+        ;;
+      *.socket|*.path)
+        managed_target="$(grep -m1 '^Service=' "$unit_file" 2>/dev/null | cut -d= -f2-)"
+        if [[ -n "$managed_target" ]]; then
+          activation_bases["${managed_target%.service}"]=1
+        else
+          activation_bases["${unit%.*}"]=1
+        fi
+        ;;
+    esac
   done
 
   print -- "Reloading systemd manager for $package units"
@@ -613,8 +663,8 @@ activate_units() {
         sudo -n systemctl restart "$unit"
         ;;
       *.service)
-        if [[ -n "${timer_bases[${unit%.service}]+x}" ]]; then
-          print -- "Skipping $unit (managed by timer ${unit%.service}.timer)"
+        if [[ -n "${activation_bases[${unit%.service}]+x}" ]]; then
+          print -- "Skipping $unit (managed by a socket, path, or timer unit)"
         else
           print -- "Starting $unit"
           sudo -n systemctl start "$unit"
@@ -728,6 +778,9 @@ start_sudo_session "System package changes require sudo. The password is request
 case "$action" in
   install)
     print -- "Installing system package(s): ${selected_packages[*]}"
+    for package in "${selected_packages[@]}"; do
+      pre_validate_config_manifest "$package"
+    done
     if (( ${#batch_sources[@]} > 0 )); then
       if confirm_action "Copy selected system files to / using manifest ownership and modes?"; then
         install_selected_files
