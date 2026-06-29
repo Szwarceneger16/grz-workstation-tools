@@ -39,14 +39,14 @@ report() {
   done
 }
 
-# List tracked files (working tree) matching an ERE under the given pathspecs.
+# List indexed files (staged / committed) matching an ERE under the given pathspecs.
 # `-l` prints file names only (never the matched text); exit 1 (no match) is fine.
 # Optional single-letter flags (e.g. -i for case-insensitive) may be passed before the pattern.
 scan() {
   local -a flags=()
   while [[ "${1-}" == -[a-zA-Z] ]]; do flags+=("$1"); shift; done
   local pattern="$1"; shift
-  git grep -lIE "${flags[@]}" -e "$pattern" -- "$@" 2>/dev/null || true
+  git grep --cached -lIE "${flags[@]}" -e "$pattern" -- "$@" 2>/dev/null || true
 }
 
 # ---- Tier A -----------------------------------------------------------------
@@ -58,13 +58,18 @@ cred_hits=(${(f)"$(scan "$cred_pattern" . ":!$self")"})
 cred_hits=(${cred_hits:#})
 (( ${#cred_hits} )) && report 'credential' "${cred_hits[@]}"
 
-# Absolute personal home paths (deanonymizing). `.github/` is excluded because CI
-# legitimately references /home/runner (the GitHub Actions runner home).
+# Absolute personal home paths (deanonymizing). /home/runner is the GitHub
+# Actions runner home — a known-safe placeholder; files whose only home-path
+# hits are /home/runner are not flagged.
 home_pattern='(/home/|/Users/)[A-Za-z0-9._-]+'
-typeset -a home_hits
-home_hits=(${(f)"$(scan "$home_pattern" . ":!$self" ':!.github')"})
-home_hits=(${home_hits:#*.example})
-home_hits=(${home_hits:#})
+typeset -a home_raw home_hits=()
+home_raw=(${(f)"$(scan "$home_pattern" . ":!$self")"})
+home_raw=(${home_raw:#})
+for f in "${home_raw[@]}"; do
+  git grep --cached -IhE -e "$home_pattern" -- "$f" 2>/dev/null \
+    | grep -qvE '/home/runner([^A-Za-z0-9._-]|$)' \
+    && home_hits+=("$f") || true
+done
 (( ${#home_hits} )) && report 'home-path' "${home_hits[@]}"
 
 # ---- Tier B -----------------------------------------------------------------
