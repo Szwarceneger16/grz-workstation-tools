@@ -41,9 +41,12 @@ report() {
 
 # List tracked files (working tree) matching an ERE under the given pathspecs.
 # `-l` prints file names only (never the matched text); exit 1 (no match) is fine.
+# Optional single-letter flags (e.g. -i for case-insensitive) may be passed before the pattern.
 scan() {
+  local -a flags=()
+  while [[ "${1-}" == -[a-zA-Z] ]]; do flags+=("$1"); shift; done
   local pattern="$1"; shift
-  git grep -lIE -e "$pattern" -- "$@" 2>/dev/null || true
+  git grep -lIE "${flags[@]}" -e "$pattern" -- "$@" 2>/dev/null || true
 }
 
 # ---- Tier A -----------------------------------------------------------------
@@ -52,13 +55,12 @@ scan() {
 cred_pattern='-----BEGIN ([A-Z]+ )?PRIVATE KEY-----|ghp_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{30,}|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{10,}|AIza[0-9A-Za-z_-]{35}'
 typeset -a cred_hits
 cred_hits=(${(f)"$(scan "$cred_pattern" . ":!$self")"})
-cred_hits=(${cred_hits:#*.example})
 cred_hits=(${cred_hits:#})
 (( ${#cred_hits} )) && report 'credential' "${cred_hits[@]}"
 
 # Absolute personal home paths (deanonymizing). `.github/` is excluded because CI
 # legitimately references /home/runner (the GitHub Actions runner home).
-home_pattern='(/home/|/Users/)[A-Za-z0-9._-]+/'
+home_pattern='(/home/|/Users/)[A-Za-z0-9._-]+'
 typeset -a home_hits
 home_hits=(${(f)"$(scan "$home_pattern" . ":!$self" ':!.github')"})
 home_hits=(${home_hits:#*.example})
@@ -72,7 +74,7 @@ install_dirs=(packages/*/install(N/))
 if (( ${#install_dirs} )); then
   word_pattern='password|passwd|secret|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret'
   typeset -a word_hits
-  word_hits=(${(f)"$(scan "$word_pattern" "${install_dirs[@]}")"})
+  word_hits=(${(f)"$(scan -i "$word_pattern" "${install_dirs[@]}")"})
   word_hits=(${word_hits:#*.example})
   word_hits=(${word_hits:#})
   (( ${#word_hits} )) && report 'secret-word' "${word_hits[@]}"
