@@ -2,7 +2,7 @@ pr-open-comments() {
   emulate -L zsh
 
   local pr="$1"
-  local mode="${2:-latest}" # latest albo all
+  local mode="${2:-latest}" # latest, all, all-unresolved, all-resolved
   local owner repo number remote_url repo_path tmp threads_tmp pr_tmp page_tmp
   local cursor has_next page_count jq_status
 
@@ -11,16 +11,18 @@ pr-open-comments() {
       cmdhelp pr-open-comments && return 0
     fi
 
-    echo "pr-open-comments - fetch unresolved GitHub PR review comments"
+    echo "pr-open-comments - fetch GitHub PR review comments"
     echo
     echo "Usage:"
-    echo "  pr-open-comments [PR_URL|PR_NUMBER] [latest|all]"
-    echo "  pr-open-comments [latest|all]"
-    echo "  pr-open-comments-copyq [PR_URL|PR_NUMBER] [latest|all]"
+    echo "  pr-open-comments [PR_URL|PR_NUMBER] [latest|all|all-unresolved|all-resolved]"
+    echo "  pr-open-comments [latest|all|all-unresolved|all-resolved]"
+    echo "  pr-open-comments-copyq [PR_URL|PR_NUMBER] [latest|all|all-unresolved|all-resolved]"
     echo
     echo "Modes:"
-    echo "  latest  Fetch unresolved non-outdated comments from the latest review batch."
-    echo "  all     Fetch all unresolved non-outdated comments."
+    echo "  latest          Fetch unresolved non-outdated comments from the latest review batch."
+    echo "  all             Fetch every review thread, regardless of resolved/outdated status."
+    echo "  all-unresolved  Fetch all unresolved non-outdated comments."
+    echo "  all-resolved    Fetch all resolved non-outdated comments."
     return 0
   fi
 
@@ -36,8 +38,8 @@ pr-open-comments() {
 
   # Resolve PR target → owner, repo, number.
   # Three paths: (1) auto-detect from current branch, (2) explicit URL, (3) explicit number.
-  if [[ -z "$pr" || "$pr" == "latest" || "$pr" == "all" ]]; then
-    [[ "$pr" == "latest" || "$pr" == "all" ]] && [[ -z "$2" ]] && mode="$pr"
+  if [[ -z "$pr" || "$pr" == "latest" || "$pr" == "all" || "$pr" == "all-unresolved" || "$pr" == "all-resolved" ]]; then
+    [[ "$pr" == "latest" || "$pr" == "all" || "$pr" == "all-unresolved" || "$pr" == "all-resolved" ]] && [[ -z "$2" ]] && mode="$pr"
 
     local pr_json pr_url
     pr_json="$(gh pr view --json url 2>/dev/null)" || {
@@ -106,8 +108,8 @@ pr-open-comments() {
     return 2
   fi
 
-  if [[ "$mode" != "latest" && "$mode" != "all" ]]; then
-    echo "Expected mode: latest or all, got: $mode" >&2
+  if [[ "$mode" != "latest" && "$mode" != "all" && "$mode" != "all-unresolved" && "$mode" != "all-resolved" ]]; then
+    echo "Expected mode: latest, all, all-unresolved, or all-resolved, got: $mode" >&2
     return 2
   fi
 
@@ -215,6 +217,20 @@ query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
       gsub("^[[:space:]]+"; "")
       | gsub("[[:space:]]+$"; "");
 
+    def drop_empty_start:
+      if length > 0 and ((.[0] | trim) == "") then
+        .[1:] | drop_empty_start
+      else
+        .
+      end;
+
+    def drop_empty_end:
+      if length > 0 and ((.[-1] | trim) == "") then
+        .[0:-1] | drop_empty_end
+      else
+        .
+      end;
+
     def clean_title:
       split("\n")
       | map(gsub("\\*"; ""))
@@ -237,8 +253,8 @@ query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
           end
         )
       | map(select(((. | trim) | test("^Useful\\? React with")) | not))
-      | while(length > 0 and ((.[0] | trim) == ""); .[1:])
-      | while(length > 0 and ((.[-1] | trim) == ""); .[0:-1])
+      | drop_empty_start
+      | drop_empty_end
       | join("\n");
 
     .data.repository.pullRequest as $pr
@@ -271,15 +287,14 @@ query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
               .comments.nodes
               | map((.body // "") | clean_comment_body)
               | map(select(length > 0))
-              | join("
-
-Reply:
-")
+              | join("\n\nReply:\n")
             ),
             comments: .comments.nodes
           })
-        | map(select(.isResolved == false and .isOutdated == false))
-      ) as $open
+      ) as $threads
+
+    | ($threads | map(select(.isResolved == false and .isOutdated == false))) as $open
+    | ($threads | map(select(.isResolved == true and .isOutdated == false))) as $resolved
 
     | (
         $open
@@ -290,7 +305,11 @@ Reply:
 
     | (
         if ($mode == "all") then
+          $threads | sort_by(.reviewSubmittedAt, .rootCreatedAt) | reverse
+        elif ($mode == "all-unresolved") then
           $open | sort_by(.reviewSubmittedAt, .rootCreatedAt) | reverse
+        elif ($mode == "all-resolved") then
+          $resolved | sort_by(.reviewSubmittedAt, .rootCreatedAt) | reverse
         else
           if $latestReviewId == null then
             $open | sort_by(.reviewSubmittedAt, .rootCreatedAt) | reverse
@@ -303,15 +322,31 @@ Reply:
         end
       ) as $selected
 
-    | "## Latest unresolved PR review comments"
+    | (
+        if ($mode == "all") then
+          "all review threads, including resolved and outdated"
+        elif ($mode == "all-unresolved") then
+          "all unresolved non-outdated threads"
+        elif ($mode == "all-resolved") then
+          "all resolved non-outdated threads"
+        else
+          "unresolved non-outdated latest review batch"
+        end
+      ) as $filterLabel
+
+    | "## PR review comments"
       + "\nPR: " + $pr.url
       + "\nTitle: " + $pr.title
       + "\nHead: " + $pr.headRefName + " / " + $pr.headRefOid
-      + "\nFilter: unresolved + non-outdated + " + (if $mode == "all" then "all open threads" else "latest review batch" end)
+      + "\nMode: " + $mode
+      + "\nFilter: " + $filterLabel
       + "\nSelected: " + ($selected | length | tostring)
+      + "\nTotal threads: " + ($threads | length | tostring)
+      + "\nUnresolved non-outdated: " + ($open | length | tostring)
+      + "\nResolved non-outdated: " + ($resolved | length | tostring)
       + "\nOlder open threads outside latest batch: "
       + (
-          if $mode == "all" or $latestReviewId == null then
+          if $mode != "latest" or $latestReviewId == null then
             "0"
           else
             ($open | map(select(.reviewId != $latestReviewId)) | length | tostring)
@@ -325,12 +360,15 @@ Reply:
               "\n---\n"
               + "### " + ((.key + 1) | tostring) + ". " + .value.title
               + "\nFile: " + (.value.location // "?")
+              + "\nStatus: " + (if .value.isResolved then "resolved" else "unresolved" end)
+              + (if .value.isOutdated then " + outdated" else "" end)
               + "\nURL: " + (.value.url // "")
               + "\n"
               + (.value.commentText // "")
             )
           | join("")
         )
+
   ' "$tmp"
   jq_status=$?
 
