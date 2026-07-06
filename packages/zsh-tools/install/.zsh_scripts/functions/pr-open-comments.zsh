@@ -1,26 +1,131 @@
+__pr_open_comments_fetch_thread_comments() {
+  emulate -L zsh
+
+  local thread_id="$1"
+  local out="$2"
+  local cursor has_next page_count total_count page_tmp comments_tmp
+
+  if [[ -z "$thread_id" || -z "$out" ]]; then
+    echo "Internal error: missing thread id or output path for comment pagination." >&2
+    return 1
+  fi
+
+  page_tmp="$(mktemp -t pr-review-comments-page.XXXXXX.json)"
+  comments_tmp="$(mktemp -t pr-review-comments-nodes.XXXXXX.json)"
+
+  : > "$comments_tmp"
+  cursor="null"
+  has_next="true"
+  page_count=0
+  total_count=0
+
+  while [[ "$has_next" == "true" ]]; do
+    gh api graphql \
+      -f threadId="$thread_id" \
+      -F cursor="$cursor" \
+      -f query='
+query($threadId: ID!, $cursor: String) {
+  node(id: $threadId) {
+    ... on PullRequestReviewThread {
+      comments(first: 100, after: $cursor) {
+        totalCount
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+        nodes {
+          id
+          databaseId
+          author { login }
+          body
+          createdAt
+          updatedAt
+          url
+          path
+          line
+          originalLine
+          diffHunk
+          pullRequestReview {
+            databaseId
+            submittedAt
+            url
+            author { login }
+          }
+        }
+      }
+    }
+  }
+}
+' > "$page_tmp" || {
+      rm -f "$page_tmp" "$comments_tmp"
+      return 1
+    }
+
+    if (( page_count == 0 )); then
+      total_count="$(jq -r '.data.node.comments.totalCount // 0' "$page_tmp")" || {
+        rm -f "$page_tmp" "$comments_tmp"
+        return 1
+      }
+    fi
+
+    jq -c '.data.node.comments.nodes[]?' "$page_tmp" >> "$comments_tmp" || {
+      rm -f "$page_tmp" "$comments_tmp"
+      return 1
+    }
+
+    has_next="$(jq -r '.data.node.comments.pageInfo.hasNextPage // false' "$page_tmp")" || {
+      rm -f "$page_tmp" "$comments_tmp"
+      return 1
+    }
+    cursor="$(jq -r '.data.node.comments.pageInfo.endCursor // "null"' "$page_tmp")" || {
+      rm -f "$page_tmp" "$comments_tmp"
+      return 1
+    }
+    (( ++page_count ))
+  done
+
+  jq -n --slurpfile comments "$comments_tmp" --argjson totalCount "$total_count" '
+    {
+      totalCount: $totalCount,
+      pageInfo: {
+        hasNextPage: false,
+        endCursor: null
+      },
+      nodes: $comments
+    }
+  ' > "$out" || {
+    rm -f "$page_tmp" "$comments_tmp"
+    return 1
+  }
+
+  rm -f "$page_tmp" "$comments_tmp"
+}
+
 pr-open-comments() {
   emulate -L zsh
 
   local pr="$1"
-  local mode="${2:-latest}" # latest albo all
-  local owner repo number remote_url repo_path tmp threads_tmp pr_tmp page_tmp
-  local cursor has_next page_count jq_status
+  local mode="${2:-latest}" # latest, all, all-unresolved, all-resolved
+  local owner repo number remote_url repo_path tmp threads_tmp pr_tmp page_tmp page_thread_nodes_tmp thread_node_tmp comments_full_tmp
+  local cursor has_next page_count jq_status thread_node thread_id thread_comments_has_next page_threads_status
 
   if [[ "$pr" == "-h" || "$pr" == "--help" ]]; then
     if command -v cmdhelp >/dev/null 2>&1; then
       cmdhelp pr-open-comments && return 0
     fi
 
-    echo "pr-open-comments - fetch unresolved GitHub PR review comments"
+    echo "pr-open-comments - fetch GitHub PR review comments"
     echo
     echo "Usage:"
-    echo "  pr-open-comments [PR_URL|PR_NUMBER] [latest|all]"
-    echo "  pr-open-comments [latest|all]"
-    echo "  pr-open-comments-copyq [PR_URL|PR_NUMBER] [latest|all]"
+    echo "  pr-open-comments [PR_URL|PR_NUMBER] [latest|all|all-unresolved|all-resolved]"
+    echo "  pr-open-comments [latest|all|all-unresolved|all-resolved]"
+    echo "  pr-open-comments-copyq [PR_URL|PR_NUMBER] [latest|all|all-unresolved|all-resolved]"
     echo
     echo "Modes:"
-    echo "  latest  Fetch unresolved non-outdated comments from the latest review batch."
-    echo "  all     Fetch all unresolved non-outdated comments."
+    echo "  latest          Fetch unresolved non-outdated comments from the latest review batch."
+    echo "  all             Fetch every review thread, regardless of resolved/outdated status."
+    echo "  all-unresolved  Fetch all unresolved non-outdated comments."
+    echo "  all-resolved    Fetch all resolved non-outdated comments."
     return 0
   fi
 
@@ -36,8 +141,8 @@ pr-open-comments() {
 
   # Resolve PR target → owner, repo, number.
   # Three paths: (1) auto-detect from current branch, (2) explicit URL, (3) explicit number.
-  if [[ -z "$pr" || "$pr" == "latest" || "$pr" == "all" ]]; then
-    [[ "$pr" == "latest" || "$pr" == "all" ]] && [[ -z "$2" ]] && mode="$pr"
+  if [[ -z "$pr" || "$pr" == "latest" || "$pr" == "all" || "$pr" == "all-unresolved" || "$pr" == "all-resolved" ]]; then
+    [[ "$pr" == "latest" || "$pr" == "all" || "$pr" == "all-unresolved" || "$pr" == "all-resolved" ]] && [[ -z "$2" ]] && mode="$pr"
 
     local pr_json pr_url
     pr_json="$(gh pr view --json url 2>/dev/null)" || {
@@ -46,6 +151,8 @@ pr-open-comments() {
       echo "  pr-open-comments https://github.com/owner/repo/pull/123" >&2
       echo "  pr-open-comments 123" >&2
       echo "  pr-open-comments all" >&2
+      echo "  pr-open-comments all-unresolved" >&2
+      echo "  pr-open-comments all-resolved" >&2
       return 2
     }
 
@@ -106,8 +213,8 @@ pr-open-comments() {
     return 2
   fi
 
-  if [[ "$mode" != "latest" && "$mode" != "all" ]]; then
-    echo "Expected mode: latest or all, got: $mode" >&2
+  if [[ "$mode" != "latest" && "$mode" != "all" && "$mode" != "all-unresolved" && "$mode" != "all-resolved" ]]; then
+    echo "Expected mode: latest, all, all-unresolved, or all-resolved, got: $mode" >&2
     return 2
   fi
 
@@ -115,6 +222,9 @@ pr-open-comments() {
   threads_tmp="$(mktemp -t pr-review-thread-nodes.XXXXXX.json)"
   pr_tmp="$(mktemp -t pr-review-pr.XXXXXX.json)"
   page_tmp="$(mktemp -t pr-review-page.XXXXXX.json)"
+  page_thread_nodes_tmp="$(mktemp -t pr-review-thread-page-nodes.XXXXXX.json)"
+  thread_node_tmp="$(mktemp -t pr-review-thread-node.XXXXXX.json)"
+  comments_full_tmp="$(mktemp -t pr-review-comments-full.XXXXXX.json)"
 
   : > "$threads_tmp"
   cursor="null"
@@ -148,6 +258,11 @@ query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
           line
           originalLine
           comments(first: 100) {
+            totalCount
+            pageInfo {
+              hasNextPage
+              endCursor
+            }
             nodes {
               id
               databaseId
@@ -174,21 +289,55 @@ query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
   }
 }
 ' > "$page_tmp" || {
-      rm -f "$tmp" "$threads_tmp" "$pr_tmp" "$page_tmp"
+      rm -f "$tmp" "$threads_tmp" "$pr_tmp" "$page_tmp" "$page_thread_nodes_tmp" "$thread_node_tmp" "$comments_full_tmp"
       return 1
     }
 
     if (( page_count == 0 )); then
       jq '.data.repository.pullRequest | {title, url, headRefName, headRefOid}' "$page_tmp" > "$pr_tmp" || {
-        rm -f "$tmp" "$threads_tmp" "$pr_tmp" "$page_tmp"
+        rm -f "$tmp" "$threads_tmp" "$pr_tmp" "$page_tmp" "$page_thread_nodes_tmp" "$thread_node_tmp" "$comments_full_tmp"
         return 1
       }
     fi
 
-    jq -c '.data.repository.pullRequest.reviewThreads.nodes[]' "$page_tmp" >> "$threads_tmp" || {
-      rm -f "$tmp" "$threads_tmp" "$pr_tmp" "$page_tmp"
+    jq -c '.data.repository.pullRequest.reviewThreads.nodes[]' "$page_tmp" > "$page_thread_nodes_tmp" || {
+      rm -f "$tmp" "$threads_tmp" "$pr_tmp" "$page_tmp" "$page_thread_nodes_tmp" "$thread_node_tmp" "$comments_full_tmp"
       return 1
     }
+
+    page_threads_status=0
+    while IFS= read -r thread_node; do
+      thread_comments_has_next="$(jq -r '.comments.pageInfo.hasNextPage // false' <<< "$thread_node")" || {
+        page_threads_status=1
+        break
+      }
+
+      if [[ "$thread_comments_has_next" == "true" ]]; then
+        thread_id="$(jq -r '.id' <<< "$thread_node")" || {
+          page_threads_status=1
+          break
+        }
+
+        print -r -- "$thread_node" > "$thread_node_tmp"
+
+        if ! __pr_open_comments_fetch_thread_comments "$thread_id" "$comments_full_tmp"; then
+          page_threads_status=1
+          break
+        fi
+
+        jq --slurpfile comments "$comments_full_tmp" '.comments = $comments[0]' "$thread_node_tmp" >> "$threads_tmp" || {
+          page_threads_status=1
+          break
+        }
+      else
+        print -r -- "$thread_node" >> "$threads_tmp"
+      fi
+    done < "$page_thread_nodes_tmp"
+
+    if (( page_threads_status != 0 )); then
+      rm -f "$tmp" "$threads_tmp" "$pr_tmp" "$page_tmp" "$page_thread_nodes_tmp" "$thread_node_tmp" "$comments_full_tmp"
+      return 1
+    fi
 
     has_next="$(jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.hasNextPage' "$page_tmp")"
     cursor="$(jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.endCursor // "null"' "$page_tmp")"
@@ -204,16 +353,30 @@ query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
       }
     }
   ' > "$tmp" || {
-    rm -f "$tmp" "$threads_tmp" "$pr_tmp" "$page_tmp"
+    rm -f "$tmp" "$threads_tmp" "$pr_tmp" "$page_tmp" "$page_thread_nodes_tmp" "$thread_node_tmp" "$comments_full_tmp"
     return 1
   }
 
-  rm -f "$threads_tmp" "$pr_tmp" "$page_tmp"
+  rm -f "$threads_tmp" "$pr_tmp" "$page_tmp" "$page_thread_nodes_tmp" "$thread_node_tmp" "$comments_full_tmp"
 
   jq -r --arg mode "$mode" '
     def trim:
       gsub("^[[:space:]]+"; "")
       | gsub("[[:space:]]+$"; "");
+
+    def drop_empty_start:
+      if length > 0 and ((.[0] | trim) == "") then
+        .[1:] | drop_empty_start
+      else
+        .
+      end;
+
+    def drop_empty_end:
+      if length > 0 and ((.[-1] | trim) == "") then
+        .[0:-1] | drop_empty_end
+      else
+        .
+      end;
 
     def clean_title:
       split("\n")
@@ -237,8 +400,8 @@ query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
           end
         )
       | map(select(((. | trim) | test("^Useful\\? React with")) | not))
-      | while(length > 0 and ((.[0] | trim) == ""); .[1:])
-      | while(length > 0 and ((.[-1] | trim) == ""); .[0:-1])
+      | drop_empty_start
+      | drop_empty_end
       | join("\n");
 
     .data.repository.pullRequest as $pr
@@ -271,15 +434,17 @@ query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
               .comments.nodes
               | map((.body // "") | clean_comment_body)
               | map(select(length > 0))
-              | join("
-
-Reply:
-")
+              | join("\n\nReply:\n")
             ),
-            comments: .comments.nodes
+            comments: .comments.nodes,
+            commentTotalCount: (.comments.totalCount // (.comments.nodes | length)),
+            commentFetchedCount: (.comments.nodes | length),
+            commentPageTruncated: (.comments.pageInfo.hasNextPage // false)
           })
-        | map(select(.isResolved == false and .isOutdated == false))
-      ) as $open
+      ) as $threads
+
+    | ($threads | map(select(.isResolved == false and .isOutdated == false))) as $open
+    | ($threads | map(select(.isResolved == true and .isOutdated == false))) as $resolved
 
     | (
         $open
@@ -290,7 +455,11 @@ Reply:
 
     | (
         if ($mode == "all") then
+          $threads | sort_by(.reviewSubmittedAt, .rootCreatedAt) | reverse
+        elif ($mode == "all-unresolved") then
           $open | sort_by(.reviewSubmittedAt, .rootCreatedAt) | reverse
+        elif ($mode == "all-resolved") then
+          $resolved | sort_by(.reviewSubmittedAt, .rootCreatedAt) | reverse
         else
           if $latestReviewId == null then
             $open | sort_by(.reviewSubmittedAt, .rootCreatedAt) | reverse
@@ -303,15 +472,35 @@ Reply:
         end
       ) as $selected
 
-    | "## Latest unresolved PR review comments"
+    | (
+        if ($mode == "all") then
+          "all review threads, including resolved and outdated"
+        elif ($mode == "all-unresolved") then
+          "all unresolved non-outdated threads"
+        elif ($mode == "all-resolved") then
+          "all resolved non-outdated threads"
+        else
+          "unresolved non-outdated latest review batch"
+        end
+      ) as $filterLabel
+
+    | "## PR review comments"
       + "\nPR: " + $pr.url
       + "\nTitle: " + $pr.title
       + "\nHead: " + $pr.headRefName + " / " + $pr.headRefOid
-      + "\nFilter: unresolved + non-outdated + " + (if $mode == "all" then "all open threads" else "latest review batch" end)
+      + "\nMode: " + $mode
+      + "\nFilter: " + $filterLabel
       + "\nSelected: " + ($selected | length | tostring)
+      + "\nTotal threads: " + ($threads | length | tostring)
+      + "\nUnresolved non-outdated: " + ($open | length | tostring)
+      + "\nResolved non-outdated: " + ($resolved | length | tostring)
+      + "\nPaginated comment threads: "
+      + ($threads | map(select(.commentTotalCount > 100)) | length | tostring)
+      + "\nTotal comments fetched: "
+      + ($threads | map(.commentFetchedCount) | add // 0 | tostring)
       + "\nOlder open threads outside latest batch: "
       + (
-          if $mode == "all" or $latestReviewId == null then
+          if $mode != "latest" or $latestReviewId == null then
             "0"
           else
             ($open | map(select(.reviewId != $latestReviewId)) | length | tostring)
@@ -325,12 +514,15 @@ Reply:
               "\n---\n"
               + "### " + ((.key + 1) | tostring) + ". " + .value.title
               + "\nFile: " + (.value.location // "?")
+              + "\nStatus: " + (if .value.isResolved then "resolved" else "unresolved" end)
+              + (if .value.isOutdated then " + outdated" else "" end)
               + "\nURL: " + (.value.url // "")
               + "\n"
               + (.value.commentText // "")
             )
           | join("")
         )
+
   ' "$tmp"
   jq_status=$?
 

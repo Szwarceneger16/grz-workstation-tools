@@ -1,21 +1,23 @@
 # pr-open-comments
 
-Fetch unresolved, non-outdated GitHub PR review comments and print a compact Markdown report for AI-assisted review work.
+Fetch GitHub PR review comments and print a compact Markdown report for AI-assisted review work.
 
 ## Usage
 
 ```sh
-pr-open-comments [latest|all]
-pr-open-comments <PR_URL|PR_NUMBER> [latest|all]
-pr-open-comments-copyq [latest|all]
-pr-open-comments-copyq <PR_URL|PR_NUMBER> [latest|all]
+pr-open-comments [latest|all|all-unresolved|all-resolved]
+pr-open-comments <PR_URL|PR_NUMBER> [latest|all|all-unresolved|all-resolved]
+pr-open-comments-copyq [latest|all|all-unresolved|all-resolved]
+pr-open-comments-copyq <PR_URL|PR_NUMBER> [latest|all|all-unresolved|all-resolved]
 ```
 
 ## Arguments
 
 - `<PR_URL|PR_NUMBER>` — GitHub pull request URL, or a PR number when run inside a GitHub repository. When omitted, the PR is inferred from the current branch via `gh pr view`.
 - `latest` — default; return unresolved, non-outdated comments from the latest review batch.
-- `all` — return all unresolved, non-outdated review comments.
+- `all` — return every review thread, including resolved and outdated threads.
+- `all-unresolved` — return all unresolved, non-outdated review comments.
+- `all-resolved` — return all resolved, non-outdated review comments.
 
 ## Examples
 
@@ -23,12 +25,16 @@ pr-open-comments-copyq <PR_URL|PR_NUMBER> [latest|all]
 # Auto-detect PR from the current branch
 pr-open-comments
 pr-open-comments all
+pr-open-comments all-unresolved
+pr-open-comments all-resolved
 
 # Explicit PR URL or number
 pr-open-comments https://github.com/owner/repo/pull/123
 pr-open-comments 123
 pr-open-comments 123 all
-pr-open-comments-copyq 123
+pr-open-comments 123 all-unresolved
+pr-open-comments 123 all-resolved
+pr-open-comments-copyq 123 all
 ```
 
 ## CopyQ

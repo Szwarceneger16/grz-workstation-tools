@@ -5,7 +5,9 @@ _pr_open_comments_target_or_mode() {
 
   modes=(
     'latest:aktualny branch PR, tylko najnowszy otwarty batch komentarzy'
-    'all:aktualny branch PR, wszystkie otwarte komentarze'
+    'all:aktualny branch PR, wszystkie komentarze, także resolved/outdated'
+    'all-unresolved:aktualny branch PR, wszystkie otwarte non-outdated komentarze'
+    'all-resolved:aktualny branch PR, wszystkie resolved non-outdated komentarze'
   )
 
   _describe -t modes 'tryb dla PR-a aktualnego brancha' modes
@@ -27,7 +29,9 @@ _pr_open_comments_mode() {
 
   modes=(
     'latest:tylko najnowszy otwarty batch komentarzy'
-    'all:wszystkie otwarte komentarze'
+    'all:wszystkie komentarze, także resolved/outdated'
+    'all-unresolved:wszystkie otwarte non-outdated komentarze'
+    'all-resolved:wszystkie resolved non-outdated komentarze'
   )
 
   _describe -t modes 'tryb pobierania komentarzy' modes
@@ -45,7 +49,7 @@ _pr_open_comments() {
 
   case "$state" in
     extra)
-      _message 'użycie: pr-open-comments [PR_URL|PR_NUMBER] [latest|all]'
+      _message 'użycie: pr-open-comments [PR_URL|PR_NUMBER] [latest|all|all-unresolved|all-resolved]'
       ;;
   esac
 }
