@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+LANGS="pol+eng"
+SAVE_TO_OCR_TAB=1
+OCR_TAB_NAME="OCR"
+
+text="$(
+  flameshot gui --raw \
+  | tesseract stdin stdout -l "$LANGS"
+)" || {
+  rc=$?
+  # Flameshot zwraca 2, gdy użytkownik anuluje przechwycenie
+  if [[ "$rc" -eq 2 ]]; then
+    exit 0
+  fi
+  notify-send "OCR" "Błąd Flameshot/Tesseract. Kod: $rc"
+  exit "$rc"
+}
+
+if [[ -z "${text//[[:space:]]/}" ]]; then
+  notify-send "OCR" "Nie rozpoznano tekstu."
+  exit 1
+fi
+
+if [[ "$SAVE_TO_OCR_TAB" -eq 1 ]]; then
+  printf '%s' "$text" | copyq eval -- "
+    var t = str(input());
+    copy(t);
+    tab('$OCR_TAB_NAME');
+    add(t);
+  "
+  notify-send "OCR" "Tekst skopiowany do schowka i zapisany w zakładce $OCR_TAB_NAME."
+else
+  printf '%s' "$text" | copyq eval -- "
+    copy(str(input()));
+  "
+  notify-send "OCR" "Tekst skopiowany do schowka."
+fi
