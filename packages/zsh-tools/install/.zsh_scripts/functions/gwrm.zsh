@@ -6,6 +6,5 @@ gwrm() {
       return $?
   	fi
 
-    gwtrm $1
-    gbd $1
+    gwtrm "$1" && gbd "$1"
 }

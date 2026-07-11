@@ -5,14 +5,14 @@ gwta() {
       return $?
   	fi
 
-    if [[ $# -ne 1 || -z "$1" ]]; then
-        print -u2 "Usage: gwta <ścieżka>"
+    if [[ $# -lt 1 || $# -gt 2 || -z "$1" ]]; then
+        print -u2 "Usage: gwta <ścieżka> [branch]"
         print -u2 "Try: gwta --help"
         return 2
     fi
 
     local target="$1"
-    local branch="${target:t}"
+    local branch="${2:-${target:t}}"
 
     if git show-ref --verify --quiet "refs/heads/$branch"; then
         git worktree add "$target" "$branch"

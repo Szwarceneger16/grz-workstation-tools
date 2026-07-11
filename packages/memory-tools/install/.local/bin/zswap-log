@@ -90,6 +90,9 @@ done
 if (( EUID != 0 )); then
   if (( auto_sudo )); then
     print -- "[INFO] Potrzebne uprawnienia roota, przełączam na sudo..."
+    if [[ -z "$log_dir_opt" && -n "$ZSWAP_LOG_DIR" ]]; then
+      original_args+=("--log-dir=$ZSWAP_LOG_DIR")
+    fi
     exec sudo -p "Hasło dla %u (zswap-log): " "$0" "${original_args[@]}"
   else
     fail "Ten skrypt wymaga roota. Uruchom przez sudo albo usuń --no-auto-sudo."

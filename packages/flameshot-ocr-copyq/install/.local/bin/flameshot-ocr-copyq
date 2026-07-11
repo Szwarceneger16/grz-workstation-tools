@@ -8,7 +8,7 @@ OCR_TAB_NAME="OCR"
 tmp_png="$(mktemp --suffix=.png)"
 trap 'rm -f "$tmp_png"' EXIT
 
-if ! flameshot gui --raw > "$tmp_png"; then
+flameshot gui --raw > "$tmp_png" || {
   rc=$?
   # Flameshot zwraca 2, gdy użytkownik anuluje przechwycenie
   if [[ "$rc" -eq 2 ]]; then
@@ -16,7 +16,7 @@ if ! flameshot gui --raw > "$tmp_png"; then
   fi
   notify-send "OCR" "Błąd Flameshot. Kod: $rc"
   exit "$rc"
-fi
+}
 
 if [[ ! -s "$tmp_png" ]]; then
   exit 0

@@ -5,9 +5,10 @@ gwadd() {
       return $?
   	fi
 
-  local target="$HOME/repos/.worktree/$1"
+  local branch="$1"
+  local target="$HOME/repos/.worktree/$branch"
 
-  gwta "$target"
+  gwta "$target" "$branch"
 
   local env_src="$PWD/.env.lint.local"
   if [ -f "$env_src" ] && [ ! -e "$target/.env.lint.local" ]; then

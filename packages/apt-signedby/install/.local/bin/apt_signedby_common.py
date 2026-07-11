@@ -9,7 +9,7 @@ INSECURE_OPTS = ("trusted=yes", "trusted=1", "allow-insecure=yes", "allow-insecu
 INSECURE_BOOL_VALUES = ("yes", "true", "1")
 
 DEB_LINE_RE = re.compile(
-    r"^(deb|deb-src)\s+(?:\[(?P<opts>[^\]]+)\]\s+)?(?P<uri>\S+)\s+(?P<suite>\S+)\s+(?P<comps>.+)$",
+    r"^(deb|deb-src)\s+(?:\[(?P<opts>[^\]]+)\]\s+)?(?P<uri>\S+)\s+(?P<suite>\S+)(?:\s+(?P<comps>.+))?$",
     re.I,
 )
 SIGNEDBY_OPT_RE = re.compile(r"\bsigned-by\s*=\s*([^\s\]]+)", re.I)
@@ -97,7 +97,11 @@ def parse_list_file_with_entries(path) -> Tuple[List[Entry], List[Issue]]:
         opts = m.group("opts") or ""
         uri = m.group("uri")
         suite = m.group("suite")
-        comps = m.group("comps").split()
+        comps_str = m.group("comps")
+        if comps_str is None and not suite.endswith("/"):
+            issues.append(("MALFORMED_DEB_LINE", path_str, idx, "brak komponentów dla suite bez końcowego /"))
+            continue
+        comps = (comps_str or "").split()
         target = f"{uri} {suite}"
 
         for bad in insecure_options_from_list_opts(opts):

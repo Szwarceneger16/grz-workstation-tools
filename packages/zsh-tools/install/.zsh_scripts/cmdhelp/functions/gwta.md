@@ -1,17 +1,18 @@
 # gwta
 
-`gwta` — dodaje worktree pod podaną ścieżką; nazwa brancha jest wyliczana z ostatniego segmentu ścieżki.
+`gwta` — dodaje worktree pod podaną ścieżką; nazwa brancha domyślnie jest wyliczana z ostatniego segmentu ścieżki, ale można ją podać jawnie jako drugi argument.
 
 ## Użycie
 
 ```bash
-gwta <ścieżka>
+gwta <ścieżka> [branch]
 gwta [-h|--help]
 ```
 
 ## Opcje
 
-- `<ścieżka>` — docelowa ścieżka worktree (branch = nazwa ostatniego segmentu)
+- `<ścieżka>` — docelowa ścieżka worktree (domyślnie branch = nazwa ostatniego segmentu)
+- `[branch]` — opcjonalna jawna nazwa brancha (potrzebna np. gdy branch zawiera `/`, jak `feature/foo`)
 - `-h`, `--help` — pokaż pomoc
 
 ## Co robi
@@ -20,7 +21,7 @@ gwta [-h|--help]
 - inaczej, jeśli istnieje `origin/<branch>`: `git worktree add <ścieżka> -b <branch> origin/<branch>`
 - inaczej: `git worktree add <ścieżka> -b <branch>` (nowy branch)
 
-Używane przez `gwadd`.
+Używane przez `gwadd` (przekazuje branch jawnie, żeby zachować branche ze `/`).
 
 ## Efekt końcowy
 
