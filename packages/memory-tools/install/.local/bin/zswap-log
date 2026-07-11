@@ -262,7 +262,7 @@ log_line "# zswap logger started at $(date)"
 log_line "# interval_seconds: $interval"
 log_line "# log_dir: $log_dir"
 log_line "# columns: timestamp_iso epoch stored_pages pool_bytes pool_MiB written_back_pages"
-print -- "timestamp epoch stored_pages pool_bytes pool_MiB written_back_pages" >> "$log_file"
+print -- "timestamp_iso epoch stored_pages pool_bytes pool_MiB written_back_pages" >> "$log_file"
 
 typeset -i start_epoch samples
 
@@ -322,7 +322,7 @@ trap 'running=0' INT TERM
 trap 'cleanup' EXIT
 
 while (( running )); do
-  now_iso=$(date +%F\ %T)
+  now_iso=$(date +%FT%T)
   now_epoch=$(date +%s)
 
   stored_pages=$(<"$zswap_dir/stored_pages")

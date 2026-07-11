@@ -5,16 +5,26 @@ LANGS="pol+eng"
 SAVE_TO_OCR_TAB=1
 OCR_TAB_NAME="OCR"
 
-text="$(
-  flameshot gui --raw \
-  | tesseract stdin stdout -l "$LANGS"
-)" || {
+tmp_png="$(mktemp --suffix=.png)"
+trap 'rm -f "$tmp_png"' EXIT
+
+if ! flameshot gui --raw > "$tmp_png"; then
   rc=$?
   # Flameshot zwraca 2, gdy użytkownik anuluje przechwycenie
   if [[ "$rc" -eq 2 ]]; then
     exit 0
   fi
-  notify-send "OCR" "Błąd Flameshot/Tesseract. Kod: $rc"
+  notify-send "OCR" "Błąd Flameshot. Kod: $rc"
+  exit "$rc"
+fi
+
+if [[ ! -s "$tmp_png" ]]; then
+  exit 0
+fi
+
+text="$(tesseract "$tmp_png" stdout -l "$LANGS")" || {
+  rc=$?
+  notify-send "OCR" "Błąd Tesseract. Kod: $rc"
   exit "$rc"
 }
 

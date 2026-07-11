@@ -15,10 +15,9 @@ gwfr [-h|--help]
 
 ## Co robi
 
-### Wymagania:
-
-U Ciebie gwfr woła: - fetchremote <branch> - gwadd <branch>
-więc fetchremote musi istnieć.
+`gwfr` woła po kolei:
+- `fetchremote <branch>` — pobiera branch z `origin`
+- `gwadd <branch>` — dodaje worktree dla tego brancha
 
 ## Efekt końcowy
 

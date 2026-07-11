@@ -35,3 +35,5 @@ _kswapd_summary_sh() {
     -*) compadd -Q -S '' -- -h --help ;;
   esac
 }
+
+_kswapd_summary_sh "$@"

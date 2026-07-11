@@ -52,7 +52,20 @@ fi
 
 print -r -- "⏱  Start: interval=${interval}s, duration≈${approx_secs}s, threshold≥${threshold}%"
 
-LC_ALL=C sudo -n true 2>/dev/null || true
+if ! LC_ALL=C sudo -n true 2>/dev/null; then
+  if [[ -t 0 ]]; then
+    print -r -- "🔒 Wymagane sudo do odczytu wątków kswapd (pidstat -t)."
+    if ! LC_ALL=C sudo -v; then
+      print -u2 -r -- "Brak dostępu sudo. Przerywam."
+      exit 1
+    fi
+  else
+    print -u2 -r -- "Wymagane sudo (pidstat -t), a brak terminala do podania hasła."
+    print -u2 -r -- "Uruchom najpierw 'sudo -v', a potem ponownie ten skrypt."
+    exit 1
+  fi
+fi
+
 LC_ALL=C sudo -n pidstat -u -t -p ALL "${interval}" "${reports}" 2>/dev/null \
 | awk -v thr="$threshold" -v intv="$interval" '
   BEGIN{

@@ -1,4 +1,4 @@
-# TEMPLATE
+# gwrm
 
 Usuwa worktree i kasuje branch
 
@@ -6,26 +6,27 @@ Usuwa worktree i kasuje branch
 
 ```bash
 gwrm <branch|ścieżka>
-TEMPLATE [-h|--help]
+gwrm [-h|--help]
 ```
 
 ## Opcje
 
-- <branch|ścieżka> To co akceptują Twoje gwtrm i gbd (u Ciebie to wrappery)
+- <branch|ścieżka> To co akceptują `gwtrm` i `gbd`
 - `-h`, `--help` — pokaż pomoc
 
 ## Co robi
 
-U Ciebie gwrm woła: - gwtrm <arg> - gbd <arg>
-więc obie komendy muszą istnieć.
+`gwrm` woła po kolei:
+- `gwtrm <arg>` — usuwa worktree powiązany z branchem
+- `gbd <arg>` — bezpiecznie usuwa sam branch
 
 ## Efekt końcowy
 
-Usunięcie worktree + usunięcie brancha (zależnie od implementacji gwtrm/gbd).
+Usunięcie worktree + usunięcie brancha (bezpieczne usunięcie — `gbd` odmówi, jeśli branch nie jest zmergowany).
 
 ## Przykłady
 
 ```bash
 gwrm feature/foo
-TEMPLATE --help
+gwrm --help
 ```

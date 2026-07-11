@@ -108,9 +108,13 @@ def check_official_minimum(entries):
     """Return list of missing/issue strings for official repo set."""
     issues = []
 
+    # deb-src-only entries don't provide binary packages; ignore them here
+    # so a source-only mirror can't satisfy the "official repos present" check.
+    binary_entries = [e for e in entries if e.get("type", "deb") == "deb"]
+
     # Mint repo presence + components
     mint_ok = False
-    for e in entries:
+    for e in binary_entries:
         if e["suite"] != REQUIRED_MINT["suite"]:
             continue
         if REQUIRED_MINT["host_substr"] not in (e["uri"] or ""):
@@ -128,7 +132,7 @@ def check_official_minimum(entries):
 
     # Ubuntu suites presence; allow any mirror URI, but require ubuntu keyring Signed-By hint
     seen = {s: set() for s in REQUIRED_UBUNTU_SUITES.keys()}
-    for e in entries:
+    for e in binary_entries:
         s = e["suite"]
         if s not in REQUIRED_UBUNTU_SUITES:
             continue
@@ -287,6 +291,15 @@ def run_watch():
                 if WATCH_NAME_RE.search(bn):
                     pending.add(full)
                     deadline = time.time() + 1.0  # debounce window
+
+                # A configured watch directory (e.g. sources.list.d) just
+                # appeared but isn't watched yet (missing at startup, or
+                # deleted+recreated) - re-arm it so its own child events fire.
+                if full in WATCH_DIRS and full not in wd_map.values() and os.path.isdir(full):
+                    try:
+                        wd_map[inotify_add(fd, full)] = full
+                    except OSError:
+                        pass
 
                 # Kernel auto-removed this watch (target deleted/moved/unmounted);
                 # drop it so a later recycled wd number can't be mislabeled.

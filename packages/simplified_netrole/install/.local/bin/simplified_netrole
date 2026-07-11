@@ -451,7 +451,7 @@ ensure_firefox_profile_dir() {
     fi
 
     # -h: nie podążaj za symlinkami przy zmianie właściciela.
-    chown -h -R "$REAL_USER:$REAL_USER" "$PROFILE_DIR"
+    chown -h -R "$REAL_USER:" "$PROFILE_DIR"
 
     # chmod jako użytkownik docelowy: gdyby ścieżkę podmieniono na symlink do
     # uprzywilejowanego celu, user nie ma praw go zmienić (root by podążył) —
@@ -769,11 +769,11 @@ netrole_fix_config_owner() {
         if [[ "$parent_dir" != "/" ]]; then
             parent_owner="$(stat -c '%U' "$parent_dir" 2>/dev/null || true)"
             if [[ "$parent_owner" == "root" ]]; then
-                chown -h "$owner_user:$owner_user" "$parent_dir" 2>/dev/null || true
+                chown -h "$owner_user:" "$parent_dir" 2>/dev/null || true
             fi
         fi
 
-        chown -h -R "$owner_user:$owner_user" "$config_dir" 2>/dev/null || true
+        chown -h -R "$owner_user:" "$config_dir" 2>/dev/null || true
     fi
 }
 

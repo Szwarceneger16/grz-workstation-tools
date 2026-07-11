@@ -401,10 +401,23 @@ class Controller:
         self.overlay.set_target_for_index(self.overlay.i)
         self.overlay.queue_draw()
 
+    def is_mod_key_still_down(self) -> bool:
+        keymap = self.d.query_keymap()
+        keycode = self.cfg["mod_keycode"]
+        return bool(keymap[keycode // 8] & (1 << (keycode % 8)))
+
     def check_mod_timeout(self):
         if self.mod_down:
             now = int(time.time() * 1000)
             if now - self.last_mod_ms > self.cfg["mod_timeout_ms"]:
+                if self.is_mod_key_still_down():
+                    # Modifier is still physically held (e.g. no autorepeat
+                    # KeyPress arrived in time) - keep waiting for KeyRelease.
+                    self.last_mod_ms = now
+                    return True
+
+                # No KeyRelease event ever arrived for this press - fall back
+                # to releasing state as if it had.
                 self.mod_down = False
                 self.pending = False
 
