@@ -1,0 +1,1033 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$HOME/.local/bin"
+export PATH
+
+APP_ROOT="$HOME/.local/share/yubico-authenticator"
+VERSIONS_DIR="$APP_ROOT/versions"
+CURRENT_LINK="$APP_ROOT/current"
+GNUPG_YUBI="$APP_ROOT/trust/gnupg"
+DESKTOP_FILE="$HOME/.local/share/applications/com.yubico.yubioath.desktop"
+RELEASES_URL="https://developers.yubico.com/yubioath-flutter/Releases/"
+SIGNING_KEYS_URL="https://developers.yubico.com/Software_Projects/Software_Signing.html"
+RELEASE_KEYRING="$APP_ROOT/trust/yubico-release-signers.gpg"
+STATE_HOME_DIR="${XDG_STATE_HOME:-$HOME/.local/state}"
+CACHE_HOME_DIR="${XDG_CACHE_HOME:-$HOME/.cache}"
+STATE_DIR="$STATE_HOME_DIR/yubico-authenticator"
+CACHE_DIR="$CACHE_HOME_DIR/yubico-authenticator"
+CHECK_LOCKFILE="$STATE_DIR/check.lock"
+APPLY_LOCKFILE="$STATE_DIR/apply.lock"
+LAST_NOTIFIED_FILE="$STATE_DIR/last_notified_version"
+SIGNERS_DRIFT_FILE="$STATE_DIR/signers_drift_state"
+SIGNERS_GUIDE_MD="$HOME/.zsh_scripts/cmdhelp/bin/yubico-auth/updating-signers.md"
+
+# Aktualni sygnatariusze wydań Yubico (OpenPGP), zgodnie ze stroną podpisów:
+#   https://developers.yubico.com/Software_Projects/Software_Signing.html
+# Wydanie jest akceptowane, jeśli podpis pochodzi od DOWOLNEGO z tych kluczy.
+# Gdy Yubico zmieni listę, `yubico-auth check` zgłosi rozjazd i wskaże instrukcję:
+#   yubico-auth signers --guide
+ALLOWED_SIGNER_FPRS=(
+  0A3B0262BCA1705307D5FF06BCA00FD4B2168C0A  # Klas Lindfors
+  20EE325B86A81BCBD3E56798F04367096FBA95E8  # Dain Nilsson
+  B70D62AA6A31AD6B9E4F9F4BDC8888925D25CA7A  # Alessio Di Mauro
+  B6042E2BD1FDBC2BCA8588B2FF8D3B45B7B875A9  # Jean Paul Galea
+  57A9DEED4C6D962A923BB691816F3ED99921835E  # Emil Lundberg
+  268583B64786F50F807456DA8CED3A80D41C0DCB  # Trevor Bentley
+  1D7308B0055F5AEF36944A8F27A9C24D9588EA0F  # Aveen Ismail
+  355C8C0186CC96CBA49F9CD8DAA17C2953914D9D  # Alessandro Carlo Chirico
+  9E885C0302F9BB9167529C2D5CBA11E6ADC7BCD1  # Dennis Fokin
+  7FBB6186957496D58C751AC20E777DD85755AA4A  # Konstantinos Georgantas
+  78D997D53E9C0A2A205392ED14A19784723C9988  # Ludvig Michaelsson
+  AF511D2CBC0F973E5D308054325C8E4AE2E6437D  # Adam Velebil
+  C28ED3753F01B4B097A1B306948B29C5F1E063ED  # Elias Bonnici
+  F475928225229F58460640EAD91777C175533EE5  # Giovanni Simoni
+)
+
+ZSH_CORE_10="$HOME/.zsh_scripts/core/10-help_render.zsh"
+ZSH_CORE_11="$HOME/.zsh_scripts/core/11-cmdhelp.zsh"
+ZSH_CORE_12="$HOME/.zsh_scripts/core/12-cmdhelp_internal.zsh"
+PUBLIC_HELP_MD="$HOME/.zsh_scripts/cmdhelp/bin/yubico-auth.md"
+
+usage_main() {
+  cat <<'EOF2'
+yubico-auth — zarządzanie lokalną instalacją Yubico Authenticator
+
+Użycie:
+  yubico-auth <subkomenda> [opcje]
+  yubico-auth --help
+  yubico-auth help [subkomenda]
+
+Subkomendy:
+  init      inicjalizuj środowisko przed pierwszą instalacją
+  run       uruchom aktualnie aktywną wersję GUI
+  status    pokaż stan instalacji i timera
+  check     sprawdź, czy jest nowa wersja
+  upgrade   pobierz i zainstaluj nowszą wersję
+  switch    przełącz aktywną wersję na już zainstalowaną
+  list      wypisz zainstalowane wersje
+  signers   pokaż/zweryfikuj zaufanych sygnatariuszy wydań Yubico
+  help      pokaż help ogólny albo help subkomendy
+
+Więcej:
+  yubico-auth <subkomenda> --help
+EOF2
+}
+
+usage_check() {
+  cat <<'EOF2'
+yubico-auth check
+
+Użycie:
+  yubico-auth check [--notify|--no-notify] [--force-notify]
+  yubico-auth check --upgradable
+  yubico-auth check --help
+
+Opcje:
+  --notify        pokaż powiadomienie, jeśli jest nowa wersja
+  --no-notify     nie pokazuj powiadomienia
+  --force-notify  wymuś powiadomienie także przy braku nowej wersji;
+                  jeśli update istnieje, pokaż je ponownie dla tej samej wersji
+  --upgradable    tryb skryptowy:
+                  0 = jest nowa wersja
+                  1 = brak nowej wersji
+                  2 = błąd
+EOF2
+}
+
+usage_upgrade() {
+  cat <<'EOF2'
+yubico-auth upgrade
+
+Użycie:
+  yubico-auth upgrade [--version WERSJA] [--dry-run] [--no-switch] [--keep-staging]
+  yubico-auth upgrade --help
+
+Opcje:
+  --version WERSJA  pobierz konkretną wersję zamiast najnowszej
+  --dry-run         pokaż plan bez zmian na dysku
+  --no-switch       zainstaluj wersję, ale nie przestawiaj current
+  --keep-staging    nie usuwaj staging po zakończeniu
+
+Bezpieczeństwo:
+  - wymusza podpis od jednego z aktualnych kluczy wydań Yubico (gpgv)
+  - używa wydzielonego keyringu w ~/.local/share/yubico-authenticator/trust/gnupg
+  - nie pozwala na downgrade
+  - nie nadpisuje istniejącej wersji
+EOF2
+}
+
+usage_switch() {
+  cat <<'EOF2'
+yubico-auth switch
+
+Użycie:
+  yubico-auth switch <WERSJA>
+  yubico-auth switch --version WERSJA
+  yubico-auth switch --list
+  yubico-auth switch [--dry-run]
+  yubico-auth switch --help
+
+Opcje:
+  --version WERSJA  wersja do aktywacji
+  --list            pokaż zainstalowane wersje
+  --dry-run         pokaż plan bez zmian na dysku
+EOF2
+}
+
+usage_status() {
+  cat <<'EOF2'
+yubico-auth status
+
+Użycie:
+  yubico-auth status
+  yubico-auth status --help
+
+Opis:
+  Pokazuje aktywną wersję, listę zainstalowanych wersji, status timera
+  oraz informację, czy dostępna jest nowsza wersja.
+EOF2
+}
+
+usage_run() {
+  cat <<'EOF2'
+yubico-auth run
+
+Użycie:
+  yubico-auth run
+  yubico-auth run --help
+
+Opis:
+  Uruchamia aktualnie aktywny bundle wskazywany przez symlink current.
+EOF2
+}
+
+usage_list() {
+  cat <<'EOF2'
+yubico-auth list
+
+Użycie:
+  yubico-auth list
+  yubico-auth list --help
+
+Opis:
+  Wypisuje zainstalowane wersje. Aktywna wersja jest oznaczona gwiazdką '*'.
+EOF2
+}
+
+usage_init() {
+  cat <<'EOF2'
+yubico-auth init
+
+Użycie:
+  yubico-auth init
+  yubico-auth init --help
+
+Opis:
+  Inicjalizuje środowisko przed pierwszą instalacją:
+  - tworzy katalogi danych, stanu i cache
+  - zakłada izolowany keyring GPG w ~/.local/share/yubico-authenticator/trust/gnupg
+  - importuje aktualne klucze podpisujące wydania Yubico (zob. yubico-auth signers)
+  - eksportuje keyring weryfikacyjny dla gpgv
+
+  Uruchom ten polecenie raz po pierwszym stow yubico-auth, a następnie
+  użyj: yubico-auth upgrade
+EOF2
+}
+
+usage_signers() {
+  cat <<'EOF2'
+yubico-auth signers
+
+Użycie:
+  yubico-auth signers
+  yubico-auth signers --check
+  yubico-auth signers --guide
+  yubico-auth signers --help
+
+Opcje:
+  --check   porównaj lokalnie zaufaną listę z aktualną listą Yubico
+  --guide   otwórz instrukcję ręcznej aktualizacji listy sygnatariuszy
+
+Opis:
+  Bez opcji wypisuje lokalnie zaufane odciski sygnatariuszy wydań Yubico.
+  Weryfikacja wydań akceptuje podpis od dowolnego z tych kluczy.
+EOF2
+}
+
+die() {
+  echo "ERROR: $*" >&2
+  exit 2
+}
+
+info() {
+  echo "INFO: $*"
+}
+
+warn() {
+  echo "WARN: $*" >&2
+}
+
+# Lokalnie zaufane odciski sygnatariuszy, znormalizowane (same 40 hex) i posortowane.
+local_signer_fprs() {
+  printf '%s\n' "${ALLOWED_SIGNER_FPRS[@]}" | tr 'a-f' 'A-F' | sort -u
+}
+
+# Aktualni sygnatariusze pobrani ze strony podpisów Yubico (best-effort).
+# Strona ma dwie listy odcisków: aktualnych ("currently releasing code") oraz
+# wycofanych ("released code in the past"). Bierzemy WYŁĄCZNIE sekcję aktualnych —
+# wycofane klucze podpisywały tylko stare wydania, których updater nie pobiera.
+# Zwraca niezerowy kod, gdy pobranie/parsowanie zawiedzie lub gdy nie rozpoznamy
+# znaczników sekcji — dzięki temu nie generujemy fałszywych alarmów o rozjeździe.
+upstream_signer_fprs() {
+  local html region fprs
+  html="$(curl --fail --silent --show-error --location \
+    --connect-timeout 10 --max-time 30 "$SIGNING_KEYS_URL" 2>/dev/null)" || return 1
+
+  # usuń znaczniki HTML i sklej do jednej linii ze znormalizowanymi spacjami
+  region="$(printf '%s' "$html" | sed -E 's/<[^>]+>/ /g' | tr '\n' ' ' | tr -s '[:space:]' ' ')"
+
+  # wymagaj obu znaczników sekcji; bez nich traktuj jako brak pewnego wyniku
+  case "$region" in *"currently releasing code"*) : ;; *) return 1 ;; esac
+  case "$region" in *"released code in the past"*) : ;; *) return 1 ;; esac
+
+  region="${region#*currently releasing code}"
+  region="${region%%released code in the past*}"
+
+  fprs="$(printf '%s' "$region" \
+    | grep -oE '[0-9A-Fa-f]{4}( [0-9A-Fa-f]{4}){9}' \
+    | tr -d ' ' | tr 'a-f' 'A-F' | sort -u)"
+  [[ -n "$fprs" ]] || return 1
+  printf '%s\n' "$fprs"
+}
+
+# (Re)eksportuje zaufane klucze z izolowanego homedir do keyringa dla gpgv.
+# Idempotentne — utrzymuje keyring aktualny także dla instalacji ze starszej
+# wersji skryptu, która nie tworzyła jeszcze tego pliku.
+export_release_keyring() {
+  gpg --homedir "$GNUPG_YUBI" --export "${ALLOWED_SIGNER_FPRS[@]}" > "$RELEASE_KEYRING" 2>/dev/null \
+    || die "nie udało się wyeksportować keyringa sygnatariuszy do $RELEASE_KEYRING"
+  [[ -s "$RELEASE_KEYRING" ]] || die "keyring sygnatariuszy jest pusty — uruchom: yubico-auth init"
+}
+
+# Weryfikuje podpis wydania przez gpgv (działa na GnuPG 2.2 i 2.4) względem
+# keyringa zawierającego wyłącznie aktualne klucze wydań Yubico. Sukces oznacza
+# poprawny podpis od jednego z zaufanych sygnatariuszy.
+verify_release_signature() {
+  local sig_file="$1" tar_file="$2"
+  export_release_keyring
+  gpgv --keyring "$RELEASE_KEYRING" "$sig_file" "$tar_file" \
+    || die "weryfikacja podpisu nie powiodła się: brak zaufanego klucza dla tego podpisu. Jeśli keyring jest niekompletny, uruchom: yubico-auth init (zob. też: yubico-auth signers --check)"
+}
+
+# Otwiera instrukcję ręcznej aktualizacji listy sygnatariuszy.
+open_signers_guide() {
+  if [[ ! -f "$SIGNERS_GUIDE_MD" ]]; then
+    warn "brak pliku instrukcji: $SIGNERS_GUIDE_MD"
+    info "źródło listy sygnatariuszy: $SIGNING_KEYS_URL"
+    return 1
+  fi
+  if command -v glow >/dev/null 2>&1; then
+    glow "$SIGNERS_GUIDE_MD"
+  elif [[ -n "${EDITOR:-}" ]] && command -v "${EDITOR%% *}" >/dev/null 2>&1; then
+    read -ra _editor_cmd <<< "${EDITOR}"
+    "${_editor_cmd[@]}" "$SIGNERS_GUIDE_MD"
+  elif command -v xdg-open >/dev/null 2>&1; then
+    xdg-open "$SIGNERS_GUIDE_MD" >/dev/null 2>&1 || cat "$SIGNERS_GUIDE_MD"
+  else
+    cat "$SIGNERS_GUIDE_MD"
+  fi
+}
+
+# Porównuje lokalnie zaufaną listę sygnatariuszy z aktualną listą Yubico.
+# Best-effort: gdy nie uda się pobrać/sparsować strony, nie alarmuje.
+# Przy do_notify=1 wysyła powiadomienie raz na zmianę (dedup po stanie w pliku).
+# Zwraca: 0 = brak rozjazdu, 1 = wykryto rozjazd, 2 = nie dało się sprawdzić.
+check_signer_drift() {
+  local do_notify="${1:-0}"
+  local local_set upstream_set added removed
+
+  local_set="$(local_signer_fprs)"
+  if ! upstream_set="$(upstream_signer_fprs)"; then
+    return 2
+  fi
+
+  if [[ "$local_set" == "$upstream_set" ]]; then
+    return 0
+  fi
+
+  added="$(comm -13 <(printf '%s\n' "$local_set") <(printf '%s\n' "$upstream_set"))"
+  removed="$(comm -23 <(printf '%s\n' "$local_set") <(printf '%s\n' "$upstream_set"))"
+
+  echo "Lista sygnatariuszy Yubico różni się od lokalnie zaufanej."
+  local fpr
+  if [[ -n "$added" ]]; then
+    echo "Nowi sygnatariusze u Yubico (brak lokalnie):"
+    while IFS= read -r fpr; do printf '  + %s\n' "$fpr"; done <<< "$added"
+  fi
+  if [[ -n "$removed" ]]; then
+    echo "Sygnatariusze lokalni, których nie ma już u Yubico:"
+    while IFS= read -r fpr; do printf '  - %s\n' "$fpr"; done <<< "$removed"
+  fi
+  echo "Instrukcja aktualizacji: yubico-auth signers --guide"
+
+  if [[ "$do_notify" -eq 1 ]] && command -v notify-send >/dev/null 2>&1; then
+    local drift_hash last_hash=""
+    drift_hash="$(printf '%s\n' "$upstream_set" | sha256sum | awk '{print $1}')"
+    [[ -f "$SIGNERS_DRIFT_FILE" ]] && last_hash="$(<"$SIGNERS_DRIFT_FILE")"
+    if [[ "$drift_hash" != "$last_hash" ]]; then
+      if notify-send --app-name="Yubico Authenticator" --icon="com.yubico.yubioath" \
+          "Yubico Authenticator" \
+          "Lista sygnatariuszy Yubico się zmieniła. Instrukcja: yubico-auth signers --guide"; then
+        mkdir -p "$STATE_DIR"
+        printf '%s\n' "$drift_hash" > "$SIGNERS_DRIFT_FILE"
+      fi
+    fi
+  fi
+
+  return 1
+}
+
+version_gt() {
+  local lhs="$1" rhs="$2"
+  [[ "$lhs" != "$rhs" ]] || return 1
+  [[ "$(printf '%s\n%s\n' "$lhs" "$rhs" | sort -V | tail -n1)" == "$lhs" ]]
+}
+
+is_valid_version() {
+  [[ "$1" =~ ^[0-9]+([.][0-9]+)*$ ]]
+}
+
+current_version() {
+  [[ -e "$CURRENT_LINK" ]] || return 1
+  basename "$(readlink -f "$CURRENT_LINK")"
+}
+
+# Fallback ikony, gdy make_icon_set nie jest dostępne: kopiuje dołączony PNG do
+# motywu hicolor użytkownika, żeby launcher/autostart miały ikonę zamiast generycznej.
+install_icon_fallback() {
+  local icon_source="$1"
+  local dest_dir="$HOME/.local/share/icons/hicolor/256x256/apps"
+
+  if [[ ! -f "$icon_source" ]]; then
+    info "brak źródłowej ikony do skopiowania: $icon_source"
+    return 0
+  fi
+
+  mkdir -p "$dest_dir"
+  cp -f "$icon_source" "$dest_dir/com.yubico.yubioath.png"
+  info "skopiowano ikonę do $dest_dir/com.yubico.yubioath.png"
+}
+
+latest_release_version() {
+  local releases_html latest_tar latest_ver
+  releases_html="$(curl --fail --silent --show-error --location --connect-timeout 10 --max-time 30 "$RELEASES_URL")"
+  latest_tar="$({ printf '%s\n' "$releases_html" | grep -oE 'yubico-authenticator-[0-9][0-9.]*-linux\.tar\.gz' | sort -Vu | tail -n1; } || true)"
+  [[ -n "$latest_tar" ]] || return 1
+  latest_ver="${latest_tar#yubico-authenticator-}"
+  latest_ver="${latest_ver%-linux.tar.gz}"
+  printf '%s\n' "$latest_ver"
+}
+
+render_public_help() {
+  if command -v zsh >/dev/null 2>&1 \
+    && [[ -f "$ZSH_CORE_10" ]] \
+    && [[ -f "$ZSH_CORE_11" ]]; then
+    if zsh -fc '
+      source "$1"
+      source "$2"
+      cmdhelp yubico-auth
+    ' _ "$ZSH_CORE_10" "$ZSH_CORE_11"; then
+      return 0
+    fi
+  fi
+
+  if [[ -f "$PUBLIC_HELP_MD" ]]; then
+    if command -v glow >/dev/null 2>&1; then
+      glow "$PUBLIC_HELP_MD"
+    else
+      cat "$PUBLIC_HELP_MD"
+    fi
+    return 0
+  fi
+
+  usage_main
+}
+
+render_internal_help() {
+  local rel="$1"
+
+  if command -v zsh >/dev/null 2>&1 \
+    && [[ -f "$ZSH_CORE_10" ]] \
+    && [[ -f "$ZSH_CORE_11" ]] \
+    && [[ -f "$ZSH_CORE_12" ]]; then
+    if zsh -fc '
+      source "$1"
+      source "$2"
+      source "$3"
+      cmdhelp_render_internal "$4"
+    ' _ "$ZSH_CORE_10" "$ZSH_CORE_11" "$ZSH_CORE_12" "$rel"; then
+      return 0
+    fi
+  fi
+
+  case "$rel" in
+    yubico-auth/check.md) usage_check ;;
+    yubico-auth/upgrade.md) usage_upgrade ;;
+    yubico-auth/switch.md) usage_switch ;;
+    yubico-auth/status.md) usage_status ;;
+    yubico-auth/run.md) usage_run ;;
+    yubico-auth/list.md) usage_list ;;
+    yubico-auth/init.md) usage_init ;;
+    yubico-auth/signers.md) usage_signers ;;
+    *)
+      print_fallback_sub_help "$rel"
+      return 1
+      ;;
+  esac
+}
+
+print_fallback_sub_help() {
+  local rel="$1"
+  case "$rel" in
+    yubico-auth/check.md) usage_check ;;
+    yubico-auth/upgrade.md) usage_upgrade ;;
+    yubico-auth/switch.md) usage_switch ;;
+    yubico-auth/status.md) usage_status ;;
+    yubico-auth/run.md) usage_run ;;
+    yubico-auth/list.md) usage_list ;;
+    yubico-auth/init.md) usage_init ;;
+    yubico-auth/signers.md) usage_signers ;;
+    *) echo "ERROR: brak helpa dla subkomendy: ${rel##*/}" >&2 ;;
+  esac
+}
+
+cmd_init() {
+  if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+    render_internal_help "yubico-auth/init.md"
+    return 0
+  fi
+
+  command -v gpg >/dev/null 2>&1 || die "brak gpg"
+  command -v gpgv >/dev/null 2>&1 || die "brak gpgv (część pakietu gnupg)"
+
+  info "tworzę katalogi danych..."
+  mkdir -p "$VERSIONS_DIR" "$STATE_DIR" "$CACHE_DIR"
+
+  if [[ ! -d "$GNUPG_YUBI" ]]; then
+    info "tworzę izolowany keyring GPG: $GNUPG_YUBI"
+    mkdir -p "$GNUPG_YUBI"
+    chmod 700 "$GNUPG_YUBI"
+  fi
+
+  info "importuję klucze podpisujące Yubico (${#ALLOWED_SIGNER_FPRS[@]})..."
+  gpg --homedir "$GNUPG_YUBI" \
+      --keyserver hkps://keys.openpgp.org \
+      --recv-keys "${ALLOWED_SIGNER_FPRS[@]}" \
+    || warn "część kluczy mogła nie zostać pobrana z keys.openpgp.org"
+
+  local fpr missing=()
+  for fpr in "${ALLOWED_SIGNER_FPRS[@]}"; do
+    gpg --homedir "$GNUPG_YUBI" --list-keys "$fpr" >/dev/null 2>&1 || missing+=("$fpr")
+  done
+
+  if (( ${#missing[@]} )); then
+    info "próbuję pobrać brakujące klucze z keyserver.ubuntu.com..."
+    gpg --homedir "$GNUPG_YUBI" \
+        --keyserver hkps://keyserver.ubuntu.com \
+        --recv-keys "${missing[@]}" \
+      || warn "nie udało się pobrać wszystkich brakujących kluczy z keyserver.ubuntu.com"
+    local still_missing=()
+    for fpr in "${missing[@]}"; do
+      gpg --homedir "$GNUPG_YUBI" --list-keys "$fpr" >/dev/null 2>&1 || still_missing+=("$fpr")
+    done
+    for fpr in "${still_missing[@]}"; do
+      warn "nie zaimportowano klucza: $fpr (wydania podpisane tym kluczem nie przejdą weryfikacji)"
+    done
+  fi
+
+  info "eksportuję keyring weryfikacyjny dla gpgv: $RELEASE_KEYRING"
+  export_release_keyring
+  info "keyring gotowy"
+
+  info "inicjalizacja zakończona. Możesz teraz uruchomić: yubico-auth upgrade"
+}
+
+cmd_run() {
+  [[ $# -eq 0 ]] || [[ "${1:-}" != "--help" && "${1:-}" != "-h" ]] || { render_internal_help "yubico-auth/run.md"; return 0; }
+  [[ -x "$APP_ROOT/current/authenticator" ]] || die "brak wykonywalnego pliku: $APP_ROOT/current/authenticator"
+  exec "$APP_ROOT/current/authenticator" "$@"
+}
+
+cmd_list() {
+  if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+    render_internal_help "yubico-auth/list.md"
+    return 0
+  fi
+
+  [[ -d "$VERSIONS_DIR" ]] || { info "brak katalogu wersji: $VERSIONS_DIR"; return 1; }
+  local current=""
+  [[ -e "$CURRENT_LINK" ]] && current="$(basename "$(readlink -f "$CURRENT_LINK")")"
+  local found=0
+  local dir base
+  while IFS= read -r -d '' dir; do
+    found=1
+    base="$(basename "$dir")"
+    if [[ "$base" == "$current" ]]; then
+      printf '* %s\n' "$base"
+    else
+      printf '  %s\n' "$base"
+    fi
+  done < <(find "$VERSIONS_DIR" -maxdepth 1 -mindepth 1 -type d -print0 2>/dev/null | sort -zV)
+  [[ $found -eq 1 ]] || info "brak zainstalowanych wersji"
+}
+
+cmd_check() {
+  local mode="check-upgrade" notify=1 force_notify=0
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --help|-h)
+        render_internal_help "yubico-auth/check.md"
+        return 0
+        ;;
+      --notify)
+        notify=1
+        ;;
+      --no-notify)
+        notify=0
+        ;;
+      --force-notify)
+        force_notify=1
+        ;;
+      --upgradable)
+        mode="upgradable"
+        ;;
+      *)
+        die "nieznana opcja dla check: $1"
+        ;;
+    esac
+    shift
+  done
+
+  [[ "$mode" != "upgradable" ]] || notify=0
+
+  mkdir -p "$STATE_DIR"
+  exec 9>"$CHECK_LOCKFILE"
+  if ! flock -n 9; then
+    info "checker już działa, pomijam."
+    [[ "$mode" == "upgradable" ]] && return 2
+    return 0
+  fi
+
+  command -v curl >/dev/null 2>&1 || die "brak curl"
+  [[ -e "$CURRENT_LINK" ]] || die "brak aktywnego linku current: $CURRENT_LINK"
+
+  local current_ver latest_ver msg last_notified=""
+  current_ver="$(current_version)"
+  is_valid_version "$current_ver" || die "niepoprawna aktywna wersja: $current_ver"
+
+  latest_ver="$(latest_release_version)" || die "nie udało się ustalić najnowszego linuxowego release"
+  is_valid_version "$latest_ver" || die "wykryto niepoprawną wersję: $latest_ver"
+
+  # Best-effort: ostrzeż, jeśli Yubico zmieniło listę sygnatariuszy wydań.
+  # Pomijamy w trybie skryptowym, by nie zaśmiecać wyjścia kodów wyjścia.
+  if [[ "$mode" != "upgradable" ]]; then
+    check_signer_drift "$notify" || true
+  fi
+
+  if version_gt "$latest_ver" "$current_ver"; then
+    msg="Yubico Authenticator: dostępna aktualizacja $latest_ver (masz $current_ver)"
+    echo "$msg"
+
+    if [[ "$notify" -eq 1 ]]; then
+      [[ -f "$LAST_NOTIFIED_FILE" ]] && last_notified="$(<"$LAST_NOTIFIED_FILE")"
+      if [[ "$force_notify" -eq 1 || "$last_notified" != "$latest_ver" ]]; then
+        if command -v notify-send >/dev/null 2>&1; then
+          if notify-send --app-name="Yubico Authenticator" --icon="com.yubico.yubioath" \
+              "Yubico Authenticator" "Dostępna aktualizacja: $latest_ver (masz $current_ver)"; then
+            printf '%s\n' "$latest_ver" > "$LAST_NOTIFIED_FILE"
+          fi
+        else
+          info "notify-send nie jest dostępny — powiadomienie pominięte"
+        fi
+      fi
+    fi
+
+    [[ "$mode" == "upgradable" ]] && return 0
+    return 0
+  fi
+
+  echo "Yubico Authenticator: brak nowszej wersji (masz $current_ver)."
+
+  if [[ "$notify" -eq 1 && "$force_notify" -eq 1 ]]; then
+    if command -v notify-send >/dev/null 2>&1; then
+      notify-send --app-name="Yubico Authenticator" --icon="com.yubico.yubioath" \
+        "Yubico Authenticator" "Brak nowszej wersji. Masz już: $current_ver" || true
+    fi
+  fi
+
+  [[ "$mode" == "upgradable" ]] && return 1
+  return 0
+}
+
+cmd_upgrade() {
+  local requested_version="" keep_staging=0 dry_run=0 no_switch=0
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --help|-h)
+        render_internal_help "yubico-auth/upgrade.md"
+        return 0
+        ;;
+      --version)
+        [[ $# -ge 2 ]] || die "brak wartości po --version"
+        requested_version="$2"
+        shift
+        ;;
+      --dry-run)
+        dry_run=1
+        ;;
+      --no-switch)
+        no_switch=1
+        ;;
+      --keep-staging)
+        keep_staging=1
+        ;;
+      *)
+        die "nieznana opcja dla upgrade: $1"
+        ;;
+    esac
+    shift
+  done
+
+  if [[ "$dry_run" -eq 0 ]]; then
+    mkdir -p "$VERSIONS_DIR" "$STATE_DIR" "$CACHE_DIR"
+
+    exec 9>"$APPLY_LOCKFILE"
+    if ! flock -n 9; then
+      die "inny proces aktualizacji już działa"
+    fi
+  fi
+
+  command -v curl >/dev/null 2>&1 || die "brak curl"
+  command -v gpg >/dev/null 2>&1 || die "brak gpg"
+  command -v gpgv >/dev/null 2>&1 || die "brak gpgv (część pakietu gnupg)"
+  command -v tar >/dev/null 2>&1 || die "brak tar"
+  command -v sha256sum >/dev/null 2>&1 || die "brak sha256sum"
+
+  local current_ver target_ver target_tar install_dir staging_dir sig_file tar_url sig_url extracted_dir icon_source old_target new_target
+  current_ver="$(current_version 2>/dev/null || true)"
+  [[ -z "$current_ver" ]] || is_valid_version "$current_ver" || die "niepoprawna aktywna wersja: $current_ver"
+
+  if [[ -n "$requested_version" ]]; then
+    is_valid_version "$requested_version" || die "niepoprawny format wersji: $requested_version"
+    target_ver="$requested_version"
+    target_tar="yubico-authenticator-$target_ver-linux.tar.gz"
+  else
+    target_ver="$(latest_release_version)" || die "nie udało się ustalić najnowszego linuxowego release"
+    is_valid_version "$target_ver" || die "wykryto niepoprawną wersję: $target_ver"
+    target_tar="yubico-authenticator-$target_ver-linux.tar.gz"
+  fi
+
+  if [[ -n "$current_ver" ]]; then
+    if [[ "$target_ver" == "$current_ver" ]]; then
+      info "już używasz wersji $current_ver"
+      return 0
+    fi
+    if ! version_gt "$target_ver" "$current_ver"; then
+      die "wersja docelowa ($target_ver) nie jest nowsza od aktywnej ($current_ver)"
+    fi
+  fi
+
+  install_dir="$VERSIONS_DIR/$target_ver"
+  if [[ "$dry_run" -eq 0 ]]; then
+    staging_dir="$(mktemp -d "$CACHE_DIR/staging-$target_ver-XXXXXX")"
+    if [[ "$keep_staging" -eq 0 ]]; then
+      # shellcheck disable=SC2064  # intentional: expand now so path survives function return
+      trap "rm -rf $(printf '%q' "$staging_dir")" EXIT
+    fi
+  else
+    staging_dir="$CACHE_DIR/staging-$target_ver-XXXXXX"
+  fi
+
+  sig_file="$target_tar.sig"
+  tar_url="$RELEASES_URL$target_tar"
+  sig_url="$RELEASES_URL$sig_file"
+
+  info "aktywna wersja: $current_ver"
+  info "docelowa wersja: $target_ver"
+  info "staging: $staging_dir"
+
+  if [[ "$dry_run" -eq 1 ]]; then
+    info "dry-run: pobrałbym $tar_url"
+    info "dry-run: pobrałbym $sig_url"
+    info "dry-run: zweryfikowałbym podpis przez gpgv względem keyringu Yubico ($RELEASE_KEYRING)"
+    if [[ -e "$install_dir" ]]; then
+      info "dry-run: wersja $target_ver już zainstalowana w $install_dir — nic do zrobienia"
+    else
+      info "dry-run: zainstalowałbym do $install_dir"
+    fi
+    if [[ "$no_switch" -eq 0 ]]; then
+      info "dry-run: przestawiłbym current -> $install_dir"
+    else
+      info "dry-run: current pozostałby bez zmian"
+    fi
+    return 0
+  fi
+
+  [[ ! -e "$install_dir" ]] || die "wersja $target_ver jest już obecna w $install_dir"
+
+  cd "$staging_dir"
+  info "pobieram tarball"
+  curl --fail --silent --show-error --location --connect-timeout 10 --max-time 120 -O "$tar_url"
+  info "pobieram podpis"
+  curl --fail --silent --show-error --location --connect-timeout 10 --max-time 60 -O "$sig_url"
+  info "sha256: $(sha256sum "$target_tar" | awk '{print $1}')"
+
+  info "weryfikuję podpis"
+  verify_release_signature "$sig_file" "$target_tar"
+
+  info "rozpakowuję archive"
+  tar -xzf "$target_tar"
+  extracted_dir="yubico-authenticator-$target_ver-linux"
+
+  [[ -d "$extracted_dir" ]] || die "brak rozpakowanego katalogu $extracted_dir"
+  [[ -x "$extracted_dir/authenticator" ]] || die "brak wykonywalnego pliku authenticator"
+  [[ -f "$extracted_dir/linux_support/com.yubico.yubioath.png" ]] || die "brak ikony źródłowej"
+
+  info "instaluję do $install_dir"
+  mv "$extracted_dir" "$install_dir"
+
+  if [[ "$no_switch" -eq 0 ]]; then
+    old_target="$(readlink -f "$CURRENT_LINK")"
+    ln -sfn "$install_dir" "${CURRENT_LINK}.tmp"
+    mv -T "${CURRENT_LINK}.tmp" "$CURRENT_LINK"
+    new_target="$(readlink -f "$CURRENT_LINK")"
+    info "przestawiono current"
+    info "stare: $old_target"
+    info "nowe:  $new_target"
+    icon_source="$APP_ROOT/current/linux_support/com.yubico.yubioath.png"
+  else
+    info "pominięto przełączenie current (--no-switch)"
+    icon_source="$install_dir/linux_support/com.yubico.yubioath.png"
+  fi
+
+  if command -v make_icon_set >/dev/null 2>&1; then
+    info "odświeżam ikony przez make_icon_set"
+    make_icon_set "$icon_source" com.yubico.yubioath
+  else
+    info "make_icon_set nie jest dostępne — instaluję ikonę fallback"
+    install_icon_fallback "$icon_source"
+  fi
+
+  if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database "$HOME/.local/share/applications" 2>/dev/null || true
+  fi
+  if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+    gtk-update-icon-cache "$HOME/.local/share/icons/hicolor" 2>/dev/null || true
+  fi
+
+  info "gotowe: zainstalowano $target_ver"
+}
+
+cmd_switch() {
+  local requested_version="" dry_run=0 show_list=0
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --help|-h)
+        render_internal_help "yubico-auth/switch.md"
+        return 0
+        ;;
+      --version)
+        [[ $# -ge 2 ]] || die "brak wartości po --version"
+        requested_version="$2"
+        shift
+        ;;
+      --dry-run)
+        dry_run=1
+        ;;
+      --list)
+        show_list=1
+        ;;
+      --*)
+        die "nieznana opcja dla switch: $1"
+        ;;
+      *)
+        if [[ -z "$requested_version" ]]; then
+          requested_version="$1"
+        else
+          die "podano więcej niż jedną wersję"
+        fi
+        ;;
+    esac
+    shift
+  done
+
+  [[ -d "$VERSIONS_DIR" ]] || die "brak katalogu wersji: $VERSIONS_DIR"
+
+  if [[ "$show_list" -eq 1 ]]; then
+    cmd_list
+    return 0
+  fi
+
+  [[ -n "$requested_version" ]] || die "brak wersji do przełączenia"
+  is_valid_version "$requested_version" || die "niepoprawny format wersji: $requested_version"
+
+  local target_dir="$VERSIONS_DIR/$requested_version"
+  [[ -d "$target_dir" ]] || die "wersja nie jest zainstalowana: $requested_version"
+
+  local current_ver=""
+  [[ -e "$CURRENT_LINK" ]] && current_ver="$(current_version)"
+
+  if [[ "$dry_run" -eq 1 ]]; then
+    info "dry-run: przestawiłbym current z ${current_ver:-brak} na $requested_version"
+    info "dry-run: źródło ikon: $target_dir/linux_support/com.yubico.yubioath.png"
+    return 0
+  fi
+
+  ln -sfn "$target_dir" "${CURRENT_LINK}.tmp"
+  mv -T "${CURRENT_LINK}.tmp" "$CURRENT_LINK"
+
+  if command -v make_icon_set >/dev/null 2>&1; then
+    make_icon_set "$target_dir/linux_support/com.yubico.yubioath.png" com.yubico.yubioath
+  else
+    install_icon_fallback "$target_dir/linux_support/com.yubico.yubioath.png"
+  fi
+
+  if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database "$HOME/.local/share/applications" 2>/dev/null || true
+  fi
+  if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+    gtk-update-icon-cache "$HOME/.local/share/icons/hicolor" 2>/dev/null || true
+  fi
+
+  info "przestawiono current na $requested_version"
+}
+
+cmd_status() {
+  if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+    render_internal_help "yubico-auth/status.md"
+    return 0
+  fi
+
+  local current_ver="brak" current_target="brak" latest_ver="nieznany" update_state="nieznany" timer_enabled="no" timer_active="no"
+  local signer_count="${#ALLOWED_SIGNER_FPRS[@]}" signers_state="nieznany" upstream_set=""
+
+  if [[ -e "$CURRENT_LINK" ]]; then
+    current_target="$(readlink -f "$CURRENT_LINK")"
+    current_ver="$(basename "$current_target")"
+  fi
+
+  if upstream_set="$(upstream_signer_fprs 2>/dev/null)"; then
+    if [[ "$(local_signer_fprs)" == "$upstream_set" ]]; then
+      signers_state="ok"
+    else
+      signers_state="rozjazd (uruchom: yubico-auth signers --check)"
+    fi
+  fi
+
+  if systemctl --user is-enabled yubico-auth-check.timer >/dev/null 2>&1; then
+    timer_enabled="enabled"
+  fi
+  if systemctl --user is-active yubico-auth-check.timer >/dev/null 2>&1; then
+    timer_active="yes"
+  fi
+
+  if latest_ver="$(latest_release_version 2>/dev/null)"; then
+    if [[ "$current_ver" != "brak" ]] && version_gt "$latest_ver" "$current_ver"; then
+      update_state="yes"
+    else
+      update_state="no"
+    fi
+  fi
+
+  echo "Yubico Authenticator status"
+  echo
+  echo "Aktywna wersja: $current_ver"
+  echo "Current target: $current_target"
+  echo "Desktop file:   $DESKTOP_FILE"
+  echo "Keyring:        $GNUPG_YUBI"
+  echo "Trusted signers: $signer_count"
+  echo "Signers state:  $signers_state"
+  echo
+  echo "Zainstalowane wersje:"
+  cmd_list || true
+  echo
+  echo "Timer:          $timer_enabled"
+  echo "Timer active:   $timer_active"
+  echo "Latest release: $latest_ver"
+  echo "Update:         $update_state"
+}
+
+cmd_signers() {
+  local action="list"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --help|-h)
+        render_internal_help "yubico-auth/signers.md"
+        return 0
+        ;;
+      --check)
+        action="check"
+        ;;
+      --guide)
+        action="guide"
+        ;;
+      *)
+        die "nieznana opcja dla signers: $1"
+        ;;
+    esac
+    shift
+  done
+
+  case "$action" in
+    list)
+      echo "Lokalnie zaufani sygnatariusze wydań Yubico (${#ALLOWED_SIGNER_FPRS[@]}):"
+      printf '  %s\n' "${ALLOWED_SIGNER_FPRS[@]}"
+      echo
+      echo "Źródło listy: $SIGNING_KEYS_URL"
+      echo "Sprawdź rozjazd: yubico-auth signers --check"
+      ;;
+    check)
+      command -v curl >/dev/null 2>&1 || die "brak curl"
+      local rc=0
+      check_signer_drift 0 || rc=$?
+      case "$rc" in
+        0) echo "OK: lokalna lista sygnatariuszy zgodna z Yubico." ;;
+        2) warn "nie udało się pobrać/sparsować listy sygnatariuszy z $SIGNING_KEYS_URL"
+           return 1 ;;
+        *)
+          echo
+          echo "Instrukcja aktualizacji: $SIGNERS_GUIDE_MD"
+          echo "Otwórz ją poleceniem: yubico-auth signers --guide"
+          return 1
+          ;;
+      esac
+      ;;
+    guide)
+      open_signers_guide
+      ;;
+  esac
+}
+
+cmd_help() {
+  local subcmd="${1:-}"
+  case "$subcmd" in
+    "") render_public_help ;;
+    init|run|status|check|upgrade|switch|list|signers) render_internal_help "yubico-auth/${subcmd}.md" ;;
+    *) die "brak helpa dla subkomendy: $subcmd" ;;
+  esac
+}
+
+main() {
+  local subcmd="${1:-}"
+  case "$subcmd" in
+    ""|--help|-h)
+      render_public_help
+      ;;
+    help)
+      shift
+      cmd_help "$@"
+      ;;
+    init)
+      shift
+      cmd_init "$@"
+      ;;
+    run)
+      shift
+      cmd_run "$@"
+      ;;
+    status)
+      shift
+      cmd_status "$@"
+      ;;
+    check)
+      shift
+      cmd_check "$@"
+      ;;
+    upgrade)
+      shift
+      cmd_upgrade "$@"
+      ;;
+    switch)
+      shift
+      cmd_switch "$@"
+      ;;
+    list)
+      shift
+      cmd_list "$@"
+      ;;
+    signers)
+      shift
+      cmd_signers "$@"
+      ;;
+    *)
+      die "nieznana subkomenda: $subcmd"
+      ;;
+  esac
+}
+
+main "$@"

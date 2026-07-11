@@ -1,0 +1,285 @@
+#compdef yubico-auth
+
+_yubico_auth() {
+  emulate -L zsh
+  setopt localoptions noshwordsplit noksh_arrays
+
+  local app_root="${HOME}/.local/share/yubico-authenticator"
+  local versions_dir="${app_root}/versions"
+
+  # Dla tego completion chcemy czytelny, jednokolumnowy układ.
+  zstyle ':completion:*:*:yubico-auth:*' list-packed false
+
+  local -a installed_versions
+  installed_versions=()
+  if [[ -d "$versions_dir" ]]; then
+    local dir
+    for dir in "$versions_dir"/*(/N); do
+      installed_versions+=("${dir:t}")
+    done
+  fi
+
+  local -a root_names root_descs
+  root_names=(
+    init
+    run
+    status
+    check
+    upgrade
+    switch
+    list
+    signers
+    help
+    --help
+    -h
+  )
+  root_descs=(
+    'yubico-auth init — zaimportuj klucze i utwórz katalogi stanu'
+    'yubico-auth run — uruchom aktualnie aktywną wersję GUI'
+    'yubico-auth status — pokaż stan instalacji i timera'
+    'yubico-auth check — sprawdź, czy jest nowa wersja'
+    'yubico-auth upgrade — pobierz i zainstaluj nowszą wersję'
+    'yubico-auth switch — przełącz aktywną wersję na już zainstalowaną'
+    'yubico-auth list — wypisz zainstalowane wersje'
+    'yubico-auth signers — pokaż/zweryfikuj zaufanych sygnatariuszy Yubico'
+    'yubico-auth help — pokaż help ogólny albo help subkomendy'
+    'yubico-auth --help — pokaż help ogólny'
+    'yubico-auth -h — pokaż help ogólny'
+  )
+
+  local -a check_names check_descs
+  check_names=(--notify --no-notify --force-notify --upgradable --help -h)
+  check_descs=(
+    'yubico-auth check --notify — pokaż powiadomienie, jeśli jest nowa wersja'
+    'yubico-auth check --no-notify — nie pokazuj powiadomienia'
+    'yubico-auth check --force-notify — wymuś powiadomienie dla tej samej wersji ponownie'
+    'yubico-auth check --upgradable — tryb skryptowy z kodem wyjścia'
+    'yubico-auth check --help — pokaż help dla subkomendy check'
+    'yubico-auth check -h — pokaż help dla subkomendy check'
+  )
+
+  local -a upgrade_names upgrade_descs
+  upgrade_names=(--version --dry-run --no-switch --keep-staging --help -h)
+  upgrade_descs=(
+    'yubico-auth upgrade --version — pobierz konkretną wersję zamiast najnowszej'
+    'yubico-auth upgrade --dry-run — pokaż plan bez zmian na dysku'
+    'yubico-auth upgrade --no-switch — zainstaluj wersję, ale nie przestawiaj current'
+    'yubico-auth upgrade --keep-staging — nie usuwaj staging po zakończeniu'
+    'yubico-auth upgrade --help — pokaż help dla subkomendy upgrade'
+    'yubico-auth upgrade -h — pokaż help dla subkomendy upgrade'
+  )
+
+  local -a switch_names switch_descs
+  switch_names=(--list --dry-run --version --help -h)
+  switch_descs=(
+    'yubico-auth switch --list — pokaż zainstalowane wersje'
+    'yubico-auth switch --dry-run — pokaż plan bez zmian na dysku'
+    'yubico-auth switch --version — wersja do aktywacji'
+    'yubico-auth switch --help — pokaż help dla subkomendy switch'
+    'yubico-auth switch -h — pokaż help dla subkomendy switch'
+  )
+
+  local -a signers_names signers_descs
+  signers_names=(--check --guide --help -h)
+  signers_descs=(
+    'yubico-auth signers --check — porównaj lokalną listę z aktualną listą Yubico'
+    'yubico-auth signers --guide — otwórz instrukcję aktualizacji sygnatariuszy'
+    'yubico-auth signers --help — pokaż help dla subkomendy signers'
+    'yubico-auth signers -h — pokaż help dla subkomendy signers'
+  )
+
+  local -a help_names help_descs
+  help_names=(init run status check upgrade switch list signers)
+  help_descs=(
+    'yubico-auth help init — help dla subkomendy init'
+    'yubico-auth help run — help dla subkomendy run'
+    'yubico-auth help status — help dla subkomendy status'
+    'yubico-auth help check — help dla subkomendy check'
+    'yubico-auth help upgrade — help dla subkomendy upgrade'
+    'yubico-auth help switch — help dla subkomendy switch'
+    'yubico-auth help list — help dla subkomendy list'
+    'yubico-auth help signers — help dla subkomendy signers'
+  )
+
+  local -a show_names show_descs
+  local i
+
+  _yubico_auth_add_matches() {
+    emulate -L zsh
+    setopt localoptions noksh_arrays
+
+    local prefix="$1"
+    shift
+
+    local -a in_names in_descs
+    in_names=("${(@P)1}")
+    in_descs=("${(@P)2}")
+
+    show_names=()
+    show_descs=()
+
+    local j
+    for (( j = 1; j <= ${#in_names[@]}; ++j )); do
+      if [[ -z "$prefix" || "${in_names[j]}" == ${prefix}* ]]; then
+        show_names+=("${in_names[j]}")
+        show_descs+=("${in_descs[j]}")
+      fi
+    done
+  }
+
+  _yubico_auth_compadd_described() {
+    emulate -L zsh
+    setopt localoptions noksh_arrays
+
+    local -a names descs
+    names=("$@")
+    descs=("${show_descs[@]}")
+
+    compstate[list]='list force'
+    compadd -Q -S '' -d descs -- $names
+  }
+
+  # Główna subkomenda po "yubico-auth "
+  if (( CURRENT == 2 )); then
+    _yubico_auth_add_matches "$PREFIX" root_names root_descs
+    if (( ${#show_names[@]} )); then
+      _yubico_auth_compadd_described "${show_names[@]}"
+    fi
+    return
+  fi
+
+  case "${words[2]:-}" in
+    init)
+      if (( CURRENT == 3 )); then
+        show_names=(--help -h)
+        show_descs=(
+          'yubico-auth init --help — pokaż help dla subkomendy init'
+          'yubico-auth init -h — pokaż help dla subkomendy init'
+        )
+        _yubico_auth_compadd_described "${show_names[@]}"
+      fi
+      return
+      ;;
+
+    run)
+      if (( CURRENT == 3 )); then
+        show_names=(--help -h)
+        show_descs=(
+          'yubico-auth run --help — pokaż help dla subkomendy run'
+          'yubico-auth run -h — pokaż help dla subkomendy run'
+        )
+        _yubico_auth_compadd_described "${show_names[@]}"
+      fi
+      return
+      ;;
+
+    status)
+      if (( CURRENT == 3 )); then
+        show_names=(--help -h)
+        show_descs=(
+          'yubico-auth status --help — pokaż help dla subkomendy status'
+          'yubico-auth status -h — pokaż help dla subkomendy status'
+        )
+        _yubico_auth_compadd_described "${show_names[@]}"
+      fi
+      return
+      ;;
+
+    list)
+      if (( CURRENT == 3 )); then
+        show_names=(--help -h)
+        show_descs=(
+          'yubico-auth list --help — pokaż help dla subkomendy list'
+          'yubico-auth list -h — pokaż help dla subkomendy list'
+        )
+        _yubico_auth_compadd_described "${show_names[@]}"
+      fi
+      return
+      ;;
+
+    check)
+      if (( CURRENT == 3 )); then
+        _yubico_auth_add_matches "$PREFIX" check_names check_descs
+        if (( ${#show_names[@]} )); then
+          _yubico_auth_compadd_described "${show_names[@]}"
+        fi
+      fi
+      return
+      ;;
+
+    upgrade)
+      if [[ "${words[CURRENT-1]:-}" == "--version" ]]; then
+        _message 'wersja release, np. 7.3.2'
+        return
+      fi
+
+      if (( CURRENT == 3 )); then
+        _yubico_auth_add_matches "$PREFIX" upgrade_names upgrade_descs
+        if (( ${#show_names[@]} )); then
+          _yubico_auth_compadd_described "${show_names[@]}"
+        fi
+      fi
+      return
+      ;;
+
+    switch)
+      if [[ "${words[CURRENT-1]:-}" == "--version" ]]; then
+        compstate[list]='list force'
+        if (( ${#installed_versions[@]} )); then
+          compadd -Q -S '' -- $installed_versions
+        else
+          _message 'brak zainstalowanych wersji'
+        fi
+        return
+      fi
+
+      if (( CURRENT == 3 )); then
+        local -a version_matches opt_names opt_descs
+        version_matches=()
+        for i in "${installed_versions[@]}"; do
+          if [[ -z "$PREFIX" || "$i" == ${PREFIX}* ]]; then
+            version_matches+=("$i")
+          fi
+        done
+
+        _yubico_auth_add_matches "$PREFIX" switch_names switch_descs
+        opt_names=("${show_names[@]}")
+        opt_descs=("${show_descs[@]}")
+
+        compstate[list]='list force'
+
+        if (( ${#version_matches[@]} )); then
+          compadd -Q -S '' -X 'zainstalowane wersje' -- $version_matches
+        fi
+
+        if (( ${#opt_names[@]} )); then
+          show_descs=("${opt_descs[@]}")
+          _yubico_auth_compadd_described "${opt_names[@]}"
+        fi
+      fi
+      return
+      ;;
+
+    signers)
+      if (( CURRENT == 3 )); then
+        _yubico_auth_add_matches "$PREFIX" signers_names signers_descs
+        if (( ${#show_names[@]} )); then
+          _yubico_auth_compadd_described "${show_names[@]}"
+        fi
+      fi
+      return
+      ;;
+
+    help)
+      if (( CURRENT == 3 )); then
+        _yubico_auth_add_matches "$PREFIX" help_names help_descs
+        if (( ${#show_names[@]} )); then
+          _yubico_auth_compadd_described "${show_names[@]}"
+        fi
+      fi
+      return
+      ;;
+  esac
+}
+
+_yubico_auth "$@"

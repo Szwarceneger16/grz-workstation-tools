@@ -1,0 +1,5 @@
+# systemd --user units to activate (one unit name per line).
+# yubico-auth-check.timer manages yubico-auth-check.service (Unit=), so only the
+# timer is enabled; the service is not started directly.
+yubico-auth-check.service
+yubico-auth-check.timer

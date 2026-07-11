@@ -1,0 +1,11 @@
+#!/usr/bin/env xdg-open
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Yubico Authenticator
+Comment=Manage Yubico Authenticator accounts
+Exec=/bin/sh -c "exec $HOME/.local/bin/yubico-auth run"
+Icon=com.yubico.yubioath
+Terminal=false
+Categories=Utility;Security;
+StartupNotify=true
