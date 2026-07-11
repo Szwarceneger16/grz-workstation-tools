@@ -1,13 +1,13 @@
-# jlog
+# jlog-user
 
 Podgląd logów **user service** z `systemd` w trybie śledzenia na żywo.
 
 ## Użycie
 
 ```bash
-jlog <nazwa_usługi>
-jlog <nazwa_usługi>.service
-jlog [-h|--help]
+jlog-user <nazwa_usługi>
+jlog-user <nazwa_usługi>.service
+jlog-user [-h|--help]
 ```
 
 ## Co robi
@@ -33,12 +33,12 @@ Jeśli podasz nazwę bez końcówki `.service`, zostanie ona dopisana automatycz
 ## Przykłady
 
 ```bash
-jlog nextcloud
-jlog syncthing.service
-jlog my-worker
+jlog-user nextcloud
+jlog-user syncthing.service
+jlog-user my-worker
 ```
 
 ## Uwagi
 
-- Działa dla **usług użytkownika** (`systemctl --user`), a nie dla usług systemowych.
+- Działa dla **usług użytkownika** (`systemctl --user`), a nie dla usług systemowych — do tych służy `jlog-system`.
 - Jeśli usługa nie istnieje, `journalctl` zwróci błąd lub pusty wynik.

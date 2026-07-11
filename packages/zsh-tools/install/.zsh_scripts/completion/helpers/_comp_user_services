@@ -1,35 +1,6 @@
 _comp_user_services() {
-  local curcontext="$curcontext" state line expl
-  local -a bare_units full_units all_units
-
-  bare_units=(${${(f)"$(
-    {
-      systemctl --user list-unit-files --type=service --no-legend --no-pager 2>/dev/null \
-        | awk '{print $1}'
-      systemctl --user list-units --type=service --all --no-legend --no-pager 2>/dev/null \
-        | awk '{print $1}'
-    } | sed '/^[[:space:]]*$/d' | sed 's/\.service$//' | sort -u
-  )"}:#})
-
-  full_units=(${${(f)"$(
-    {
-      systemctl --user list-unit-files --type=service --no-legend --no-pager 2>/dev/null \
-        | awk '{print $1}'
-      systemctl --user list-units --type=service --all --no-legend --no-pager 2>/dev/null \
-        | awk '{print $1}'
-    } | sed '/^[[:space:]]*$/d' | awk '!/\.service$/ { print $0 ".service"; next } { print }' | sort -u
-  )"}:#})
-
-  if [[ "$PREFIX" == *.* || "$IPREFIX" == *.* ]]; then
-    all_units=("${full_units[@]}")
-  else
-    all_units=("${bare_units[@]}")
-  fi
-
-  if (( ${#all_units[@]} == 0 )); then
-    _message 'brak wykrytych user services'
-    return 0
-  fi
-
-  _wanted services expl 'user service' compadd -a all_units
+  autoload -Uz _comp_services
+  _comp_services "--user" user
 }
+
+_comp_user_services "$@"

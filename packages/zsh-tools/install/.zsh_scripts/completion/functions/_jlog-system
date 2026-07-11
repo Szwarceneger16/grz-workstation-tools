@@ -1,0 +1,21 @@
+#compdef jlog-system
+
+_jlog-system() {
+  autoload -Uz _comp_system_services
+
+  if (( CURRENT == 2 )); then
+    _arguments -S \
+      '(-h --help)'{-h,--help}'[pokaż help]' \
+      '1:system service:_comp_system_services'
+    return
+  fi
+
+  _arguments -S \
+    '(-h --help)'{-h,--help}'[pokaż help]'
+
+  if (( CURRENT > 2 )); then
+    _message 'jlog-system przyjmuje tylko jeden argument: nazwę system service'
+  fi
+}
+
+_jlog-system "$@"

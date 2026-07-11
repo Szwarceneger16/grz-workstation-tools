@@ -7,7 +7,7 @@ jlogpretty() {
   	local svc="$1"
   	if [ -z "$svc" ]
   	then
-  		echo "Użycie: jlog NAZWA_USLUGI (bez .service albo z)"
+		echo "Użycie: jlogpretty NAZWA_USLUGI (bez .service albo z)"
   		return 1
   	fi
   	if [[ "$svc" != *.service ]]

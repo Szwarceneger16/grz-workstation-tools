@@ -1,0 +1,6 @@
+_comp_system_services() {
+  autoload -Uz _comp_services
+  _comp_services "" system
+}
+
+_comp_system_services "$@"

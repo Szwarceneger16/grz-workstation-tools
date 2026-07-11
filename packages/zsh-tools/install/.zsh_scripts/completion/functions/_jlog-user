@@ -1,6 +1,6 @@
-#compdef jlog
+#compdef jlog-user
 
-_jlog() {
+_jlog-user() {
   autoload -Uz _comp_user_services
 
   if (( CURRENT == 2 )); then
@@ -14,8 +14,8 @@ _jlog() {
     '(-h --help)'{-h,--help}'[pokaż help]'
 
   if (( CURRENT > 2 )); then
-    _message 'jlog przyjmuje tylko jeden argument: nazwę user service'
+    _message 'jlog-user przyjmuje tylko jeden argument: nazwę user service'
   fi
 }
 
-_jlog "$@"
+_jlog-user "$@"

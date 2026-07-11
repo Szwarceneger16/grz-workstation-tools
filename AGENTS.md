@@ -56,8 +56,9 @@ packages/<package>/install/             # source of truth for user (stow) files
 packages/<package>/system-install/      # source of truth for system files (sudo)
 packages/<package>/system-install.manifest   # files -> /  (rel_path mode owner group)
 packages/<package>/system-config.manifest    # required secret configs (dest mode owner group)
-packages/<package>/system-units.manifest     # systemd units to activate (one name per line)
-packages/<package>/*.hook.sh            # closed set of user-layer hooks (see rules)
+packages/<package>/system-units.manifest     # systemd system units to activate (one name per line)
+packages/<package>/user-units.manifest       # systemd --user units to activate (one name per line)
+packages/<package>/verify.hook.sh       # optional custom verify logic (user-level, no sudo)
 stow/<package>                          # symlink -> ../packages/<package>/install
 manifests/ignore-all-install.txt        # packages excluded from `all`
 manifests/protected-system-paths.txt    # paths a system manifest may never manage
@@ -111,25 +112,45 @@ package-specific behavior into `scripts/system-copy-select` or `run.sh`.
 - `system-config.manifest` — real root-only secrets. The repo holds only `*.example`; the real
   destination is never committed. At install the engine prompts for a path and copies with
   `install` (it never reads the contents); empty answer = create in place with `sudoedit`.
-- `system-units.manifest` — units to activate. `.timer` → `enable --now`, `.service` → `start`;
-  uninstall reverses it.
+- `system-units.manifest` — system units to activate. Activation runs `scripts/check-repo`
+  before mutation and treats `daemon-reload` failure as fatal. `.timer` → enable if `[Install]`
+  exists, then `restart`; `.path`/`.socket` → enable if `[Install]` exists, then `start`
+  without restart; `.target`/`.mount` → enable only with `[Install]`, otherwise `start`;
+  `.service` → `start` only. Uninstall is best-effort teardown: triggers first, then the
+  remaining units in reverse manifest order.
 - There are **no system hooks**. If something privileged isn't expressible as a manifest, raise it
   with the user rather than adding a sudo hook.
 
+## User unit rules (declarative)
+
+`systemd --user` unit activation is also **data, not code**. Declare units in `user-units.manifest`;
+do not add per-package shell code for activate/deactivate.
+
+- `user-units.manifest` — one unit name per line (e.g. `foo.timer`). Every unit listed must have
+  a file under `install/.config/systemd/user/` (and vice versa). `check-repo` enforces this.
+- Activation runs `scripts/check-repo` before mutation and treats `daemon-reload` failure as
+  fatal. `.timer` → enable if `[Install]` exists, then `restart`; `.path`/`.socket` → enable
+  if `[Install]` exists, then `start` without restart; `.service` → enable only with
+  `[Install]`, then `start`, skipped when managed by a timer/path/socket. Activation runs
+  only when `STOW_TARGET` resolves to `$HOME`.
+- Uninstall deactivates trigger units first, then the remaining units in reverse manifest
+  order before removing stow links. User-unit deactivation failures are fatal to avoid
+  removing files while units remain active.
+- There are **no user activate/deactivate hooks**. If activation logic isn't expressible as a
+  manifest entry, raise it with the user.
+
 ## Package hook rules (user layer only)
 
-Hooks are an escape hatch for **user-session** steps only, recognised by a closed set of filenames
-(no manifest). `check-repo` rejects any other `*.hook.sh`.
+The only remaining hook is `verify.hook.sh` — an escape hatch for custom verification logic
+that can't be expressed as a manifest. `check-repo` rejects any other `*.hook.sh`.
 
 | Hook (in `packages/<pkg>/`) | Trigger |
 |---|---|
-| `user-activate.hook.sh` | `./run.sh activate <pkg>`, after system units, only when `STOW_TARGET=HOME` |
-| `user-deactivate.hook.sh` | `./run.sh uninstall <pkg>`, before files removed, only when `STOW_TARGET=HOME` |
-| `verify.hook.sh` | `./run.sh verify <pkg>`, after stow-link verification |
+| `verify.hook.sh` | `./run.sh verify <pkg>`, after stow-link and user unit verification |
 
 Rules: executable; run as the normal user with **no `sudo`**; idempotent; exit non-zero to abort;
-must live in the package root (never under `install/`). Hooks receive `GRZ_REPO_ROOT`,
-`GRZ_PACKAGE`, `STOW_TARGET`. Do not run hooks to inspect them — read them.
+must live in the package root (never under `install/`). Hook receives `GRZ_REPO_ROOT`,
+`GRZ_PACKAGE`, `STOW_TARGET`. Do not run the hook to inspect it — read it.
 
 ## Shell script rules
 

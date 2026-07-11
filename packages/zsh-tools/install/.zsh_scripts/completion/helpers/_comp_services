@@ -1,0 +1,31 @@
+_comp_services() {
+  local scope="$1" kind="$2"
+  local curcontext="$curcontext" state line expl
+  local -a full_units bare_units all_units
+
+  full_units=(${${(f)"$(
+    {
+      systemctl ${=scope} list-unit-files --type=service --no-legend --no-pager 2>/dev/null \
+        | awk '{print $1}'
+      systemctl ${=scope} list-units --type=service --all --no-legend --no-pager 2>/dev/null \
+        | awk '{print $1}'
+    } | sed '/^[[:space:]]*$/d' | awk '!/\.service$/ { print $0 ".service"; next } { print }' | sort -u
+  )"}:#})
+
+  bare_units=("${full_units[@]%.service}")
+
+  if [[ "$PREFIX" == *.* || "$IPREFIX" == *.* ]]; then
+    all_units=("${full_units[@]}")
+  else
+    all_units=("${bare_units[@]}")
+  fi
+
+  if (( ${#all_units[@]} == 0 )); then
+    _message "brak wykrytych $kind services"
+    return 0
+  fi
+
+  _wanted services expl "$kind service" compadd -a all_units
+}
+
+_comp_services "$@"

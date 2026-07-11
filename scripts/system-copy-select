@@ -493,12 +493,158 @@ load_units_metadata() {
       die "invalid system-units manifest line $manifest:$line_no"
     [[ "$unit" != */* ]] ||
       die "system-units manifest must list unit names, not paths $manifest:$line_no: $unit"
+    [[ "$unit" != -* ]] ||
+      die "system-units manifest unit must not start with '-': $manifest:$line_no: $unit"
     case "$unit" in
       *.service|*.timer|*.path|*.socket|*.mount|*.target) ;;
       *) die "unsupported unit type in system-units manifest $manifest:$line_no: $unit" ;;
     esac
+    if is_template_unit_name "$unit" && [[ "$unit" != *.service ]]; then
+      die "system-units manifest must list concrete template instances, not template units $manifest:$line_no: $unit"
+    fi
     system_units+=("$unit")
   done < "$manifest"
+}
+
+is_template_unit_name() {
+  local unit="$1"
+  [[ "$unit" == *@.* && "${${unit%.*}#*@}" == "" ]]
+}
+
+template_unit_name_for_instance() {
+  local unit="$1"
+  if [[ "$unit" == *@*.* && "$unit" != *.mount ]] && ! is_template_unit_name "$unit"; then
+    print -r -- "${unit%%@*}@.${unit##*.}"
+  fi
+}
+
+systemd_directive_value() {
+  local key="$1" file="$2" value
+  value="$(
+    grep -m1 "^[[:space:]]*${key}[[:space:]]*=" "$file" 2>/dev/null |
+      sed "s/^[[:space:]]*${key}[[:space:]]*=[[:space:]]*//" || :
+  )"
+  value="${value%"${value##*[![:space:]]}"}"
+  print -r -- "$value"
+}
+
+systemd_truthy_directive() {
+  local key="$1" file="$2" value
+  value="$(systemd_directive_value "$key" "$file")"
+  value="${value%%#*}"
+  value="${value%%;*}"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  case "${(L)value}" in
+    yes|true|1|on) return 0 ;;
+  esac
+  return 1
+}
+
+socket_accept_service_base() {
+  local unit="$1" unit_file="$2" socket_base
+  if is_template_unit_name "${unit_file:t}"; then
+    print -r -- "${unit_file:t:r}"
+  else
+    socket_base="${unit%.socket}"
+    print -r -- "${socket_base%%@*}@"
+  fi
+}
+
+unit_has_install_section() {
+  local unit_file="$1"
+  grep -qE '^[[:space:]]*\[Install\]' "$unit_file" 2>/dev/null
+}
+
+resolve_unit_file_path() {
+  local unit_dir="$1" unit="$2" unit_file template_file
+  unit_file="$unit_dir/$unit"
+  template_file="$(template_unit_name_for_instance "$unit")"
+  if [[ ! -f "$unit_file" && -n "$template_file" ]]; then
+    unit_file="$unit_dir/$template_file"
+  fi
+  print -r -- "$unit_file"
+}
+
+# systemd resolves an exact unit name against its whole system unit load path
+# before ever falling back to a template, so a shadow check must be exhaustive
+# across that path. Ask systemd itself rather than hard-coding a list (kept in
+# parity with run.sh's system_unit_search_paths).
+system_unit_search_paths() {
+  command -v systemd-analyze >/dev/null 2>&1 ||
+    die "systemd-analyze is required to determine the system unit search path"
+  systemd-analyze unit-paths ||
+    die "failed to query the system unit search path via systemd-analyze"
+}
+
+find_shadowing_system_unit_path() {
+  local unit="$1" dir path
+  for dir in "${(@f)$(system_unit_search_paths)}"; do
+    path="$dir/$unit"
+    if sudo -n test -e "$path" 2>/dev/null || sudo -n test -L "$path" 2>/dev/null; then
+      print -r -- "$path"
+      return 0
+    fi
+  done
+  return 1
+}
+
+stop_system_template_instances() {
+  local unit="$1"
+  local pattern="${unit/@./@*.}"
+  local line instance
+  for line in "${(@f)$(sudo -n systemctl list-units --all --no-legend --plain -- "$pattern" 2>/dev/null)}"; do
+    instance="${${(z)line}[1]}"
+    [[ -n "$instance" ]] || continue
+    print -- "Stopping $instance (Accept=yes connection instance of $unit)"
+    sudo -n systemctl stop "$instance" || print -u2 -- "warning: failed to stop $instance (ignored)"
+  done
+}
+
+systemd_unescape_instance() {
+  local instance="$1"
+  if [[ -n "$instance" ]] && command -v systemd-escape >/dev/null 2>&1; then
+    systemd-escape --unescape -- "$instance"
+  else
+    print -r -- "$instance"
+  fi
+}
+
+activation_bases_for_unit() {
+  local unit_dir="$1" unit="$2"
+  local unit_file managed_target unit_instance unit_instance_unescaped
+
+  unit_file="$(resolve_unit_file_path "$unit_dir" "$unit")"
+  unit_instance=""
+  [[ "$unit" == *@*.* ]] && unit_instance="${${unit%.*}#*@}"
+  unit_instance_unescaped="$(systemd_unescape_instance "$unit_instance")"
+
+  case "$unit" in
+    *.timer|*.path)
+      managed_target="$(systemd_directive_value Unit "$unit_file")"
+      if [[ -n "$managed_target" ]]; then
+        [[ -n "$unit_instance" ]] && managed_target="${managed_target//\%i/$unit_instance}"
+        [[ -n "$unit_instance" ]] && managed_target="${managed_target//\%I/$unit_instance_unescaped}"
+        print -r -- "${managed_target%.service}"
+      else
+        print -r -- "${unit%.*}"
+      fi
+      ;;
+    *.socket)
+      managed_target="$(systemd_directive_value Service "$unit_file")"
+      if [[ -n "$managed_target" ]]; then
+        [[ -n "$unit_instance" ]] && managed_target="${managed_target//\%i/$unit_instance}"
+        [[ -n "$unit_instance" ]] && managed_target="${managed_target//\%I/$unit_instance_unescaped}"
+        print -r -- "${managed_target%.service}"
+      elif systemd_truthy_directive Accept "$unit_file"; then
+        # Accept=yes sockets instantiate the template service per connection;
+        # they never start the plain, non-template foo.service.
+        print -r -- "$(socket_accept_service_base "$unit" "$unit_file")"
+      else
+        print -r -- "${unit%.socket}"
+      fi
+      ;;
+  esac
 }
 
 batch_has_units() {
@@ -624,63 +770,91 @@ require_configs_present() {
 
 activate_units() {
   local package="$1"
-  local unit unit_file managed_target
+  local unit unit_file unit_dir dest_name base instance_path
+  local verify_failures=0
   local -A activation_bases  # service bases that should not be started directly
 
   load_units_metadata "$package"
   (( ${#system_units[@]} > 0 )) || return 0
   command -v systemctl >/dev/null 2>&1 || die "systemctl is required to activate units for $package"
 
+  unit_dir="$packages_dir/$package/system-install/etc/systemd/system"
   for unit in "${system_units[@]}"; do
-    unit_file="$packages_dir/$package/system-install/etc/systemd/system/$unit"
-    case "$unit" in
-      *.timer)
-        managed_target="$(grep -m1 '^Unit=' "$unit_file" 2>/dev/null | cut -d= -f2- || :)"
-        if [[ -n "$managed_target" ]]; then
-          activation_bases["${managed_target%.service}"]=1
-        else
-          activation_bases["${unit%.timer}"]=1
-        fi
-        ;;
-      *.socket)
-        managed_target="$(grep -m1 '^Service=' "$unit_file" 2>/dev/null | cut -d= -f2- || :)"
-        if [[ -n "$managed_target" ]]; then
-          activation_bases["${managed_target%.service}"]=1
-        else
-          activation_bases["${unit%.socket}"]=1
-        fi
-        ;;
-      *.path)
-        managed_target="$(grep -m1 '^Unit=' "$unit_file" 2>/dev/null | cut -d= -f2- || :)"
-        if [[ -n "$managed_target" ]]; then
-          activation_bases["${managed_target%.service}"]=1
-        else
-          activation_bases["${unit%.path}"]=1
-        fi
-        ;;
-    esac
+    unit_file="$(resolve_unit_file_path "$unit_dir" "$unit")"
+    # System unit files are plain-copied (not stow-symlinked), and content/
+    # mode/owner identity for units this package actually ships is already
+    # guaranteed before this runs. The one case that isn't covered: a
+    # concrete instance (foo@bar.timer) this package does NOT ship, backed
+    # only by a template (foo@.timer). systemd's unit search prefers an
+    # exact instance file over the template across its whole unit load path,
+    # so a stale/foreign file anywhere on that path would silently shadow the
+    # packaged template when we enable/restart "$unit" by name below.
+    dest_name="${unit_file:t}"
+    if [[ "$dest_name" != "$unit" ]]; then
+      if instance_path="$(find_shadowing_system_unit_path "$unit")"; then
+        print -u2 -- "not ok - stale exact-instance unit shadows template: $instance_path"
+        verify_failures=$(( verify_failures + 1 ))
+      fi
+    fi
+    for base in "${(@f)$(activation_bases_for_unit "$unit_dir" "$unit")}"; do
+      [[ -n "$base" ]] && activation_bases[$base]=1
+    done
   done
 
+  (( verify_failures == 0 )) ||
+    die "cannot activate $package: $verify_failures system unit stale-instance shadow failure(s)"
+
   print -- "Reloading systemd manager for $package units"
-  sudo -n systemctl daemon-reload
+  sudo -n systemctl daemon-reload ||
+    die "failed to reload systemd manager for $package"
   for unit in "${system_units[@]}"; do
     case "$unit" in
-      *.timer|*.path|*.socket)
-        print -- "Enabling and starting $unit"
-        sudo -n systemctl enable --now "$unit"
+      *.timer)
+        # Trigger unit: enable only when installable, then restart so a
+        # changed unit file's config is applied with one start transition.
+        unit_file="$(resolve_unit_file_path "$unit_dir" "$unit")"
+        if unit_has_install_section "$unit_file"; then
+          print -- "Enabling $unit"
+          sudo -n systemctl enable "$unit"
+        fi
+        print -- "Restarting $unit"
         sudo -n systemctl restart "$unit"
+        ;;
+      *.path|*.socket)
+        # Trigger units: start, and enable only when installable. Unlike
+        # timers, restarting an already-active socket/path tears down its live
+        # fd/watch, so activation is intentionally start-only.
+        unit_file="$(resolve_unit_file_path "$unit_dir" "$unit")"
+        if unit_has_install_section "$unit_file"; then
+          print -- "Enabling $unit"
+          sudo -n systemctl enable "$unit"
+        fi
+        print -- "Starting $unit"
+        sudo -n systemctl start "$unit"
         ;;
       *.service)
         if [[ -n "${activation_bases[${unit%.service}]+x}" ]]; then
           print -- "Skipping $unit (managed by a socket, path, or timer unit)"
         else
+          # Per system-units.manifest semantics, a standalone system service
+          # is start-only (never enabled), unlike user units.
           print -- "Starting $unit"
           sudo -n systemctl start "$unit"
         fi
         ;;
-      *)
-        print -- "Starting $unit"
-        sudo -n systemctl start "$unit"
+      *.target|*.mount)
+        if [[ -n "${activation_bases[$unit]+x}" ]]; then
+          print -- "Skipping $unit (managed by a timer unit)"
+        else
+          unit_file="$(resolve_unit_file_path "$unit_dir" "$unit")"
+          if unit_has_install_section "$unit_file"; then
+            print -- "Enabling and starting $unit"
+            sudo -n systemctl enable --now "$unit"
+          else
+            print -- "Starting $unit"
+            sudo -n systemctl start "$unit"
+          fi
+        fi
         ;;
     esac
   done
@@ -688,19 +862,83 @@ activate_units() {
 
 deactivate_units() {
   local package="$1"
-  local unit
+  local unit unit_file unit_dir dest_name base instance_path
+  local -A activation_bases
 
   load_units_metadata "$package"
   (( ${#system_units[@]} > 0 )) || return 0
   command -v systemctl >/dev/null 2>&1 || die "systemctl is required to deactivate units for $package"
 
+  unit_dir="$packages_dir/$package/system-install/etc/systemd/system"
+  for unit in "${system_units[@]}"; do
+    for base in "${(@f)$(activation_bases_for_unit "$unit_dir" "$unit")}"; do
+      [[ -n "$base" ]] && activation_bases[$base]=1
+    done
+  done
+
+  # Disable/stop trigger units first so they stop spawning their targets, then
+  # tear down the remaining units in reverse declaration order (${(Oa)...} is
+  # a plain index-order reversal, not an alphabetical sort) to respect
+  # dependencies. Kept in parity with deactivate_user_units in run.sh.
   for unit in "${system_units[@]}"; do
     case "$unit" in
-      *.timer|*.path|*.socket)
-        print -- "Disabling and stopping $unit"
-        sudo -n systemctl disable --now "$unit" || print -u2 -- "warning: failed to disable $unit (ignored)"
+      *.timer|*.path|*.socket) ;;
+      *) continue ;;
+    esac
+    # A package that only ships a unit's template (foo@.timer) doesn't own
+    # the exact instance path; a stale/foreign file living anywhere on the
+    # unit load path must not be disabled/stopped by name, mirroring the
+    # activation-time shadow check.
+    unit_file="$(resolve_unit_file_path "$unit_dir" "$unit")"
+    dest_name="${unit_file:t}"
+    if [[ "$dest_name" != "$unit" ]]; then
+      if instance_path="$(find_shadowing_system_unit_path "$unit")"; then
+        print -u2 -- "warning: skipping deactivation of $unit: stale exact-instance unit shadows template: $instance_path"
+        continue
+      fi
+    fi
+    if unit_has_install_section "$unit_file"; then
+      print -- "Disabling and stopping $unit"
+      sudo -n systemctl disable --now "$unit" || print -u2 -- "warning: failed to disable $unit (ignored)"
+    else
+      print -- "Stopping $unit"
+      sudo -n systemctl stop "$unit" || print -u2 -- "warning: failed to stop $unit (ignored)"
+    fi
+  done
+  for unit in "${(Oa)system_units[@]}"; do
+    case "$unit" in
+      *.timer|*.path|*.socket) continue ;;
+    esac
+    unit_file="$(resolve_unit_file_path "$unit_dir" "$unit")"
+    dest_name="${unit_file:t}"
+    if [[ "$dest_name" != "$unit" ]]; then
+      if instance_path="$(find_shadowing_system_unit_path "$unit")"; then
+        print -u2 -- "warning: skipping deactivation of $unit: stale exact-instance unit shadows template: $instance_path"
+        continue
+      fi
+    fi
+    case "$unit" in
+      *.target|*.mount)
+        if [[ -n "${activation_bases[$unit]+x}" ]]; then
+          print -- "Stopping $unit"
+          sudo -n systemctl stop "$unit" || print -u2 -- "warning: failed to stop $unit (ignored)"
+        elif unit_has_install_section "$unit_file"; then
+          print -- "Disabling and stopping $unit"
+          sudo -n systemctl disable --now "$unit" || print -u2 -- "warning: failed to disable/stop $unit (ignored)"
+        else
+          print -- "Stopping $unit"
+          sudo -n systemctl stop "$unit" || print -u2 -- "warning: failed to stop $unit (ignored)"
+        fi
         ;;
       *)
+        is_template_unit_name "$unit" && {
+          stop_system_template_instances "$unit"
+          print -- "Skipping $unit (template service managed by an Accept=yes socket)"
+          continue
+        }
+        # These units are never enabled by activate_units (system-units.manifest
+        # services are start-only), so only stop them here — disabling could
+        # strip an enablement created outside this tool.
         print -- "Stopping $unit"
         sudo -n systemctl stop "$unit" || print -u2 -- "warning: failed to stop $unit (ignored)"
         ;;

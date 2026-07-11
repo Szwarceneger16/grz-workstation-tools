@@ -49,7 +49,7 @@ entirely by **declarative manifests** (no per-package shell code for the privile
 |---|---|
 | `system-install.manifest` | files to copy to `/` — lines `rel_path mode owner group` |
 | `system-config.manifest` | required root-only secret configs — lines `dest mode owner group` |
-| `system-units.manifest` | systemd units to activate — one unit name per line |
+| `system-units.manifest` | systemd system units to activate — one unit name per line |
 
 The repo only ever contains `*.example` configs and unit files — **never real secrets**.
 
@@ -73,26 +73,49 @@ package's units. If any config was skipped, activation is left for later:
 ./run.sh activate <name>
 ```
 
-Activation reloads systemd and, per `system-units.manifest`: `.timer` → `enable --now`,
-`.service` → `start`. Uninstall reverses this (`disable`/`stop`) before removing files.
-Verify checks installed file modes/contents, that required configs exist and are root-only,
-and runs `systemd-analyze verify` on the installed units.
+Activation first runs `scripts/check-repo`, then reloads systemd; a failed `daemon-reload`
+aborts activation. Per `system-units.manifest`: `.timer` is enabled when it has `[Install]`
+and then restarted; `.path`/`.socket` are enabled when they have `[Install]` and then
+started, but not restarted; `.target`/`.mount` are enabled only when they have `[Install]`
+and otherwise started; `.service` is start-only. Uninstall disables/stops trigger units
+first, then tears down the remaining units in reverse manifest order before removing files.
+Post-uninstall reload is best-effort. Verify checks installed file modes/contents, that
+required configs exist and are root-only, and runs `systemd-analyze verify` on the installed
+units.
+
+## User systemd units
+
+A user-layer package may declare `systemd --user` units via `packages/<name>/user-units.manifest`
+(one unit name per line). The unit files must live under `packages/<name>/install/.config/systemd/user/`
+and are installed by GNU Stow as symlinks in `~/.config/systemd/user/`.
+
+```
+./run.sh activate <name>   # enable/start units
+./run.sh uninstall <name>  # disable/stop units, then remove stow links
+./run.sh verify <name>     # check units exist and pass systemd-analyze --user verify
+```
+
+Activation first runs `scripts/check-repo`, then reloads the user systemd manager; a failed
+`daemon-reload` aborts activation. User timers are enabled when they have `[Install]` and
+then restarted. User paths/sockets are enabled when they have `[Install]` and then started,
+but not restarted. User services are enabled only when they have `[Install]`, then started;
+services managed by a timer, path, or socket are skipped. Deactivation disables/stops
+trigger units first, then the rest in reverse manifest order. Activation and deactivation
+run only when `STOW_TARGET` resolves to `$HOME`.
 
 ## Package hooks (user layer only)
 
-The privileged layer is fully declarative (manifests above) — there are **no system hooks**.
-For user-session steps that can't be expressed as data, a package may ship a small, closed set
-of hooks, recognised **by filename** (no manifest). Each must be executable, run as your normal
-user (**no `sudo`**), be idempotent, and exit non-zero to abort the operation.
+The privileged layer is fully declarative — there are **no system hooks**. For custom
+verification logic that can't be expressed as a manifest, a package may ship a `verify.hook.sh`
+hook, which runs after stow-link verification and user unit verification.
 
 | File in `packages/<name>/` | When it runs |
 |---|---|
-| `user-activate.hook.sh` | `./run.sh activate <name>`, after system units (only when `STOW_TARGET=HOME`) |
-| `user-deactivate.hook.sh` | `./run.sh uninstall <name>`, before files are removed (only when `STOW_TARGET=HOME`) |
-| `verify.hook.sh` | `./run.sh verify <name>`, after stow-link verification |
+| `verify.hook.sh` | `./run.sh verify <name>`, after stow-link and user unit verification |
 
-Hooks receive: `GRZ_REPO_ROOT`, `GRZ_PACKAGE`, `STOW_TARGET`. Any other `*.hook.sh` is rejected
-by `check-repo`.
+The hook must be executable, run as the normal user (**no `sudo`**), be idempotent, and exit
+non-zero to signal failure. It receives: `GRZ_REPO_ROOT`, `GRZ_PACKAGE`, `STOW_TARGET`.
+Any other `*.hook.sh` is rejected by `check-repo`.
 
 ## Consistency check (`check-repo`)
 

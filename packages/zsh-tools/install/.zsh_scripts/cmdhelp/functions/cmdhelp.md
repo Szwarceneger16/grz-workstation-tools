@@ -81,8 +81,8 @@ Pokazuje:
 ## Przykłady
 
 ```bash
-cmdhelp jlog
-cmdhelp --less jlog
+cmdhelp jlog-user
+cmdhelp --less jlog-user
 cmdhelp gfr functions
 cmdhelp --list
 cmdhelp --list functions

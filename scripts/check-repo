@@ -8,6 +8,7 @@ set -euo pipefail
 #   - every installed systemd unit is declared in system-units.manifest,
 #   - every *.example config has its real destination declared in system-config.manifest,
 #   - no real (non-.example) secret config is committed in the repo,
+#   - every user systemd unit is declared in user-units.manifest (and vice versa),
 #   - only the allowed *.hook.sh files exist, are executable, and contain no sudo.
 #
 # Usage: check-repo [--] [<package> ...]   (no package = check all)
@@ -17,7 +18,7 @@ repo_root="${0:A:h:h}"
 packages_dir="$repo_root/packages"
 
 errors=0
-allowed_hooks=(user-activate.hook.sh user-deactivate.hook.sh verify.hook.sh)
+allowed_hooks=(verify.hook.sh)
 protected_paths_file="$repo_root/manifests/protected-system-paths.txt"
 typeset -a protected_paths
 protected_paths=()
@@ -110,10 +111,14 @@ _check_config_manifest_security() {
 }
 
 load_units_manifest() {
-  local manifest="$1" line unit extra
+  local manifest="$1" kind="$2" line unit extra
   local line_no=0
   typeset -gA manifest_paths
   manifest_paths=()
+  case "$kind" in
+    system|user) ;;
+    *) die "internal: load_units_manifest called with invalid kind: $kind" ;;
+  esac
   [[ -f "$manifest" ]] || return 0
   while IFS= read -r line || [[ -n "$line" ]]; do
     line_no=$(( line_no + 1 ))
@@ -128,19 +133,201 @@ load_units_manifest() {
       err "unit name must not contain a slash at $manifest:$line_no: $unit"
       continue
     fi
+    if [[ "$unit" == -* ]]; then
+      err "unit name must not start with '-' at $manifest:$line_no: $unit"
+      continue
+    fi
     case "$unit" in
-      *.service|*.timer|*.path|*.socket|*.mount|*.target) ;;
+      *.mount)
+        if [[ "$kind" == user ]]; then
+          err "user unit manifest must not declare a mount unit (systemd.mount(5) requires UID 0): $manifest:$line_no: $unit"
+          continue
+        fi
+        ;;
+      *.service|*.timer|*.path|*.socket|*.target) ;;
       *)
         err "unsupported unit suffix at $manifest:$line_no: $unit"
         continue
         ;;
     esac
+    if is_template_unit_name "$unit" && [[ "$unit" != *.service ]]; then
+      err "manifest must list concrete template instances, not template units at $manifest:$line_no: $unit"
+      continue
+    fi
     if [[ -n "${manifest_paths[$unit]-}" ]]; then
       err "duplicate unit '$unit' at $manifest:$line_no"
       continue
     fi
     manifest_paths[$unit]=1
   done < "$manifest"
+}
+
+is_template_unit_name() {
+  local unit="$1"
+  [[ "$unit" == *@.* && "${${unit%.*}#*@}" == "" ]]
+}
+
+template_unit_name_for_instance() {
+  local unit="$1"
+  if [[ "$unit" == *@*.* && "$unit" != *.mount ]] && ! is_template_unit_name "$unit"; then
+    print -r -- "${unit%%@*}@.${unit##*.}"
+  fi
+}
+
+unit_name_matches_template() {
+  local unit="$1" template="$2"
+  [[ "$unit" == "${template%%@.*}@"*".${template##*.}" ]]
+}
+
+systemd_directive_value() {
+  local key="$1" file="$2" value
+  value="$(
+    grep -m1 "^[[:space:]]*${key}[[:space:]]*=" "$file" 2>/dev/null |
+      sed "s/^[[:space:]]*${key}[[:space:]]*=[[:space:]]*//" || :
+  )"
+  value="${value%"${value##*[![:space:]]}"}"
+  print -r -- "$value"
+}
+
+systemd_truthy_directive() {
+  local key="$1" file="$2" value
+  value="$(systemd_directive_value "$key" "$file")"
+  value="${value%%#*}"
+  value="${value%%;*}"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  case "${(L)value}" in
+    yes|true|1|on) return 0 ;;
+  esac
+  return 1
+}
+
+systemd_unescape_instance() {
+  local instance="$1"
+  if [[ -n "$instance" ]] && command -v systemd-escape >/dev/null 2>&1; then
+    systemd-escape --unescape -- "$instance"
+  else
+    print -r -- "$instance"
+  fi
+}
+
+repo_unit_file_exists() {
+  local unit_dir="$1" unit="$2" template_file
+  [[ -f "$unit_dir/$unit" ]] && return 0
+  template_file="$(template_unit_name_for_instance "$unit")"
+  if [[ -n "$template_file" ]]; then
+    [[ -f "$unit_dir/$template_file" ]] && return 0
+  fi
+  return 1
+}
+
+socket_accept_service_unit() {
+  local socket_base="$1"
+  socket_base="${socket_base%.socket}"
+  print -r -- "${socket_base%%@*}@.service"
+}
+
+# True when the manifest declares $1 exactly, or (when $1 is a real template
+# name such as foo@.service) declares at least one instance foo@<inst>.service.
+# Reads the caller's `unit_names` associative array (zsh dynamic scope).
+manifest_declares_unit() {
+  local want="$1" name
+  [[ -n "${unit_names[$want]-}" ]] && return 0
+  if is_template_unit_name "$want"; then
+    for name in "${(@k)unit_names}"; do
+      unit_name_matches_template "$name" "$want" && return 0
+    done
+  fi
+  return 1
+}
+
+# When $1 is a template unit file base (e.g. foo@.timer) and $2 is its
+# Unit=/Service= directive value (which may contain the %i/%I specifier),
+# verify the directive resolves to a manifest-declared unit for every
+# manifest instance backed by this template, mirroring the %i/%I
+# substitution activate_units/activate_user_units already do at install time.
+# Reads the caller's `unit_names` and `package` (zsh dynamic scope).
+check_template_directive_instances() {
+  local file_base="$1" directive="$2" directive_name="$3" manifest_name="$4"
+  local instance inst_suffix inst_suffix_unescaped resolved
+  for instance in "${(@k)unit_names}"; do
+    unit_name_matches_template "$instance" "$file_base" || continue
+    inst_suffix="${${instance%.*}#*@}"
+    inst_suffix_unescaped="$(systemd_unescape_instance "$inst_suffix")"
+    resolved="${directive//\%i/$inst_suffix}"
+    resolved="${resolved//\%I/$inst_suffix_unescaped}"
+    manifest_declares_unit "$resolved" ||
+      err "$package: $file_base references $directive_name=$directive which resolves to $resolved for instance $instance, not in $manifest_name"
+  done
+}
+
+check_directive_target() {
+  local file_base="$1" directive="$2" directive_name="$3" manifest_name="$4"
+  local inst_suffix inst_suffix_unescaped resolved
+  if [[ "$directive" == *%[iI]* && "$file_base" == *@*.* ]]; then
+    if is_template_unit_name "$file_base"; then
+      check_template_directive_instances "$file_base" "$directive" "$directive_name" "$manifest_name"
+    else
+      inst_suffix="${${file_base%.*}#*@}"
+      inst_suffix_unescaped="$(systemd_unescape_instance "$inst_suffix")"
+      resolved="${directive//\%i/$inst_suffix}"
+      resolved="${resolved//\%I/$inst_suffix_unescaped}"
+      manifest_declares_unit "$resolved" ||
+        err "$package: $file_base references $directive_name=$directive which resolves to $resolved, not in $manifest_name"
+    fi
+  else
+    manifest_declares_unit "$directive" ||
+      err "$package: $file_base references $directive_name=$directive which is not in $manifest_name"
+  fi
+}
+
+check_implicit_service_target() {
+  local unit_dir="$1" base="$2" implicit_svc="$3" manifest_name="$4"
+  if repo_unit_file_exists "$unit_dir" "$implicit_svc"; then
+    manifest_declares_unit "$implicit_svc" ||
+      err "$package: $base implicitly requires $implicit_svc which is not in $manifest_name"
+  else
+    err "$package: $base implicitly requires $implicit_svc which has no repo unit file"
+  fi
+}
+
+check_trigger_directives() {
+  local unit_dir="$1" manifest_name="$2"
+  local unit_type directive f base custom_target implicit_svc
+  typeset -A directive_by_type
+  directive_by_type=(timer Unit path Unit socket Service)
+
+  for unit_type in timer path socket; do
+    directive="${directive_by_type[$unit_type]}"
+    for f in "$unit_dir"/*.$unit_type(N.); do
+      base="${f:t}"
+      custom_target="$(systemd_directive_value "$directive" "$f")"
+      if [[ -n "$custom_target" ]]; then
+        if [[ "$unit_type" == "socket" ]]; then
+          [[ "$custom_target" == *.service ]] ||
+            err "$package: $base sets $directive=$custom_target which must reference a .service unit"
+          systemd_truthy_directive Accept "$f" &&
+            err "$package: $base sets Accept=yes together with $directive=$custom_target, which systemd does not support (Service= requires Accept=no)"
+        fi
+        check_directive_target "$base" "$custom_target" "$directive" "$manifest_name"
+        continue
+      fi
+
+      if [[ "$unit_type" == "socket" ]] && systemd_truthy_directive Accept "$f"; then
+        implicit_svc="$(socket_accept_service_unit "$base")"
+        accept_service_templates[$implicit_svc]=1
+        repo_unit_file_exists "$unit_dir" "$implicit_svc" ||
+          err "$package: $base implicitly requires $implicit_svc which has no repo unit file"
+        [[ -n "${unit_names[$implicit_svc]-}" ]] ||
+          err "$package: $base implicitly requires $implicit_svc which is not in $manifest_name"
+      elif is_template_unit_name "$base"; then
+        check_template_directive_instances "$base" "${base%%@.*}@%i.service" "implicit $directive" "$manifest_name"
+      else
+        implicit_svc="${base%.*}.service"
+        check_implicit_service_target "$unit_dir" "$base" "$implicit_svc" "$manifest_name"
+      fi
+    done
+  done
 }
 
 check_hooks() {
@@ -170,6 +357,83 @@ check_hooks() {
   done
 }
 
+extract_function_block() {
+  local file="$1" fn="$2"
+  awk -v fn="$fn" '
+    $0 == fn "() {" && !in_fn {
+      in_fn = 1
+      depth = 1
+      print
+      next
+    }
+    in_fn {
+      print
+      line = $0
+      depth += gsub(/\{/, "{", line) - gsub(/\}/, "}", line)
+      if (depth == 0) exit
+    }
+  ' "$file"
+}
+
+check_function_parity() {
+  local left_file="$1" right_file="$2" fn="$3"
+  local left_body right_body
+  left_body="$(extract_function_block "$left_file" "$fn")"
+  right_body="$(extract_function_block "$right_file" "$fn")"
+
+  [[ -n "$left_body" ]] || { err "helper parity: missing $fn in ${left_file#$repo_root/}"; return 0; }
+  [[ -n "$right_body" ]] || { err "helper parity: missing $fn in ${right_file#$repo_root/}"; return 0; }
+  [[ "$left_body" == "$right_body" ]] ||
+    err "helper parity: $fn differs between ${left_file#$repo_root/} and ${right_file#$repo_root/}"
+}
+
+# Like check_function_parity, but allows the two functions being compared to
+# have different names and reference different variables, by applying a
+# sed(1) normalization to each side before comparing.
+check_function_parity_normalized() {
+  local left_file="$1" right_file="$2" left_fn="$3" right_fn="$4"
+  local left_sed="$5" right_sed="$6"
+  local left_body right_body
+
+  left_body="$(extract_function_block "$left_file" "$left_fn" | sed -e "$left_sed")"
+  right_body="$(extract_function_block "$right_file" "$right_fn" | sed -e "$right_sed")"
+
+  [[ -n "$left_body" ]] || { err "helper parity: missing $left_fn in ${left_file#$repo_root/}"; return 0; }
+  [[ -n "$right_body" ]] || { err "helper parity: missing $right_fn in ${right_file#$repo_root/}"; return 0; }
+  [[ "$left_body" == "$right_body" ]] ||
+    err "helper parity: $left_fn (${left_file#$repo_root/}) differs from $right_fn (${right_file#$repo_root/}) modulo normalization"
+}
+
+check_helper_parity() {
+  local run_script="$repo_root/run.sh"
+  local system_script="$repo_root/scripts/system-copy-select"
+  local check_script="$repo_root/scripts/check-repo"
+  local fn
+
+  for fn in \
+    is_template_unit_name \
+    template_unit_name_for_instance \
+    systemd_directive_value \
+    systemd_truthy_directive \
+    systemd_unescape_instance; do
+    check_function_parity "$run_script" "$system_script" "$fn"
+    check_function_parity "$run_script" "$check_script" "$fn"
+  done
+
+  for fn in \
+    socket_accept_service_base \
+    unit_has_install_section \
+    resolve_unit_file_path \
+    activation_bases_for_unit; do
+    check_function_parity "$run_script" "$system_script" "$fn"
+  done
+
+  check_function_parity_normalized "$run_script" "$check_script" \
+    unit_set_declares_unit manifest_declares_unit \
+    "s/unit_set_declares_unit/UNIT_DECLARES_UNIT/; s/unit_set/UNIT_MAP/g" \
+    "s/manifest_declares_unit/UNIT_DECLARES_UNIT/; s/unit_names/UNIT_MAP/g"
+}
+
 check_system_layer() {
   local package="$1"
   local sys_dir="$packages_dir/$package/system-install"
@@ -177,7 +441,7 @@ check_system_layer() {
   local units_manifest="$packages_dir/$package/system-units.manifest"
   local config_manifest="$packages_dir/$package/system-config.manifest"
   local f rel base real_rel
-  typeset -A install_paths config_paths unit_names
+  typeset -A install_paths config_paths unit_names accept_service_templates
 
   [[ ! -L "$sys_dir" ]] || { err "$package: system-install must not be a symlink"; return 0; }
   [[ -d "$sys_dir" ]] || return 0
@@ -211,30 +475,31 @@ check_system_layer() {
     [[ ! -L "$sys_dir/$rel" ]] || err "$package: system-install.manifest entry must not be a symlink: $rel"
   done
 
-  # Check 2: every installed systemd unit is declared in system-units.manifest.
-  load_units_manifest "$units_manifest"
+  # Check 2: every installed systemd unit is declared in system-units.manifest
+  # (a template file satisfies any manifest entry that is an instance of it).
+  load_units_manifest "$units_manifest" system
   unit_names=("${(@kv)manifest_paths}")
+  accept_service_templates=()
   for f in "$sys_dir"/etc/systemd/system/*(N.); do
     base="${f:t}"
     case "$base" in
       *.service|*.timer|*.path|*.socket|*.mount|*.target)
-        [[ -n "${unit_names[$base]-}" ]] || err "$package: systemd unit not in system-units.manifest: $base"
+        manifest_declares_unit "$base" ||
+          err "$package: systemd unit not in system-units.manifest: $base"
         ;;
     esac
   done
-  # Reverse: every manifest unit has a repo unit file.
+  # Reverse: every manifest unit has a repo unit file (template instances resolve to their template file).
   for base in "${(@k)unit_names}"; do
-    [[ -f "$sys_dir/etc/systemd/system/$base" ]] ||
+    repo_unit_file_exists "$sys_dir/etc/systemd/system" "$base" ||
       err "$package: system-units.manifest entry has no repo unit file: $base"
   done
 
-  # Validate that custom timer Unit= targets are declared in the manifest.
-  local timer_custom_svc
-  for f in "$sys_dir"/etc/systemd/system/*.timer(N.); do
-    timer_custom_svc="$(grep -m1 '^Unit=' "$f" 2>/dev/null | cut -d= -f2- || :)"
-    [[ -n "$timer_custom_svc" ]] || continue
-    [[ -n "${unit_names[$timer_custom_svc]-}" ]] ||
-      err "$package: ${f:t} references Unit=$timer_custom_svc which is not in system-units.manifest"
+  check_trigger_directives "$sys_dir/etc/systemd/system" "system-units.manifest"
+  for base in "${(@k)unit_names}"; do
+    if is_template_unit_name "$base" && [[ "$base" == *.service && -z "${accept_service_templates[$base]-}" ]]; then
+      err "$package: template service in system-units.manifest must be required by an Accept=yes socket: $base"
+    fi
   done
 
   load_4col_manifest "$config_manifest"
@@ -260,6 +525,49 @@ check_system_layer() {
   done
 }
 
+check_user_layer() {
+  local package="$1"
+  local install_dir="$packages_dir/$package/install"
+  local units_manifest="$packages_dir/$package/user-units.manifest"
+  local f base
+  typeset -A unit_names accept_service_templates
+
+  if [[ ! -d "$install_dir" ]]; then
+    [[ -f "$units_manifest" ]] &&
+      err "$package: has user-units.manifest but no install/ tree"
+    return 0
+  fi
+
+  load_units_manifest "$units_manifest" user
+  unit_names=("${(@kv)manifest_paths}")
+  accept_service_templates=()
+
+  # Every user systemd unit file must be declared in user-units.manifest
+  # (a template file satisfies any manifest entry that is an instance of it).
+  for f in "$install_dir"/.config/systemd/user/*(N.); do
+    base="${f:t}"
+    case "$base" in
+      *.service|*.timer|*.path|*.socket|*.mount|*.target)
+        manifest_declares_unit "$base" ||
+          err "$package: user systemd unit not in user-units.manifest: $base"
+        ;;
+    esac
+  done
+
+  # Reverse: every manifest entry must have a repo unit file (template instances resolve to their template file).
+  for base in "${(@k)unit_names}"; do
+    repo_unit_file_exists "$install_dir/.config/systemd/user" "$base" ||
+      err "$package: user-units.manifest entry has no repo unit file: $base"
+  done
+
+  check_trigger_directives "$install_dir/.config/systemd/user" "user-units.manifest"
+  for base in "${(@k)unit_names}"; do
+    if is_template_unit_name "$base" && [[ "$base" == *.service && -z "${accept_service_templates[$base]-}" ]]; then
+      err "$package: template service in user-units.manifest must be required by an Accept=yes socket: $base"
+    fi
+  done
+}
+
 typeset -a packages_to_check
 packages_to_check=()
 (( $# > 0 )) && [[ "$1" == "--" ]] && shift
@@ -274,11 +582,13 @@ else
 fi
 
 _load_protected_paths
+check_helper_parity
 
 for package in "${packages_to_check[@]}"; do
   [[ -d "$packages_dir/$package" ]] || { err "unknown package: $package"; continue; }
   check_hooks "$package"
   check_system_layer "$package"
+  check_user_layer "$package"
 done
 
 if (( errors > 0 )); then

@@ -46,4 +46,4 @@ jlogpretty my-worker
 ## Uwagi
 
 - Działa dla **usług użytkownika** (`systemctl --user`).
-- Jeśli potrzebujesz pełniejszego kontekstu logu, użyj `jlog`.
+- Jeśli potrzebujesz pełniejszego kontekstu logu, użyj `jlog-user`.
