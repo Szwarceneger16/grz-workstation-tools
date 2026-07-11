@@ -1,0 +1,43 @@
+#compdef kswapd-vmstat-summary.sh
+
+_kswapd_vmstat_summary_sh() {
+  emulate -L zsh
+  setopt noshwordsplit
+
+  local cur=${words[CURRENT]:-}
+
+  if (( CURRENT == 2 )); then
+    case $cur in
+      -*)
+        compadd -Q -S '' -- -h --help
+        ;;
+      *)
+        compadd -Q -S '' -- 0.25 0.5 1 2 5
+        _message 'interval_s (sekundy; może być ułamek)'
+        ;;
+    esac
+    return
+  fi
+
+  if (( CURRENT == 3 )); then
+    compadd -Q -S '' -- 30 60 120 300 600 900 1800
+    _message 'duration_s (sekundy)'
+    return
+  fi
+
+  if (( CURRENT == 4 )); then
+    compadd -Q -S '' -- 64 128 256 512 1024
+    _message 'scan_thr_pages_s (pages/s)'
+    return
+  fi
+
+  if (( CURRENT == 5 )); then
+    compadd -Q -S '' -- 10 25 50 100 256
+    _message 'steal_thr_pages_s (pages/s)'
+    return
+  fi
+
+  case $cur in
+    -*) compadd -Q -S '' -- -h --help ;;
+  esac
+}

@@ -1,0 +1,374 @@
+#!/usr/bin/env zsh
+
+emulate -L zsh
+setopt pipefail
+
+script_name=${0:t}
+original_args=("$@")
+
+print_help() {
+  cat <<'HELP'
+zswap-log - logowanie statystyk zswap z debugfs do pliku i opcjonalnego widoku TTY
+
+Użycie:
+  zswap-log [INTERWAŁ]
+  zswap-log [opcje]
+
+Opcje:
+  -h, --help             Pokaż ten help i zakończ.
+  -i, --interval SEC     Interwał próbkowania w sekundach (domyślnie: 5).
+  -d, --log-dir DIR      Jawnie ustaw katalog logów.
+      --no-auto-sudo     Nie próbuj automatycznie przejść przez sudo.
+
+Kompatybilność wsteczna:
+  - pojedynczy argument pozycyjny nadal oznacza interwał, np.:
+      zswap-log 2
+
+Zmienne środowiskowe:
+  ZSWAP_LOG_DIR          Katalog logów, walidowany tak samo jak jawny --log-dir.
+
+Zachowanie:
+  - jeśli nie jesteś rootem, skrypt domyślnie przechodzi przez sudo,
+  - jeśli debugfs nie jest zamontowane, skrypt próbuje je zamontować,
+  - w TTY pokazuje bieżące / min / max,
+  - zawsze dopisuje pełny log i summary do pliku.
+HELP
+}
+
+fail() {
+  print -u2 -- "ERROR: $*"
+  exit 1
+}
+
+interval=5
+log_dir_opt=""
+auto_sudo=1
+positional_interval_seen=0
+
+while (( $# > 0 )); do
+  case "$1" in
+    -h|--help)
+      print_help
+      exit 0
+      ;;
+    -i|--interval)
+      shift || fail "Brak wartości dla --interval"
+      interval=$1
+      ;;
+    --interval=*)
+      interval=${1#*=}
+      ;;
+    -d|--log-dir)
+      shift || fail "Brak wartości dla --log-dir"
+      log_dir_opt=$1
+      ;;
+    --log-dir=*)
+      log_dir_opt=${1#*=}
+      ;;
+    --no-auto-sudo)
+      auto_sudo=0
+      ;;
+    --)
+      shift
+      break
+      ;;
+    *)
+      if [[ "$1" == <-> ]] && (( positional_interval_seen == 0 )); then
+        interval=$1
+        positional_interval_seen=1
+      else
+        fail "Nieznana opcja lub nadmiarowy argument: $1"
+      fi
+      ;;
+  esac
+  shift
+done
+
+[[ "$interval" == <-> ]] || fail "Interwał musi być dodatnią liczbą całkowitą."
+(( interval > 0 )) || fail "Interwał musi być większy od zera."
+
+if (( EUID != 0 )); then
+  if (( auto_sudo )); then
+    print -- "[INFO] Potrzebne uprawnienia roota, przełączam na sudo..."
+    exec sudo -p "Hasło dla %u (zswap-log): " "$0" "${original_args[@]}"
+  else
+    fail "Ten skrypt wymaga roota. Uruchom przez sudo albo usuń --no-auto-sudo."
+  fi
+fi
+
+if ! mount | grep -q ' /sys/kernel/debug '; then
+  print -u2 -- "[INFO] Mountuję debugfs na /sys/kernel/debug..."
+  mount -t debugfs debugfs /sys/kernel/debug || fail "Nie udało się zamontować debugfs."
+fi
+
+zswap_dir="/sys/kernel/debug/zswap"
+[[ -d "$zswap_dir" ]] || {
+  print -u2 -- "[ERROR] Katalog $zswap_dir nie istnieje."
+  print -u2 -- "Sprawdź, czy zswap jest włączony w jądrze i parametrach startowych."
+  exit 1
+}
+
+target_user="root"
+target_group="root"
+target_uid=0
+target_home=""
+if [[ -n "$SUDO_USER" && "$SUDO_USER" != root ]]; then
+  passwd_entry=$(getent passwd "$SUDO_USER") || fail "Nie można ustalić użytkownika SUDO_USER: $SUDO_USER"
+  target_user=${passwd_entry%%:*}
+  target_uid=$(print -- "$passwd_entry" | cut -d: -f3)
+  target_home=$(print -- "$passwd_entry" | cut -d: -f6)
+  [[ -z "$target_home" ]] && target_home="/home/$target_user"
+  target_group=$(id -gn "$target_user" 2>/dev/null || print -- "$target_user")
+fi
+
+allowed_system_log_dir="/var/log/zswap-logger"
+allowed_user_log_dir=""
+if [[ -n "$target_home" ]]; then
+  allowed_user_log_dir="$target_home/.local/state/zswap-logger"
+fi
+
+reject_symlink_components() {
+  local log_path=$1
+  local current component
+  local -a parts
+
+  [[ "$log_path" == /* ]] || fail "Katalog logów musi być ścieżką bezwzględną: $log_path"
+
+  parts=(${(s:/:)log_path})
+  current=""
+  for component in "${parts[@]}"; do
+    [[ -z "$component" ]] && continue
+    current="$current/$component"
+    if [[ -L "$current" ]]; then
+      fail "Katalog logów nie może być symlinkiem ani zawierać symlinków: $current"
+    fi
+  done
+}
+
+secure_mkdir_p() {
+  local log_path=$1
+  local current component
+  local -a parts
+
+  [[ "$log_path" == /* ]] || fail "Katalog logów musi być ścieżką bezwzględną: $log_path"
+
+  parts=(${(s:/:)log_path})
+  current=""
+  for component in "${parts[@]}"; do
+    [[ -z "$component" ]] && continue
+    current="$current/$component"
+    [[ -L "$current" ]] && fail "Katalog logów nie może zawierać symlinków: $current"
+    if [[ -e "$current" && ! -d "$current" ]]; then
+      fail "Komponent ścieżki katalogu logów nie jest katalogiem: $current"
+    fi
+    if [[ ! -e "$current" ]]; then
+      mkdir "$current" || fail "Nie udało się utworzyć katalogu: $current"
+    fi
+    [[ -d "$current" && ! -L "$current" ]] || fail "Niebezpieczny komponent ścieżki katalogu logów: $current"
+  done
+}
+
+prepare_default_log_dir() {
+  local dir=$1 owner=$2 group=$3
+  local canonical_dir allowed_canonical
+
+  secure_mkdir_p "$dir"
+  reject_symlink_components "$dir"
+
+  canonical_dir=$(realpath -m -- "$dir") || fail "Nie udało się rozwiązać ścieżki katalogu logów: $dir"
+  allowed_canonical=$(realpath -m -- "$dir") || fail "Nie udało się rozwiązać dozwolonej lokalizacji logów: $dir"
+  [[ "$canonical_dir" == "$allowed_canonical" ]] || \
+    fail "Katalog logów musi pozostać w zatwierdzonej lokalizacji: $dir"
+
+  chmod 700 "$canonical_dir" || fail "Nie udało się ustawić bezpiecznych uprawnień katalogu logów: $canonical_dir"
+  chown "$owner:$group" "$canonical_dir" 2>/dev/null || true
+  print -- "$canonical_dir"
+}
+
+prepare_explicit_log_dir() {
+  local dir=$1
+
+  reject_symlink_components "$dir"
+  if [[ ! -e "$dir" ]]; then
+    secure_mkdir_p "$dir"
+  fi
+}
+
+validate_explicit_log_dir() {
+  local dir=$1
+  local canonical_dir owner mode writable_bits
+
+  prepare_explicit_log_dir "$dir"
+  [[ -d "$dir" ]] || fail "Jawny --log-dir musi wskazywać katalog: $dir"
+  canonical_dir=$(realpath -m -- "$dir") || fail "Nie udało się rozwiązać ścieżki katalogu logów: $dir"
+  reject_symlink_components "$canonical_dir"
+
+  owner=$(stat -c %u -- "$canonical_dir") || fail "Nie udało się odczytać właściciela katalogu logów: $canonical_dir"
+  if [[ "$owner" != 0 && "$owner" != "$target_uid" ]]; then
+    fail "Jawny --log-dir musi należeć do root albo $target_user (uid: $target_uid, aktualnie: $owner)."
+  fi
+
+  mode=$(stat -c %a -- "$canonical_dir") || fail "Nie udało się odczytać uprawnień katalogu logów: $canonical_dir"
+  writable_bits=$(( 8#$mode & 0022 ))
+  (( writable_bits == 0 )) || fail "Jawny --log-dir nie może być zapisywalny dla group/other: $canonical_dir (tryb: $mode)."
+
+  print -- "$canonical_dir"
+}
+
+create_log_file() {
+  local dir=$1 owner=${2:-root} group=${3:-root}
+  local file
+
+  umask 077
+  file=$(mktemp -p "$dir" "zswap-$(date +%F-%H%M%S)-XXXXXX.log") || \
+    fail "Nie udało się bezpiecznie utworzyć pliku logu w: $dir"
+  [[ -f "$file" && ! -L "$file" ]] || fail "Utworzony plik logu nie jest zwykłym plikiem: $file"
+  chown "$owner:$group" "$file" || fail "Nie udało się ustawić właściciela pliku logu: $file"
+  chmod 600 "$file" || fail "Nie udało się ustawić bezpiecznych uprawnień pliku logu: $file"
+  print -- "$file"
+}
+
+log_line() {
+  print -- "$*"
+  print -- "$*" >> "$log_file"
+}
+
+if [[ -n "$log_dir_opt" ]]; then
+  log_dir=$(validate_explicit_log_dir "$log_dir_opt") || exit 1
+elif [[ -n "$ZSWAP_LOG_DIR" ]]; then
+  log_dir=$(validate_explicit_log_dir "$ZSWAP_LOG_DIR") || exit 1
+elif [[ -n "$target_home" ]]; then
+  log_dir=$(prepare_default_log_dir "$allowed_user_log_dir" "$target_user" "$target_group") || exit 1
+else
+  log_dir=$(prepare_default_log_dir "$allowed_system_log_dir" root root) || exit 1
+fi
+
+log_file_owner="root"
+log_file_group="root"
+if [[ -n "$target_home" ]]; then
+  log_dir_owner=$(stat -c %u -- "$log_dir") || fail "Nie udało się odczytać właściciela katalogu logów: $log_dir"
+  if [[ "$log_dir_owner" == "$target_uid" ]]; then
+    log_file_owner="$target_user"
+    log_file_group="$target_group"
+  fi
+fi
+
+log_file=$(create_log_file "$log_dir" "$log_file_owner" "$log_file_group") || exit 1
+
+log_line "# zswap logger started at $(date)"
+log_line "# interval_seconds: $interval"
+log_line "# log_dir: $log_dir"
+log_line "# columns: timestamp_iso epoch stored_pages pool_bytes pool_MiB written_back_pages"
+print -- "timestamp epoch stored_pages pool_bytes pool_MiB written_back_pages" >> "$log_file"
+
+typeset -i start_epoch samples
+
+typeset -i max_stored min_stored max_pool min_pool
+
+typeset -i first_written last_written
+
+typeset -i running
+
+start_epoch=$(date +%s)
+samples=0
+max_stored=0
+min_stored=0
+max_pool=0
+min_pool=0
+first_written=0
+last_written=0
+running=1
+
+cleanup() {
+  local end_epoch elapsed wb_delta h m s max_pool_mb
+
+  end_epoch=$(date +%s)
+  elapsed=$(( end_epoch - start_epoch ))
+  wb_delta=$(( last_written - first_written ))
+
+  (( samples == 0 )) && wb_delta=0
+
+  h=$(( elapsed / 3600 ))
+  m=$(( (elapsed % 3600) / 60 ))
+  s=$(( elapsed % 60 ))
+  max_pool_mb=$(( max_pool / 1024 / 1024 ))
+
+  print
+  print -- "==== zswap logger summary ===="
+  printf "Runtime: %02d:%02d:%02d (samples: %d, interval: %ss)\n" \
+    "$h" "$m" "$s" "$samples" "$interval"
+  print -- "Max stored_pages      : $max_stored"
+  print -- "Max pool_bytes        : $max_pool (${max_pool_mb} MiB)"
+  print -- "Written_back delta    : $wb_delta pages"
+  print -- "Log file              : $log_file"
+
+  {
+    print -- "# SUMMARY start"
+    print -- "# end_time: $(date)"
+    printf "# runtime_seconds: %d\n" "$elapsed"
+    printf "# samples: %d\n" "$samples"
+    printf "# max_stored_pages: %d\n" "$max_stored"
+    printf "# max_pool_bytes: %d\n" "$max_pool"
+    printf "# max_pool_MiB: %d\n" "$max_pool_mb"
+    printf "# written_back_delta_pages: %d\n" "$wb_delta"
+    print -- "# SUMMARY end"
+  } >> "$log_file"
+}
+
+trap 'running=0' INT TERM
+trap 'cleanup' EXIT
+
+while (( running )); do
+  now_iso=$(date +%F\ %T)
+  now_epoch=$(date +%s)
+
+  stored_pages=$(<"$zswap_dir/stored_pages")
+  pool_bytes=$(<"$zswap_dir/pool_total_size")
+  written_back=$(<"$zswap_dir/written_back_pages")
+
+  (( samples++ ))
+
+  if (( samples == 1 )); then
+    first_written=$written_back
+    max_stored=$stored_pages
+    min_stored=$stored_pages
+    max_pool=$pool_bytes
+    min_pool=$pool_bytes
+  else
+    (( stored_pages > max_stored )) && max_stored=$stored_pages
+    (( stored_pages < min_stored )) && min_stored=$stored_pages
+    (( pool_bytes > max_pool )) && max_pool=$pool_bytes
+    (( pool_bytes < min_pool )) && min_pool=$pool_bytes
+  fi
+
+  last_written=$written_back
+
+  pool_mb=$(( pool_bytes / 1024 / 1024 ))
+  max_pool_mb=$(( max_pool / 1024 / 1024 ))
+  min_pool_mb=$(( min_pool / 1024 / 1024 ))
+
+  printf "%s %s %s %s %s %s\n" \
+    "$now_iso" "$now_epoch" "$stored_pages" "$pool_bytes" "$pool_mb" "$written_back" >> "$log_file"
+
+  elapsed=$(( now_epoch - start_epoch ))
+  h=$(( elapsed / 3600 ))
+  m=$(( (elapsed % 3600) / 60 ))
+  s=$(( elapsed % 60 ))
+  wb_delta=$(( written_back - first_written ))
+
+  if [[ -t 1 ]]; then
+    printf '\033[2J\033[H'
+    print -- "ZSWAP LOGGER  interval=${interval}s  runtime=$(printf '%02d:%02d:%02d' "$h" "$m" "$s")  samples=$samples"
+    print -- "Log file: $log_file"
+    print
+    printf " %-10s | %14s | %10s | %18s\n" "" "stored_pages" "pool_MiB" "written_back_delta"
+    printf "------------+----------------+------------+--------------------\n"
+    printf " %-10s | %14d | %10d | %18d\n" "CURRENT" "$stored_pages" "$pool_mb" "$wb_delta"
+    printf " %-10s | %14d | %10d | %18s\n" "MIN" "$min_stored" "$min_pool_mb" "-"
+    printf " %-10s | %14d | %10d | %18s\n" "MAX" "$max_stored" "$max_pool_mb" "-"
+    print
+    print -- "Ctrl+C aby zakończyć i dopisać podsumowanie do logu."
+  fi
+
+  sleep "$interval"
+done

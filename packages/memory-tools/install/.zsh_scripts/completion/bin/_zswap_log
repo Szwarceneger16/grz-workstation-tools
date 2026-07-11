@@ -1,0 +1,58 @@
+#compdef zswap-log
+
+_zswap_log() {
+  emulate -L zsh
+  setopt noshwordsplit
+
+  local cur prev
+  local -a interval_values option_specs
+
+  cur=${words[CURRENT]:-}
+  prev=${words[CURRENT-1]:-}
+
+  interval_values=(1 2 5 10 30 60)
+
+  option_specs=(
+    '--help:pokaż help'
+    '-h:pokaż help'
+    '--interval:interwał próbkowania w sekundach'
+    '-i:interwał próbkowania w sekundach'
+    '--log-dir:katalog logów'
+    '-d:katalog logów'
+    '--no-auto-sudo:nie przechodź automatycznie przez sudo'
+  )
+
+  case $prev in
+    -i|--interval)
+      compadd -Q -S '' -- $interval_values
+      return
+      ;;
+    -d|--log-dir)
+      _files -/
+      return
+      ;;
+  esac
+
+  if (( CURRENT == 2 )); then
+    case $cur in
+      --*|-*)
+        _describe -t options 'opcje' option_specs
+        return
+        ;;
+      *)
+        _describe -t options 'opcje' option_specs
+        compadd -Q -S '' -X 'typowe interwały (sekundy)' -- $interval_values
+        return
+        ;;
+    esac
+  fi
+
+  _arguments -s -S \
+    '(-h --help)'{-h,--help}'[pokaż help]' \
+    '(-i --interval)'{-i+,--interval=}'[interwał próbkowania w sekundach]:sekundy:(1 2 5 10 30 60)' \
+    '(-d --log-dir)'{-d+,--log-dir=}'[katalog logów]:katalog:_files -/' \
+    '--no-auto-sudo[nie przechodź automatycznie przez sudo]' \
+    '1:interwał (legacy, opcjonalny):(1 2 5 10 30 60)'
+}
+
+_zswap_log "$@"
