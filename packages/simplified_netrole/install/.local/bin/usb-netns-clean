@@ -1,0 +1,402 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+NETROLE_PROFILE_PREFIX="${NETROLE_PROFILE_PREFIX:-usbwan}"
+NETROLE_MAX_PROFILES="${NETROLE_MAX_PROFILES:-20}"
+NETROLE_CLEAN_FIREFOX_LOCKS="${NETROLE_CLEAN_FIREFOX_LOCKS:-1}"
+
+REAL_USER="${SUDO_USER:-${USER:-root}}"
+REAL_HOME="$(getent passwd "$REAL_USER" | cut -d: -f6)"
+
+need_root() {
+    if [[ "$EUID" -ne 0 ]]; then
+        echo "Uruchom przez sudo:"
+        echo "  sudo $0"
+        exit 1
+    fi
+}
+
+validate_ns_name() {
+    local name="$1"
+    if [[ ! "$name" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+        echo "[BŁĄD] Nieprawidłowa nazwa namespace: '$name'" >&2
+        exit 1
+    fi
+}
+
+usage() {
+    cat <<EOF_USAGE
+Użycie:
+  usb-netns-clean
+  usb-netns-clean --all
+  usb-netns-clean SLOT_OR_NS [SLOT_OR_NS...]
+
+Przykłady:
+  sudo usb-netns-clean
+  sudo usb-netns-clean usbwan-1
+  sudo NETROLE_PROFILE_PREFIX=labwan usb-netns-clean
+
+Zmienne:
+  NETROLE_PROFILE_PREFIX=$NETROLE_PROFILE_PREFIX
+  NETROLE_MAX_PROFILES=$NETROLE_MAX_PROFILES
+  NETROLE_CLEAN_FIREFOX_LOCKS=$NETROLE_CLEAN_FIREFOX_LOCKS
+EOF_USAGE
+}
+
+netns_exists() {
+    local NS="$1"
+    ip netns list | awk '{print $1}' | grep -Fxq "$NS"
+}
+
+list_matching_netns() {
+    local ns
+    local prefix="$NETROLE_PROFILE_PREFIX"
+    while IFS= read -r ns; do
+        # Cytowana część wzorca =~ jest traktowana dosłownie (nie jako regex),
+        # więc prefix nie jest podatny na wstrzyknięcie wyrażenia regularnego.
+        [[ "$ns" =~ ^"${prefix}"-[0-9]+$ ]] && printf '%s\n' "$ns"
+    done < <(ip netns list | awk '{print $1}') | sort -V || true
+}
+
+list_orphan_lock_slots() {
+    local LOCK_DIR="/run/simplified-netrole/locks"
+    local prefix="$NETROLE_PROFILE_PREFIX"
+    local entry
+
+    [[ -d "$LOCK_DIR" ]] || return 0
+
+    while IFS= read -r entry; do
+        [[ "$entry" =~ ^"${prefix}"-[0-9]+$ ]] || continue
+        ip netns list | awk '{print $1}' | grep -Fxq "$entry" && continue
+        printf '%s\n' "$entry"
+    done < <(ls "$LOCK_DIR" 2>/dev/null) | sort -V || true
+}
+
+kill_dhcp_pidfile() {
+    local NS="$1"
+    local PIDFILE="/run/dhclient-$NS.pid"
+    local LEASEFILE="/var/lib/dhcp/dhclient-$NS.leases"
+
+    if [[ -f "$PIDFILE" ]]; then
+        local PID
+        PID="$(cat "$PIDFILE" 2>/dev/null || true)"
+
+        if [[ -n "${PID:-}" ]] && [[ "$PID" =~ ^[0-9]+$ ]]; then
+            local PROC_COMM
+            PROC_COMM="$(cat "/proc/$PID/comm" 2>/dev/null || true)"
+            if [[ "${PROC_COMM:-}" != "dhclient" ]]; then
+                echo "[WARN] PID $PID comm='${PROC_COMM:-unknown}' — nie dhclient, pomijam"
+            else
+                # Guard against PID reuse: require the command line to reference
+                # this namespace's pidfile before sending signals.
+                local PROC_CMDLINE
+                PROC_CMDLINE="$(tr '\0' '\n' < "/proc/$PID/cmdline" 2>/dev/null || true)"
+                if ! grep -qF -- "$PIDFILE" <<< "$PROC_CMDLINE"; then
+                    echo "[WARN] PID $PID dhclient nie używa $PIDFILE — pomijam (reuse PID?)"
+                elif kill "$PID" 2>/dev/null; then
+                    echo "[+] Zabijam dhclient dla $NS: $PID"
+                    sleep 1
+                    kill -9 "$PID" 2>/dev/null || true
+                fi
+            fi
+        fi
+
+        rm -f "$PIDFILE"
+    fi
+
+    rm -f "$LEASEFILE" 2>/dev/null || true
+}
+
+kill_ns_processes() {
+    local NS="$1"
+    local PIDS
+
+    PIDS="$(ip netns pids "$NS" 2>/dev/null || true)"
+
+    if [[ -n "$PIDS" ]]; then
+        echo "[+] Zabijam procesy w namespace $NS:"
+        echo "$PIDS"
+
+        echo "$PIDS" | xargs -r kill 2>/dev/null || true
+        sleep 1
+        echo "$PIDS" | xargs -r kill -9 2>/dev/null || true
+    fi
+}
+
+mac_from_ns_eth0() {
+    local NS="$1"
+
+    ip netns exec "$NS" cat /sys/class/net/eth0/address 2>/dev/null || true
+}
+
+sanitize_iface_name() {
+    local VALUE="$1"
+
+    printf '%s' "$VALUE" \
+        | tr '[:upper:]' '[:lower:]' \
+        | tr -c '[:alnum:]_.-' '-'
+}
+
+iface_name_from_pages() {
+    local NS="$1"
+    local MAC="$2"
+    local SAFE_MAC
+    local PAGE_ROOT
+    local MATCH
+    local BASE
+    local WITHOUT_PREFIX
+    local IFACE_PART
+
+    [[ -n "${MAC:-}" ]] || return 1
+
+    SAFE_MAC="${MAC//:/-}"
+    # Usuwamy znaki specjalne glob *, ?, [ które mogłyby zmienić wzorzec find -name.
+    SAFE_MAC="${SAFE_MAC//\*/x}"
+    SAFE_MAC="${SAFE_MAC//\?/x}"
+    SAFE_MAC="${SAFE_MAC//\[/x}"
+    PAGE_ROOT="${XDG_CACHE_HOME:-$REAL_HOME/.cache}/netrole-firefox/pages"
+
+    [[ -d "$PAGE_ROOT" ]] || return 1
+
+    MATCH="$(find "$PAGE_ROOT" -maxdepth 1 -type d -name "$NS-*-$SAFE_MAC" -printf '%T@ %f\n' 2>/dev/null | sort -nr | awk 'NR==1 {print $2}')"
+    [[ -n "${MATCH:-}" ]] || return 1
+
+    BASE="$MATCH"
+    WITHOUT_PREFIX="${BASE#"${NS}"-}"
+    IFACE_PART="${WITHOUT_PREFIX%-"${SAFE_MAC}"}"
+
+    [[ -n "$IFACE_PART" ]] || return 1
+    printf '%s\n' "$IFACE_PART"
+}
+
+fallback_iface_name_from_mac() {
+    local NS="$1"
+    local MAC="$2"
+    local MAC_COMPACT
+    local SLOT_SUFFIX
+
+    if [[ -n "${MAC:-}" ]] && [[ "$MAC" != "00:00:00:00:00:00" ]]; then
+        MAC_COMPACT="${MAC//:/}"
+        printf 'enx%s\n' "$MAC_COMPACT"
+        return 0
+    fi
+
+    SLOT_SUFFIX="${NS##*-}"
+    printf 'nr%s-restored\n' "$SLOT_SUFFIX"
+}
+
+unique_host_iface_name() {
+    local PREFERRED="$1"
+    local NS="$2"
+    local MAC="$3"
+    local CANDIDATE
+    local MAC_COMPACT
+    local SLOT_SUFFIX
+
+    CANDIDATE="$(sanitize_iface_name "$PREFERRED")"
+    CANDIDATE="${CANDIDATE:0:15}"
+
+    if [[ -n "$CANDIDATE" ]] && ! ip link show "$CANDIDATE" >/dev/null 2>&1; then
+        printf '%s\n' "$CANDIDATE"
+        return 0
+    fi
+
+    MAC_COMPACT="${MAC//:/}"
+    SLOT_SUFFIX="${NS##*-}"
+    CANDIDATE="nr${SLOT_SUFFIX}-${MAC_COMPACT: -6}"
+    CANDIDATE="${CANDIDATE:0:15}"
+
+    if [[ -n "$CANDIDATE" ]] && ! ip link show "$CANDIDATE" >/dev/null 2>&1; then
+        printf '%s\n' "$CANDIDATE"
+        return 0
+    fi
+
+    CANDIDATE="nr${SLOT_SUFFIX}-restored"
+    CANDIDATE="${CANDIDATE:0:15}"
+    printf '%s\n' "$CANDIDATE"
+}
+
+infer_original_iface() {
+    local NS="$1"
+    local MAC="$2"
+    local RECORDED="/run/simplified-netrole/$NS/original-iface"
+
+    if [[ -f "$RECORDED" ]]; then
+        local NAME
+        NAME="$(cat "$RECORDED" 2>/dev/null || true)"
+        if [[ -n "${NAME:-}" ]]; then
+            printf '%s\n' "$NAME"
+            return 0
+        fi
+    fi
+
+    iface_name_from_pages "$NS" "$MAC" && return 0
+    fallback_iface_name_from_mac "$NS" "$MAC"
+}
+
+leave_iface_disconnected_on_host() {
+    local IFACE="$1"
+
+    if [[ -z "${IFACE:-}" ]]; then
+        return 0
+    fi
+
+    if ! ip link show "$IFACE" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    echo "[+] Zostawiam $IFACE na hoście jako rozłączony/autoconnect=no"
+
+    nmcli device set "$IFACE" autoconnect no >/dev/null 2>&1 || true
+    nmcli device disconnect "$IFACE" >/dev/null 2>&1 || true
+    ip addr flush dev "$IFACE" >/dev/null 2>&1 || true
+    ip link set dev "$IFACE" down >/dev/null 2>&1 || true
+}
+
+move_iface_back() {
+    local NS="$1"
+    local MAC
+    local PREFERRED_IFACE
+    local RESTORE_IFACE
+
+    if ! netns_exists "$NS"; then
+        return 0
+    fi
+
+    if ! ip -n "$NS" link show eth0 >/dev/null 2>&1; then
+        echo "[!] W namespace $NS nie widzę eth0 — nie mam czego przenieść."
+        return 0
+    fi
+
+    MAC="$(mac_from_ns_eth0 "$NS")"
+    PREFERRED_IFACE="$(infer_original_iface "$NS" "$MAC")"
+    RESTORE_IFACE="$(unique_host_iface_name "$PREFERRED_IFACE" "$NS" "$MAC")"
+
+    echo "[+] Przywracam interfejs z $NS:"
+    echo "    mac:           ${MAC:-unknown}"
+    echo "    preferred:     $PREFERRED_IFACE"
+    echo "    restore as:    $RESTORE_IFACE"
+
+    ip -n "$NS" link set eth0 down 2>/dev/null || true
+    ip -n "$NS" link set eth0 name "$RESTORE_IFACE" 2>/dev/null || true
+    ip -n "$NS" link set "$RESTORE_IFACE" netns 1 2>/dev/null || true
+
+    if ip link show "$RESTORE_IFACE" >/dev/null 2>&1; then
+        leave_iface_disconnected_on_host "$RESTORE_IFACE"
+        echo "[OK] Interfejs jest z powrotem w głównym namespace: $RESTORE_IFACE"
+    else
+        echo "[!] Nie widzę $RESTORE_IFACE po przeniesieniu do głównego namespace."
+        echo "    Jeśli to był USB Ethernet, wypnij/wpnij adapter."
+    fi
+}
+
+clean_firefox_locks() {
+    local PROFILE="$1"
+    local PROFILE_DIRS=()
+    local PROFILE_DIR
+
+    [[ "$NETROLE_CLEAN_FIREFOX_LOCKS" == "1" ]] || return 0
+
+    PROFILE_DIRS+=("$REAL_HOME/.local/share/netrole/firefox-profiles/$PROFILE")
+    PROFILE_DIRS+=("$REAL_HOME/snap/firefox/common/.mozilla/firefox/netrole-profiles/$PROFILE")
+
+    for PROFILE_DIR in "${PROFILE_DIRS[@]}"; do
+        [[ -d "$PROFILE_DIR" ]] || continue
+
+        echo "[+] Usuwam ewentualne locki Firefoksa: $PROFILE_DIR"
+        rm -f "$PROFILE_DIR/.parentlock" "$PROFILE_DIR/lock" 2>/dev/null || true
+    done
+}
+
+cleanup_one() {
+    local NS="$1"
+
+    [[ -n "${NS:-}" ]] || return 0
+
+    echo
+    echo "========== Czyszczenie $NS =========="
+
+    kill_dhcp_pidfile "$NS"
+
+    if netns_exists "$NS"; then
+        kill_ns_processes "$NS"
+        move_iface_back "$NS"
+
+        echo "[+] Usuwam namespace: $NS"
+        ip netns del "$NS" 2>/dev/null || true
+    else
+        echo "[OK] Namespace nie istnieje: $NS"
+    fi
+
+    echo "[+] Usuwam DNS config dla $NS"
+    rm -rf "/etc/netns/$NS" 2>/dev/null || true
+
+    echo "[+] Usuwam lock slotu (jeśli jest): $NS"
+    rm -rf "/run/simplified-netrole/locks/$NS" 2>/dev/null || true
+
+    clean_firefox_locks "$NS"
+}
+
+resolve_targets() {
+    if [[ "$#" -eq 0 ]]; then
+        { list_matching_netns; list_orphan_lock_slots; }
+        return 0
+    fi
+
+    local ARG
+
+    for ARG in "$@"; do
+        case "$ARG" in
+            --all)
+                { list_matching_netns; list_orphan_lock_slots; }
+                ;;
+            -h|--help|help)
+                usage
+                exit 0
+                ;;
+            *)
+                if [[ "$ARG" =~ ^[0-9]+$ ]]; then
+                    ARG="${NETROLE_PROFILE_PREFIX}-${ARG}"
+                fi
+                validate_ns_name "$ARG"
+                printf '%s\n' "$ARG"
+                ;;
+        esac
+    done | awk 'NF && !seen[$0]++'
+}
+
+main() {
+    need_root
+
+    local TARGETS
+    TARGETS="$(resolve_targets "$@")"
+
+    if [[ -z "${TARGETS:-}" ]]; then
+        echo "[OK] Nie znaleziono aktywnych namespace pasujących do: ${NETROLE_PROFILE_PREFIX}-N"
+        echo
+        echo "Stan:"
+        ip netns list || true
+        exit 0
+    fi
+
+    echo "[+] Sprzątam sloty/netns:"
+    # shellcheck disable=SC2001  # multiline prefix indent; not replaceable with ${//}
+    echo "$TARGETS" | sed 's/^/    /'
+
+    while IFS= read -r NS; do
+        [[ -n "$NS" ]] || continue
+        cleanup_one "$NS"
+    done <<< "$TARGETS"
+
+    echo
+    echo "[OK] Sprzątanie zakończone."
+    echo
+    echo "Sprawdź:"
+    echo "  ip -br link"
+    echo "  ip netns list"
+    echo
+    echo "Jeżeli NetworkManager nie przejmie kart automatycznie:"
+    echo "  sudo systemctl restart NetworkManager"
+}
+
+main "$@"

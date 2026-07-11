@@ -1,0 +1,1142 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+NETROLE_NS=""
+IFACE_IN_NS="eth0"
+PROFILE_KEY=""
+INTERACTIVE="0"
+
+CONFIG_FILE=""
+
+STATIC_ADDRS=()
+TEST_IPS=()
+DNS_SERVERS=()
+CLI_STATIC_SET=0
+CLI_TEST_SET=0
+CLI_DNS_SET=0
+CLI_DHCP_MODE_SET=0
+CLI_DHCP_TIMEOUT_SET=0
+CLI_ON_OFFER_SET=0
+
+DHCP_MODE="try"
+DHCP_TIMEOUT="8"
+ON_OFFER="ask"
+DHCP_FALLBACK_PREFIX="24"
+
+usage() {
+  cat <<'HELP'
+Użycie:
+  netrole-netns-network --interactive --namespace usbwan-1 --iface eth0 --profile-key nr-usba0
+
+Config użytkownika:
+  ~/.config/simplified-netrole/config.json
+
+Przykład configu:
+{
+  "_defaults": {
+    "dhcpTimeout": 8,
+    "onOffer": "add",
+    "dnsServers": ["1.1.1.1", "8.8.8.8"]
+  },
+  "NR_USBA0": {
+    "dhcpMode": "probe",
+    "staticAddrs": ["192.168.1.51/24", "192.168.10.51/24"],
+    "testIps": ["192.168.1.1", "192.168.10.3"],
+    "dnsServers": ["192.168.1.1"]
+  }
+}
+
+Tryby DHCP:
+  off       - nie próbuj DHCP
+  probe     - zapytaj DHCP, ale nie konfiguruj automatycznie
+  try       - spróbuj DHCP z timeoutem; jeśli brak odpowiedzi, idź dalej
+  required  - DHCP musi się udać
+  skip      - nic nie konfiguruj
+HELP
+}
+
+die() {
+  echo "[BŁĄD] $*" >&2
+  exit 1
+}
+
+require_python3() {
+  command -v python3 >/dev/null 2>&1 || \
+    die "Wymagany python3 (wyliczanie sieci z CIDR). Zainstaluj: sudo apt install python3"
+}
+
+line() {
+  printf '%s\n' "============================================================"
+}
+
+run_ns() {
+  ip netns exec "$NETROLE_NS" "$@"
+}
+
+cidr_ip() {
+  local cidr="$1"
+  printf '%s\n' "${cidr%%/*}"
+}
+
+cidr_network() {
+  local cidr="$1"
+
+  python3 - "$cidr" <<'PYNET'
+import ipaddress
+import sys
+
+iface = ipaddress.ip_interface(sys.argv[1])
+print(iface.network)
+PYNET
+}
+
+mask_to_prefix() {
+  local mask="$1"
+  local o1 o2 o3 o4
+  local octet
+  local prefix=0
+  local bits=0
+
+  if [ -z "$mask" ]; then
+    printf '%s\n' "$DHCP_FALLBACK_PREFIX"
+    return 0
+  fi
+
+  IFS=. read -r o1 o2 o3 o4 <<< "$mask"
+
+  for octet in "$o1" "$o2" "$o3" "$o4"; do
+    case "$octet" in
+      255) bits=8 ;;
+      254) bits=7 ;;
+      252) bits=6 ;;
+      248) bits=5 ;;
+      240) bits=4 ;;
+      224) bits=3 ;;
+      192) bits=2 ;;
+      128) bits=1 ;;
+      0)   bits=0 ;;
+      *)
+        printf '%s\n' "$DHCP_FALLBACK_PREFIX"
+        return 0
+        ;;
+    esac
+
+    prefix=$((prefix + bits))
+  done
+
+  printf '%s\n' "$prefix"
+}
+
+write_resolv_conf() {
+  local ns_resolv="/etc/netns/$NETROLE_NS/resolv.conf"
+  local servers=("${DNS_SERVERS[@]+"${DNS_SERVERS[@]}"}")
+  local desired=""
+  local s
+
+  if [ "${#servers[@]}" -eq 0 ]; then
+    servers=("1.1.1.1" "8.8.8.8")
+  fi
+
+  for s in "${servers[@]}"; do
+    desired+="nameserver $s"$'\n'
+  done
+
+  # Idempotentnie: jeśli plik ma już dokładnie tę treść, nie pisz ponownie.
+  # Eliminuje zbędny podwójny zapis resolv.conf (np. defaulty -> te same z DHCP).
+  if [ -f "$ns_resolv" ] && [ "$(cat "$ns_resolv" 2>/dev/null)" = "${desired%$'\n'}" ]; then
+    echo "[=] DNS dla $NETROLE_NS bez zmian:"
+    printf '    %s\n' "${servers[@]}"
+    return 0
+  fi
+
+  mkdir -p "/etc/netns/$NETROLE_NS"
+  printf '%s' "$desired" > "$ns_resolv"
+
+  echo "[+] DNS dla $NETROLE_NS:"
+  printf '    %s\n' "${servers[@]}"
+}
+
+safe_kill_dhclient_pidfile() {
+  # Zabija proces z pidfile tylko jeśli to faktycznie dhclient — po timeoucie
+  # PID mógł zostać przejęty przez inny proces, a wtedy ślepy pkill -F ubiłby
+  # niewłaściwą rzecz.
+  local pf="$1"
+  [ -f "$pf" ] || return 0
+
+  local p
+  p="$(cat "$pf" 2>/dev/null || true)"
+
+  if [ -n "$p" ] && [[ "$p" =~ ^[0-9]+$ ]] && [ -e "/proc/$p" ]; then
+    if [ "$(cat "/proc/$p/comm" 2>/dev/null || true)" = "dhclient" ]; then
+      if tr '\0' '\n' < "/proc/$p/cmdline" 2>/dev/null | grep -qxF "$pf"; then
+        kill "$p" 2>/dev/null || true
+      fi
+    fi
+  fi
+
+  rm -f "$pf" 2>/dev/null || true
+}
+
+stop_dhclient() {
+  local pid_file="/run/dhclient-$NETROLE_NS.pid"
+  if [ -f "$pid_file" ]; then
+    local pid
+    pid="$(cat "$pid_file" 2>/dev/null || true)"
+    if [ -n "$pid" ] && [ -e "/proc/$pid" ]; then
+      local comm
+      comm="$(cat "/proc/$pid/comm" 2>/dev/null || true)"
+      if [ "$comm" = "dhclient" ]; then
+        if tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null | grep -qxF "$pid_file"; then
+          kill "$pid" 2>/dev/null || true
+        fi
+      fi
+    fi
+    rm -f "$pid_file" 2>/dev/null || true
+  fi
+}
+
+parse_args() {
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --interactive)
+        INTERACTIVE="1"
+        shift
+        ;;
+
+      --namespace)
+        NETROLE_NS="${2:-}"
+        shift 2
+        ;;
+
+      --iface)
+        IFACE_IN_NS="${2:-eth0}"
+        shift 2
+        ;;
+
+      --profile-key)
+        PROFILE_KEY="${2:-}"
+        shift 2
+        ;;
+
+      --config)
+        CONFIG_FILE="${2:-}"
+        shift 2
+        ;;
+
+      --static)
+        STATIC_ADDRS+=("${2:-}")
+        CLI_STATIC_SET=1
+        shift 2
+        ;;
+
+      --test)
+        TEST_IPS+=("${2:-}")
+        CLI_TEST_SET=1
+        shift 2
+        ;;
+
+      --dns)
+        DNS_SERVERS+=("${2:-}")
+        CLI_DNS_SET=1
+        shift 2
+        ;;
+
+      --dhcp-mode)
+        DHCP_MODE="${2:-try}"
+        CLI_DHCP_MODE_SET=1
+        shift 2
+        ;;
+
+      --dhcp-timeout)
+        DHCP_TIMEOUT="${2:-8}"
+        CLI_DHCP_TIMEOUT_SET=1
+        shift 2
+        ;;
+
+      --on-offer)
+        ON_OFFER="${2:-ask}"
+        CLI_ON_OFFER_SET=1
+        shift 2
+        ;;
+
+      -h|--help|help)
+        usage
+        exit 0
+        ;;
+
+      *)
+        die "Nieznany argument: $1"
+        ;;
+    esac
+  done
+}
+
+profile_suffix() {
+  local raw_key
+
+  raw_key="${PROFILE_KEY:-$NETROLE_NS}"
+
+  printf '%s' "$raw_key" \
+    | tr '[:lower:]' '[:upper:]' \
+    | sed 's/[^A-Z0-9]/_/g'
+}
+
+resolve_config_file() {
+  local config_home=""
+  local sudo_home=""
+
+  if [ -n "$CONFIG_FILE" ]; then
+    return 0
+  fi
+
+  if [ -n "${SUDO_USER:-}" ] && [ "${SUDO_USER:-}" != "root" ]; then
+    sudo_home="$(getent passwd "$SUDO_USER" | awk -F: '{print $6}')"
+    if [ -n "$sudo_home" ]; then
+      config_home="$sudo_home"
+    fi
+  fi
+
+  if [ -z "$config_home" ]; then
+    config_home="${HOME:-}"
+  fi
+
+  if [ -z "$config_home" ]; then
+    CONFIG_FILE="/root/.config/simplified-netrole/config.json"
+  else
+    CONFIG_FILE="$config_home/.config/simplified-netrole/config.json"
+  fi
+}
+
+json_config_scalar() {
+  local field="$1"
+
+  resolve_config_file
+
+  [ -r "$CONFIG_FILE" ] || return 1
+
+  python3 - "$CONFIG_FILE" "$(profile_suffix)" "${PROFILE_KEY:-}" "$field" <<'PYJSON'
+import json
+import sys
+
+path, suffix, raw_key, field = sys.argv[1:5]
+
+try:
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+except Exception:
+    sys.exit(1)
+
+defaults = data.get("_defaults", {})
+profile = {}
+
+candidate_keys = []
+if suffix:
+    candidate_keys.append(suffix)
+if raw_key:
+    candidate_keys.append(raw_key)
+    candidate_keys.append(raw_key.upper())
+
+for key in candidate_keys:
+    value = data.get(key)
+    if isinstance(value, dict):
+        profile = value
+        break
+
+value = profile.get(field, defaults.get(field))
+
+if value is None:
+    sys.exit(1)
+
+if isinstance(value, bool):
+    print("1" if value else "0")
+elif isinstance(value, (int, float, str)):
+    print(value)
+else:
+    sys.exit(1)
+PYJSON
+}
+
+json_config_array() {
+  local field="$1"
+
+  resolve_config_file
+
+  [ -r "$CONFIG_FILE" ] || return 1
+
+  python3 - "$CONFIG_FILE" "$(profile_suffix)" "${PROFILE_KEY:-}" "$field" <<'PYJSON'
+import json
+import shlex
+import sys
+
+path, suffix, raw_key, field = sys.argv[1:5]
+
+try:
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+except Exception:
+    sys.exit(1)
+
+defaults = data.get("_defaults", {})
+profile = {}
+
+candidate_keys = []
+if suffix:
+    candidate_keys.append(suffix)
+if raw_key:
+    candidate_keys.append(raw_key)
+    candidate_keys.append(raw_key.upper())
+
+for key in candidate_keys:
+    value = data.get(key)
+    if isinstance(value, dict):
+        profile = value
+        break
+
+value = profile.get(field, defaults.get(field))
+
+if value is None:
+    sys.exit(1)
+
+if isinstance(value, list):
+    for item in value:
+        print(str(item))
+elif isinstance(value, str):
+    for item in shlex.split(value):
+        print(item)
+else:
+    sys.exit(1)
+PYJSON
+}
+
+validate_dhcp_timeout() {
+  # Akceptujemy dodatnią liczbę całkowitą lub zmiennoprzecinkową (np. 8, 8.5).
+  # timeout(1) akceptuje format [0-9]+(\.[0-9]+)?
+  if [[ ! "$DHCP_TIMEOUT" =~ ^[0-9]+(\.[0-9]+)?$ ]] || [[ "$DHCP_TIMEOUT" =~ ^0+(\.0+)?$ ]]; then
+    echo "[BŁĄD] Nieprawidłowy DHCP_TIMEOUT: '$DHCP_TIMEOUT'" >&2
+    echo "       Podaj dodatnią liczbę (całkowitą lub zmiennoprzecinkową), np. 8 lub 10.5" >&2
+    exit 1
+  fi
+}
+
+apply_config_defaults() {
+  local value
+
+  if [[ "$CLI_DHCP_TIMEOUT_SET" == "0" ]]; then
+    if value="$(json_config_scalar "dhcpTimeout" 2>/dev/null)"; then
+      DHCP_TIMEOUT="$value"
+      validate_dhcp_timeout
+    fi
+  fi
+
+  if [[ "$CLI_ON_OFFER_SET" == "0" ]]; then
+    if value="$(json_config_scalar "onOffer" 2>/dev/null)"; then
+      ON_OFFER="$value"
+    fi
+  fi
+}
+
+read_words_into_array() {
+  local prompt="$1"
+  local -n out_array="$2"
+  local config_field="${3:-}"
+  local input_line
+  local config_values=()
+
+  echo "$prompt"
+
+  if [ -n "$config_field" ]; then
+    mapfile -t config_values < <(json_config_array "$config_field" 2>/dev/null || true)
+
+    if [ "${#config_values[@]}" -gt 0 ]; then
+      echo
+      echo "[CONFIG] Wykryto w profilu $(profile_suffix):"
+      printf '         %s\n' "${config_values[@]}"
+      echo
+      echo "Wpisz:"
+      echo "  Enter = użyj wartości z configu"
+      echo "  -     = pomiń"
+      echo "  albo wpisz własne wartości rozdzielone spacją"
+    fi
+  fi
+
+  printf "> "
+  read -r input_line || input_line=""
+
+  out_array=()
+
+  if [ -z "$input_line" ] && [ "${#config_values[@]}" -gt 0 ]; then
+    out_array=("${config_values[@]}")
+    echo "[INFO] Używam wartości z configu."
+    return 0
+  fi
+
+  if [ "$input_line" = "-" ]; then
+    return 0
+  fi
+
+  if [ -n "$input_line" ]; then
+    read -r -a out_array <<< "$input_line"
+  fi
+}
+
+interactive_menu() {
+  local choice
+  local config_mode=""
+  local default_from_config="0"
+
+  apply_config_defaults
+
+  if config_mode="$(json_config_scalar "dhcpMode" 2>/dev/null)"; then
+    default_from_config="1"
+  fi
+
+  echo
+  line
+  echo "Konfiguracja sieci w namespace: $NETROLE_NS"
+  line
+  echo "Interfejs w namespace: $IFACE_IN_NS"
+  echo "Klucz profilu: ${PROFILE_KEY:-$NETROLE_NS}"
+  echo "Suffix configu: $(profile_suffix)"
+  echo "Plik configu: $CONFIG_FILE"
+
+  if [ -r "$CONFIG_FILE" ]; then
+    echo "Config: załadowany"
+  else
+    echo "Config: brak / nieczytelny"
+  fi
+
+  echo "DHCP timeout: $DHCP_TIMEOUT"
+  echo "DHCP on-offer: $ON_OFFER"
+  echo
+
+  echo "Wybierz tryb:"
+  echo "  1) DHCP try — spróbuj DHCP krótko; jeśli brak odpowiedzi, idź dalej"
+  echo "  2) Static + DHCP probe — wpisz statyczne adresy i opcjonalnie sprawdź DHCP"
+  echo "  3) Static only — wpisz statyczne adresy, bez DHCP"
+  echo "  4) Skip — nic nie konfiguruj"
+
+  if [ "$default_from_config" = "1" ]; then
+    echo "  Enter) użyj configu: dhcpMode=$config_mode"
+  fi
+
+  echo
+
+  if [ "$default_from_config" = "1" ]; then
+    printf "Wybór [1/2/3/4, Enter=config]: "
+  else
+    printf "Wybór [1/2/3/4, Enter=1]: "
+  fi
+
+  read -r choice || choice=""
+
+  if [ -z "$choice" ] && [ "$default_from_config" = "1" ]; then
+    DHCP_MODE="$config_mode"
+    echo "[INFO] Używam dhcpMode=$config_mode z configu."
+  else
+    case "${choice:-1}" in
+      1)
+        DHCP_MODE="try"
+        ;;
+
+      2)
+        DHCP_MODE="probe"
+        ;;
+
+      3)
+        DHCP_MODE="off"
+        ;;
+
+      4)
+        DHCP_MODE="skip"
+        ;;
+
+      *)
+        echo "[INFO] Nieznany wybór. Używam DHCP try."
+        DHCP_MODE="try"
+        ;;
+    esac
+  fi
+
+  case "$DHCP_MODE" in
+    probe|choice|ask|off|none|0)
+      read_words_into_array \
+        "Podaj statyczne adresy CIDR, rozdzielone spacją, np. 192.168.1.50/24 192.168.10.51/24" \
+        STATIC_ADDRS \
+        "staticAddrs"
+
+      read_words_into_array \
+        "Podaj adresy do testu, rozdzielone spacją, np. 192.168.1.1 192.168.10.3. Puste = pomiń." \
+        TEST_IPS \
+        "testIps"
+      ;;
+
+    try|optional|required|require|1|skip)
+      :
+      ;;
+
+    *)
+      echo "[UWAGA] Nieznany DHCP mode z configu: $DHCP_MODE"
+      echo "[INFO] Używam DHCP try."
+      DHCP_MODE="try"
+      ;;
+  esac
+
+  read_words_into_array \
+    "Podaj serwery DNS, rozdzielone spacją, np. 1.1.1.1 8.8.8.8. Puste = użyj domyślnych (1.1.1.1 8.8.8.8)." \
+    DNS_SERVERS \
+    "dnsServers"
+}
+
+validate_context() {
+  [ "$EUID" -eq 0 ] || die "Ten helper musi działać jako root."
+  [ -n "$NETROLE_NS" ] || die "Brak --namespace."
+
+  ip netns list | awk '{print $1}' | grep -Fxq "$NETROLE_NS" || {
+    echo "[BŁĄD] Namespace nie istnieje: $NETROLE_NS"
+    echo
+    echo "Aktywne namespace:"
+    ip netns list || true
+    exit 1
+  }
+
+  run_ns ip link show dev "$IFACE_IN_NS" >/dev/null 2>&1 || {
+    echo "[BŁĄD] Brak interfejsu $IFACE_IN_NS w namespace $NETROLE_NS"
+    echo
+    echo "Interfejsy w namespace:"
+    run_ns ip -br link show || true
+    exit 1
+  }
+}
+
+apply_static_addrs() {
+  local cidr
+  local src_ip
+  local net_cidr
+
+  if [ "${#STATIC_ADDRS[@]}" -eq 0 ]; then
+    return 0
+  fi
+
+  require_python3
+
+  echo
+  echo "[+] Ustawiam statyczne adresy na $NETROLE_NS/$IFACE_IN_NS"
+  printf '    %s\n' "${STATIC_ADDRS[@]}"
+
+  stop_dhclient
+
+  run_ns ip link set dev "$IFACE_IN_NS" up
+  run_ns ip addr flush dev "$IFACE_IN_NS"
+  run_ns ip route flush dev "$IFACE_IN_NS" 2>/dev/null || true
+  run_ns ip neigh flush dev "$IFACE_IN_NS" 2>/dev/null || true
+
+  for cidr in "${STATIC_ADDRS[@]}"; do
+    if [[ "$cidr" != */* ]]; then
+      echo "[UWAGA] Pomijam adres bez prefiksu CIDR: $cidr"
+      continue
+    fi
+
+    src_ip="$(cidr_ip "$cidr")"
+
+    if ! net_cidr="$(cidr_network "$cidr" 2>/dev/null)"; then
+      echo "[UWAGA] Pomijam nieprawidłowy adres CIDR: $cidr" >&2
+      continue
+    fi
+
+    echo "[+] Adres: $cidr"
+    run_ns ip addr add "$cidr" dev "$IFACE_IN_NS"
+
+    echo "[+] Trasa lokalna: $net_cidr dev $IFACE_IN_NS src $src_ip"
+    run_ns ip route replace "$net_cidr" dev "$IFACE_IN_NS" src "$src_ip"
+  done
+
+  echo
+  echo "[OK] Stan po statycznej konfiguracji:"
+  run_ns ip -br addr show dev "$IFACE_IN_NS" || true
+  run_ns ip route || true
+}
+
+test_ips() {
+  local test_ip
+
+  if [ "${#TEST_IPS[@]}" -eq 0 ]; then
+    return 0
+  fi
+
+  echo
+  echo "[+] Testuję adresy:"
+  printf '    %s\n' "${TEST_IPS[@]}"
+
+  for test_ip in "${TEST_IPS[@]}"; do
+    echo
+    echo "== Test: $test_ip =="
+    run_ns ping -c 1 -W 1 -- "$test_ip" || true
+    run_ns ip neigh show dev "$IFACE_IN_NS" | grep -F -- "$test_ip" || true
+  done
+}
+
+probe_dhcp() {
+  local work_dir="/run/netrole-dhcp-probe-$NETROLE_NS"
+  local log_file="$work_dir/dhclient.log"
+  local lease_file="$work_dir/dhclient.leases"
+  local pid_file="$work_dir/dhclient.pid"
+  local offer_ip
+  local offer_mask
+  local offer_router
+  local offer_server
+  local offer_dns
+
+  command -v dhclient >/dev/null 2>&1 || {
+    echo "[INFO] Brak dhclient — pomijam DHCP probe."
+    return 1
+  }
+
+  mkdir -p "$work_dir"
+  chmod 0700 "$work_dir"
+  rm -f "$log_file" "$lease_file" "$pid_file"
+
+  echo
+  echo "[+] DHCP probe w $NETROLE_NS przez maks. ${DHCP_TIMEOUT}s"
+  echo "    To tylko sprawdza ofertę DHCP. Nie powinno samo przełączyć konfiguracji."
+  echo "    Log: $log_file"
+
+  timeout "$DHCP_TIMEOUT" ip netns exec "$NETROLE_NS" dhclient \
+    -4 \
+    -1 \
+    -d \
+    -v \
+    -sf /bin/true \
+    -pf "$pid_file" \
+    -lf "$lease_file" \
+    "$IFACE_IN_NS" \
+    >"$log_file" 2>&1 || true
+
+  safe_kill_dhclient_pidfile "$pid_file"
+
+  offer_ip="$(
+    awk '
+      /DHCPOFFER of / { print $3; exit }
+      /DHCPACK of / { print $3; exit }
+      /bound to / { print $3; exit }
+    ' "$log_file" 2>/dev/null
+  )"
+
+  offer_server="$(
+    awk '
+      /DHCPOFFER of / { print $5; exit }
+      /DHCPACK of / { print $5; exit }
+    ' "$log_file" 2>/dev/null
+  )"
+
+  offer_mask="$(
+    awk '
+      /option subnet-mask/ {
+        gsub(";", "", $3)
+        print $3
+        exit
+      }
+    ' "$lease_file" 2>/dev/null || true
+  )"
+
+  offer_router="$(
+    awk '
+      /option routers/ {
+        gsub(";", "", $3)
+        gsub(",", "", $3)
+        print $3
+        exit
+      }
+    ' "$lease_file" 2>/dev/null || true
+  )"
+
+  offer_dns="$(
+    awk '
+      /option domain-name-servers/ {
+        gsub(";", "", $0)
+        # collect all IPs after the keyword
+        for (i = 3; i <= NF; i++) {
+          gsub(",", "", $i)
+          printf "%s\n", $i
+        }
+        exit
+      }
+    ' "$lease_file" 2>/dev/null || true
+  )"
+
+  if [ -z "$offer_ip" ]; then
+    echo "[INFO] DHCP nie zwrócił oferty."
+    echo "       Zostaję przy aktualnej konfiguracji."
+    echo "[INFO] Log próby DHCP zachowany: $log_file"
+    return 1
+  fi
+
+  DHCP_OFFER_IP="$offer_ip"
+  DHCP_OFFER_MASK="$offer_mask"
+  DHCP_OFFER_ROUTER="$offer_router"
+  DHCP_OFFER_SERVER="$offer_server"
+  DHCP_OFFER_DNS="$offer_dns"
+
+  echo
+  echo "[OK] DHCP znalazł ofertę:"
+  echo "    IP:      $DHCP_OFFER_IP"
+  echo "    maska:   ${DHCP_OFFER_MASK:-nieznana}"
+  echo "    router:  ${DHCP_OFFER_ROUTER:-brak/nieznany}"
+  echo "    server:  ${DHCP_OFFER_SERVER:-nieznany}"
+  if [ -n "${DHCP_OFFER_DNS:-}" ]; then
+    echo "    DNS:     $(printf '%s' "$DHCP_OFFER_DNS" | tr '\n' ' ')"
+  else
+    echo "    DNS:     brak w ofercie"
+  fi
+
+  rm -rf "$work_dir" 2>/dev/null || true
+  return 0
+}
+
+add_dhcp_offer_as_extra_addr() {
+  local prefix
+  local cidr
+  local net_cidr
+
+  [ -n "${DHCP_OFFER_IP:-}" ] || {
+    echo "[INFO] Brak oferty DHCP do dodania."
+    return 0
+  }
+
+  require_python3
+
+  if [ -n "${DHCP_OFFER_MASK:-}" ]; then
+    prefix="$(mask_to_prefix "$DHCP_OFFER_MASK")"
+  else
+    prefix="$DHCP_FALLBACK_PREFIX"
+  fi
+
+  cidr="$DHCP_OFFER_IP/$prefix"
+
+  if ! net_cidr="$(cidr_network "$cidr" 2>/dev/null)"; then
+    echo "[UWAGA] Nieprawidłowy adres z oferty DHCP: $cidr — pomijam." >&2
+    return 0
+  fi
+
+  echo "[+] Dodaję DHCP jako dodatkowy adres: $cidr"
+  run_ns ip addr add "$cidr" dev "$IFACE_IN_NS" 2>/dev/null || true
+
+  if run_ns ip route show "$net_cidr" dev "$IFACE_IN_NS" 2>/dev/null | grep -q .; then
+    echo "[INFO] Trasa $net_cidr już istnieje — nie zmieniam jej source."
+  else
+    echo "[+] Dodaję trasę dla DHCP: $net_cidr dev $IFACE_IN_NS src $DHCP_OFFER_IP"
+    run_ns ip route replace "$net_cidr" dev "$IFACE_IN_NS" src "$DHCP_OFFER_IP"
+  fi
+}
+
+switch_to_real_dhcp() {
+  echo "[+] Przełączam $NETROLE_NS/$IFACE_IN_NS na realny DHCP"
+
+  stop_dhclient
+
+  run_ns ip addr flush dev "$IFACE_IN_NS"
+  run_ns ip route flush dev "$IFACE_IN_NS" 2>/dev/null || true
+  run_ns ip neigh flush dev "$IFACE_IN_NS" 2>/dev/null || true
+  run_ns ip link set dev "$IFACE_IN_NS" up
+
+  local pid_file="/run/dhclient-$NETROLE_NS.pid"
+  local lease_file="/var/lib/dhcp/dhclient-$NETROLE_NS.leases"
+
+  mkdir -p "$(dirname -- "$lease_file")"
+  : > "$lease_file"
+
+  if timeout "$DHCP_TIMEOUT" ip netns exec "$NETROLE_NS" dhclient \
+    -4 \
+    -1 \
+    -v \
+    -pf "$pid_file" \
+    -lf "$lease_file" \
+    "$IFACE_IN_NS"
+  then
+    echo "[OK] DHCP skonfigurował $NETROLE_NS"
+    local dhcp_dns
+    dhcp_dns="$(awk '
+      /option domain-name-servers/ {
+        gsub(";", "", $0)
+        for (i = 3; i <= NF; i++) { gsub(",", "", $i); printf "%s\n", $i }
+        exit
+      }
+    ' "$lease_file" 2>/dev/null || true)"
+    if [ -n "${dhcp_dns:-}" ]; then
+      echo "[+] Przejmuję DNS z DHCP: $(printf '%s' "$dhcp_dns" | tr '\n' ' ')"
+      apply_dhcp_dns "$dhcp_dns"
+    fi
+    return 0
+  fi
+
+  echo "[BŁĄD] DHCP nie skonfigurował $NETROLE_NS w czasie ${DHCP_TIMEOUT}s"
+  return 1
+}
+
+apply_dhcp_dns() {
+  local dns_list="$1"
+  local servers=()
+
+  mapfile -t servers <<< "$dns_list"
+
+  if [ "${#servers[@]}" -eq 0 ] || [ -z "${servers[0]:-}" ]; then
+    return 0
+  fi
+
+  DNS_SERVERS=("${servers[@]}")
+  write_resolv_conf
+}
+
+ask_about_dhcp_offer() {
+  local choice
+  local default_choice="s"
+
+  if [ "$ON_OFFER" != "ask" ] && [ -n "$ON_OFFER" ]; then
+    default_choice="$ON_OFFER"
+  fi
+
+  # In noninteractive mode, never block on stdin regardless of the default —
+  # prompts only make sense when a human is driving.
+  if [ "$INTERACTIVE" != "1" ]; then
+    echo "[INFO] Nieinteraktywnie, stosuję onOffer=$default_choice"
+    choice="$default_choice"
+  else
+    echo
+    echo "Co zrobić z ofertą DHCP?"
+    echo "  s = zostań przy obecnych/statycznych adresach"
+    echo "  a = dodaj DHCP jako dodatkowy adres"
+    echo "  d = przełącz całkowicie na DHCP"
+
+    if [ "$default_choice" != "s" ]; then
+      echo "  Enter = użyj configu: $default_choice"
+    fi
+
+    echo
+
+    if [ "$default_choice" != "s" ]; then
+      printf "Wybór [s/a/d, Enter=%s]: " "$default_choice"
+    else
+      printf "Wybór [s/a/d, Enter=s]: "
+    fi
+
+    read -r choice || choice=""
+
+    if [ -z "$choice" ]; then
+      choice="$default_choice"
+    fi
+  fi
+
+  case "${choice:-s}" in
+    a|A|add)
+      add_dhcp_offer_as_extra_addr
+      ;;
+
+    d|D|dhcp)
+      switch_to_real_dhcp
+      ;;
+
+    s|S|static|"")
+      echo "[OK] Zostaję przy aktualnej konfiguracji."
+      ;;
+
+    *)
+      echo "[INFO] Nieznany wybór. Zostaję przy aktualnej konfiguracji."
+      choice="s"
+      ;;
+  esac
+
+  if [ -n "${DHCP_OFFER_DNS:-}" ]; then
+    case "${choice:-s}" in
+      s|S|static|"")
+        ;;
+      *)
+        if [ "$INTERACTIVE" != "1" ]; then
+          echo "[+] Nieinteraktywnie, przejmuję DNS z DHCP: $(printf '%s' "$DHCP_OFFER_DNS" | tr '\n' ' ')"
+          apply_dhcp_dns "$DHCP_OFFER_DNS"
+        else
+          echo
+          echo "DNS z oferty DHCP: $(printf '%s' "$DHCP_OFFER_DNS" | tr '\n' ' ')"
+          printf "Użyć DNS z DHCP? [T/n, Enter=T]: "
+          local dns_choice
+          read -r dns_choice || dns_choice=""
+          case "${dns_choice:-t}" in
+            n|N|nie)
+              echo "[INFO] Zostaję przy obecnych serwerach DNS."
+              ;;
+            *)
+              apply_dhcp_dns "$DHCP_OFFER_DNS"
+              ;;
+          esac
+        fi
+        ;;
+    esac
+  fi
+}
+
+run_real_dhcp_optional() {
+  echo
+  echo "[+] Próbuję DHCP w $NETROLE_NS przez maks. ${DHCP_TIMEOUT}s"
+
+  stop_dhclient
+
+  run_ns ip addr flush dev "$IFACE_IN_NS"
+  run_ns ip route flush dev "$IFACE_IN_NS" 2>/dev/null || true
+  run_ns ip neigh flush dev "$IFACE_IN_NS" 2>/dev/null || true
+  run_ns ip link set dev "$IFACE_IN_NS" up
+
+  local pid_file="/run/dhclient-$NETROLE_NS.pid"
+  local lease_file="/var/lib/dhcp/dhclient-$NETROLE_NS.leases"
+
+  mkdir -p "$(dirname -- "$lease_file")"
+  : > "$lease_file"
+
+  if timeout "$DHCP_TIMEOUT" ip netns exec "$NETROLE_NS" dhclient \
+    -4 \
+    -1 \
+    -v \
+    -pf "$pid_file" \
+    -lf "$lease_file" \
+    "$IFACE_IN_NS"
+  then
+    echo "[OK] DHCP uzyskane w $NETROLE_NS"
+    local dhcp_dns
+    dhcp_dns="$(awk '
+      /option domain-name-servers/ {
+        gsub(";", "", $0)
+        for (i = 3; i <= NF; i++) { gsub(",", "", $i); printf "%s\n", $i }
+        exit
+      }
+    ' "$lease_file" 2>/dev/null || true)"
+    if [ -n "${dhcp_dns:-}" ]; then
+      echo "[+] Przejmuję DNS z DHCP: $(printf '%s' "$dhcp_dns" | tr '\n' ' ')"
+      apply_dhcp_dns "$dhcp_dns"
+    fi
+    return 0
+  fi
+
+  echo "[INFO] DHCP nie odpowiedziało. Przywracam adresy statyczne."
+  apply_static_addrs
+  return 0
+}
+
+write_open_urls_runtime_file() {
+  local run_dir="/run/simplified-netrole/$NETROLE_NS"
+  local urls_file="$run_dir/open-urls"
+  local urls=()
+
+  mkdir -p "$run_dir"
+  chmod 700 "$run_dir"
+  rm -f "$urls_file"
+
+  mapfile -t urls < <(json_config_array "openUrls" 2>/dev/null || true)
+
+  if [ "${#urls[@]}" -eq 0 ]; then
+    echo "[INFO] Brak openUrls w configu dla profilu: $(profile_suffix)"
+    return 0
+  fi
+
+  printf '%s\n' "${urls[@]}" > "$urls_file"
+
+  echo
+  echo "[+] URL-e do otwarcia w Firefox:"
+  printf '    %s\n' "${urls[@]}"
+  echo "[INFO] Zapisano:"
+  echo "       $urls_file"
+}
+
+configure_network() {
+  echo
+  line
+  echo "Konfiguracja sieci w namespace"
+  line
+  echo "Namespace: $NETROLE_NS"
+  echo "Interfejs: $IFACE_IN_NS"
+  echo "Profil: ${PROFILE_KEY:-$NETROLE_NS}"
+  echo "DHCP mode: $DHCP_MODE"
+  echo
+
+  if [[ "$DHCP_MODE" == "skip" ]]; then
+    echo "[INFO] Pomijam konfigurację sieci (tryb skip)."
+    write_open_urls_runtime_file
+    return 0
+  fi
+
+  write_resolv_conf
+
+  apply_static_addrs
+  test_ips
+
+  case "$DHCP_MODE" in
+    off|none|0)
+      echo "[INFO] Pomijam DHCP."
+      ;;
+
+    probe|choice|ask)
+      if probe_dhcp; then
+        ask_about_dhcp_offer
+      fi
+      ;;
+
+    try|optional|"")
+      run_real_dhcp_optional
+      ;;
+
+    required|require|1)
+      if ! switch_to_real_dhcp; then
+        die "DHCP (required) nie powiódł się — przerywam konfigurację sieci."
+      fi
+      ;;
+
+    *)
+      echo "[UWAGA] Nieznany DHCP mode: $DHCP_MODE. Pomijam DHCP."
+      ;;
+  esac
+
+  write_open_urls_runtime_file
+
+  echo
+  line
+  echo "Końcowy stan sieci w $NETROLE_NS"
+  line
+  run_ns ip -br addr show dev "$IFACE_IN_NS" || true
+  echo
+  run_ns ip route || true
+}
+
+parse_args "$@"
+
+if [[ "$CLI_DHCP_TIMEOUT_SET" == "1" ]]; then
+  validate_dhcp_timeout
+fi
+
+resolve_config_file
+
+if [ -z "$PROFILE_KEY" ]; then
+  PROFILE_KEY="$NETROLE_NS"
+fi
+
+validate_context
+
+if [ "$INTERACTIVE" = "1" ]; then
+  interactive_menu
+else
+  apply_config_defaults
+
+  if [[ "$CLI_DHCP_MODE_SET" == "0" ]]; then
+    config_mode="$(json_config_scalar "dhcpMode" 2>/dev/null || true)"
+    if [ -n "$config_mode" ]; then
+      DHCP_MODE="$config_mode"
+    fi
+  fi
+
+  if [[ "$CLI_STATIC_SET" == "0" ]]; then
+    mapfile -t STATIC_ADDRS < <(json_config_array "staticAddrs" 2>/dev/null || true)
+  fi
+  if [[ "$CLI_TEST_SET" == "0" ]]; then
+    mapfile -t TEST_IPS < <(json_config_array "testIps" 2>/dev/null || true)
+  fi
+  if [[ "$CLI_DNS_SET" == "0" ]]; then
+    mapfile -t DNS_SERVERS < <(json_config_array "dnsServers" 2>/dev/null || true)
+  fi
+fi
+
+configure_network
