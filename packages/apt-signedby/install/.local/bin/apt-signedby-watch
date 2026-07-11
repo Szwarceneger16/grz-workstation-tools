@@ -27,11 +27,10 @@ REQUIRED_UBUNTU_SUITES = {
 UBUNTU_SIGNED_BY_HINT = "ubuntu-archive-keyring.gpg"
 
 WATCH_DIRS = [
+    "/etc/apt",
     "/etc/apt/sources.list.d",
 ]
-WATCH_FILES = [
-    "/etc/apt/sources.list",
-]
+WATCH_FILES = []
 
 # We only trigger audit notifications for these file patterns
 WATCH_NAME_RE = re.compile(r"(?:^sources\.list$|\.list$|\.sources$)", re.IGNORECASE)
@@ -208,6 +207,7 @@ IN_CREATE        = 0x00000100
 IN_DELETE        = 0x00000200
 IN_DELETE_SELF   = 0x00000400
 IN_MOVE_SELF     = 0x00000800
+IN_IGNORED       = 0x00008000
 
 WATCH_MASK = (
     IN_MODIFY | IN_ATTRIB | IN_CLOSE_WRITE |
@@ -287,6 +287,11 @@ def run_watch():
                 if WATCH_NAME_RE.search(bn):
                     pending.add(full)
                     deadline = time.time() + 1.0  # debounce window
+
+                # Kernel auto-removed this watch (target deleted/moved/unmounted);
+                # drop it so a later recycled wd number can't be mislabeled.
+                if mask & IN_IGNORED:
+                    wd_map.pop(wd, None)
 
         else:
             # timeout fired -> run audit if pending

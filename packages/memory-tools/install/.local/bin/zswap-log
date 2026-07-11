@@ -146,7 +146,7 @@ reject_symlink_components() {
 }
 
 secure_mkdir_p() {
-  local log_path=$1
+  local log_path=$1 owner=$2 group=$3
   local current component
   local -a parts
 
@@ -163,6 +163,9 @@ secure_mkdir_p() {
     fi
     if [[ ! -e "$current" ]]; then
       mkdir "$current" || fail "Nie udało się utworzyć katalogu: $current"
+      if [[ -n "$owner" && -n "$group" ]]; then
+        chown "$owner:$group" "$current" 2>/dev/null || true
+      fi
     fi
     [[ -d "$current" && ! -L "$current" ]] || fail "Niebezpieczny komponent ścieżki katalogu logów: $current"
   done
@@ -172,7 +175,7 @@ prepare_default_log_dir() {
   local dir=$1 owner=$2 group=$3
   local canonical_dir allowed_canonical
 
-  secure_mkdir_p "$dir"
+  secure_mkdir_p "$dir" "$owner" "$group"
   reject_symlink_components "$dir"
 
   canonical_dir=$(realpath -m -- "$dir") || fail "Nie udało się rozwiązać ścieżki katalogu logów: $dir"
@@ -190,7 +193,7 @@ prepare_explicit_log_dir() {
 
   reject_symlink_components "$dir"
   if [[ ! -e "$dir" ]]; then
-    secure_mkdir_p "$dir"
+    secure_mkdir_p "$dir" "" ""
   fi
 }
 

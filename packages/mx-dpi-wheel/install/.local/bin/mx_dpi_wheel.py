@@ -456,6 +456,17 @@ class Controller:
                         else:
                             self.step(-1)
 
+                elif e.type == X.KeyRelease and e.detail == self.cfg["mod_keycode"]:
+                    if self.mod_down:
+                        self.mod_down = False
+                        self.pending = False
+
+                        if self.pointer_grabbed:
+                            self.ungrab_pointer()
+                            self.pointer_grabbed = False
+
+                        self.commit_if_needed()
+
         except Exception as ex:
             try:
                 if self.pointer_grabbed:
