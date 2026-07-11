@@ -1,0 +1,11 @@
+[Unit]
+Description=APT sources audit watcher (Signed-By + minimal official repos)
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/apt-signedby-watch
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target

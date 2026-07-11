@@ -1,0 +1,17 @@
+#compdef apt-signedby-watch
+
+# Zsh completion for apt-signedby-watch
+# Bin: ~/.local/bin/apt-signedby-watch
+# Target: ~/.zsh_scripts/completion/bin/_apt_signedby_watch
+
+local curcontext="$curcontext" state line
+
+_arguments -s -S \
+  '(-h --help)'{-h,--help}'[pokaż pomoc i zakończ]' \
+  '*: :->args'
+
+case $state in
+  args)
+    _message 'brak argumentów pozycyjnych'
+    ;;
+esac
