@@ -13,6 +13,7 @@ DEB_LINE_RE = re.compile(
     r"^(deb|deb-src)\s+(?:\[(?P<opts>[^\]]+)\]\s+)?(?P<uri>\S+)\s+(?P<suite>\S+)(?:\s+(?P<comps>.+))?$",
     re.I,
 )
+DEB_PREFIX_RE = re.compile(r"^(?:deb|deb-src)\s", re.I)
 SIGNEDBY_OPT_RE = re.compile(r"\bsigned-by\s*=\s*([^\s\]]+)", re.I)
 OPTION_RE = re.compile(r"(?P<key>[A-Za-z0-9-]+)\s*=\s*(?P<value>[^\s\]]+)")
 
@@ -100,7 +101,7 @@ def parse_list_file_with_entries(path) -> Tuple[List[Entry], List[Issue]]:
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
-        if not (line.lower().startswith("deb ") or line.lower().startswith("deb-src ")):
+        if not DEB_PREFIX_RE.match(line):
             continue
 
         m = DEB_LINE_RE.match(line)

@@ -760,12 +760,12 @@ cmd_upgrade() {
   mv "$extracted_dir" "$install_dir"
 
   if [[ "$no_switch" -eq 0 ]]; then
-    old_target="$(readlink -f "$CURRENT_LINK")"
+    old_target="$(readlink -f "$CURRENT_LINK" 2>/dev/null || true)"
     ln -sfn "$install_dir" "${CURRENT_LINK}.tmp"
     mv -T "${CURRENT_LINK}.tmp" "$CURRENT_LINK"
     new_target="$(readlink -f "$CURRENT_LINK")"
     info "przestawiono current"
-    info "stare: $old_target"
+    info "stare: ${old_target:-(brak)}"
     info "nowe:  $new_target"
     icon_source="$APP_ROOT/current/linux_support/com.yubico.yubioath.png"
   else

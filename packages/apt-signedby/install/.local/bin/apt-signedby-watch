@@ -133,8 +133,9 @@ def check_official_minimum(entries):
     # so a source-only mirror can't satisfy the "official repos present" check.
     binary_entries = [e for e in entries if e.get("type", "deb") == "deb"]
 
-    # Mint repo presence + components
-    mint_ok = False
+    # Mint repo presence + components (union across entries, same suite/host/keyring)
+    mint_components = set()
+    mint_seen = False
     for e in binary_entries:
         if e["suite"] != REQUIRED_MINT["suite"]:
             continue
@@ -142,14 +143,18 @@ def check_official_minimum(entries):
             continue
         if REQUIRED_MINT["signed_by_hint"] not in (e["signed_by"] or "").lower():
             continue
-        if REQUIRED_MINT["components"].issubset(e["components"]):
-            mint_ok = True
-            break
-    if not mint_ok:
-        issues.append(
-            f"Brak minimalnego repo Mint: {REQUIRED_MINT['host_substr']} {REQUIRED_MINT['suite']} "
-            f"({', '.join(sorted(REQUIRED_MINT['components']))}) z Signed-By zawierającym '{REQUIRED_MINT['signed_by_hint']}'."
-        )
+        mint_seen = True
+        mint_components |= set(e["components"])
+
+    if not REQUIRED_MINT["components"].issubset(mint_components):
+        missing = sorted(REQUIRED_MINT["components"] - mint_components)
+        if not mint_seen:
+            issues.append(
+                f"Brak minimalnego repo Mint: {REQUIRED_MINT['host_substr']} {REQUIRED_MINT['suite']} "
+                f"({', '.join(sorted(REQUIRED_MINT['components']))}) z Signed-By zawierającym '{REQUIRED_MINT['signed_by_hint']}'."
+            )
+        else:
+            issues.append(f"Repo Mint {REQUIRED_MINT['suite']}: brakuje komponentów: {', '.join(missing)}.")
 
     # Ubuntu suites presence; allow any mirror URI, but require ubuntu keyring Signed-By hint
     seen = {s: set() for s in REQUIRED_UBUNTU_SUITES.keys()}
