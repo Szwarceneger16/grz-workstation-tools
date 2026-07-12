@@ -7,6 +7,7 @@ from typing import Iterable, List, Tuple
 # Opcje, które omijają weryfikację podpisu (złe praktyki)
 INSECURE_OPTS = ("trusted=yes", "trusted=1", "allow-insecure=yes", "allow-insecure=true")
 INSECURE_BOOL_VALUES = ("yes", "true", "1")
+INSECURE_OPT_KEYS = ("trusted", "allow-insecure")
 
 DEB_LINE_RE = re.compile(
     r"^(deb|deb-src)\s+(?:\[(?P<opts>[^\]]+)\]\s+)?(?P<uri>\S+)\s+(?P<suite>\S+)(?:\s+(?P<comps>.+))?$",
@@ -42,10 +43,10 @@ def parse_options_blob(opts: str) -> dict:
 def insecure_options_from_list_opts(opts: str) -> List[str]:
     parsed = parse_options_blob(opts)
     found = []
-    for bad in INSECURE_OPTS:
-        key, value = bad.split("=", 1)
-        if parsed.get(key) == value:
-            found.append(bad)
+    for key in INSECURE_OPT_KEYS:
+        value = parsed.get(key)
+        if value in INSECURE_BOOL_VALUES:
+            found.append(f"{key}={value}")
     return found
 
 

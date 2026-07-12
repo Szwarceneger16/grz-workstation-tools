@@ -5,6 +5,6 @@ gwfr() {
       return $?
   	fi
 
-    fetchremote $1
+    fetchremote $1 || return $?
     gwadd $1
 }
