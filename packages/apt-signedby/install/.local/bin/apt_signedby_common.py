@@ -26,9 +26,23 @@ def read_text(path) -> str:
 
 
 def is_world_readable(path: str) -> bool:
+    """True only if an 'other' user (e.g. _apt) can actually open the file: the file
+    itself must be world-readable (o+r) AND every parent directory up to '/' must be
+    world-traversable (o+x). A 0644 key under a 0700 dir (e.g. /root) is unreachable by
+    _apt despite its own mode bits."""
     try:
-        st = os.stat(path)
-        return bool(st.st_mode & stat.S_IROTH)
+        real = os.path.realpath(path)
+        st = os.stat(real)
+        if not (st.st_mode & stat.S_IROTH):
+            return False
+        d = os.path.dirname(real)
+        while True:
+            if not (os.stat(d).st_mode & stat.S_IXOTH):
+                return False
+            parent = os.path.dirname(d)
+            if parent == d:
+                return True
+            d = parent
     except (FileNotFoundError, PermissionError):
         return False
 
@@ -67,7 +81,7 @@ def validate_signed_by(value: str, path: str, loc, label: str, target: str) -> L
         if not os.path.exists(p):
             issues.append(("SIGNED_BY_MISSING_FILE", path, loc, f"{p} (nie istnieje)  ->  {target}"))
         elif not is_world_readable(p):
-            issues.append(("SIGNED_BY_NOT_READABLE", path, loc, f"{p} (nie jest world-readable; _apt może nie przeczytać)  ->  {target}"))
+            issues.append(("SIGNED_BY_NOT_READABLE", path, loc, f"{p} (niedostępny dla _apt: wymaga world-readable pliku i przechodnich katalogów nadrzędnych)  ->  {target}"))
     return issues
 
 

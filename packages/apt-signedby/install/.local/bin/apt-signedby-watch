@@ -39,6 +39,27 @@ WATCH_NAME_RE = re.compile(r"(?:^sources\.list$|\.list$|\.sources$)", re.IGNOREC
 def now_str():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+def _os_release():
+    data = {}
+    try:
+        with open("/etc/os-release") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                data[k] = v.strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return data
+
+def official_minimum_applies():
+    """The hardcoded 'official minimum repos' set is specific to Linux Mint 22.3
+    (zena, noble base). Enforce it only there; on any other distro/version we have no
+    baseline and must not raise a false-critical 'missing official repo' alarm."""
+    osr = _os_release()
+    return osr.get("ID") == "linuxmint" and osr.get("VERSION_CODENAME") == "zena"
+
 def notify(summary: str, body: str, critical: bool):
     # Cinnamon will render critical notifications more prominently (often red).
     args = [
@@ -168,7 +189,8 @@ def format_violations(violations, max_lines=8):
 
 def audit(trigger: str):
     entries, violations = collect_entries()
-    official_issues = check_official_minimum(entries)
+    applies = official_minimum_applies()
+    official_issues = check_official_minimum(entries) if applies else []
 
     critical = bool(violations or official_issues)
 
@@ -185,8 +207,10 @@ def audit(trigger: str):
             lines.append(f"- {s}")
         if len(official_issues) > 8:
             lines.append(f"(… i jeszcze {len(official_issues)-8} pozycji)")
-    else:
+    elif applies:
         lines.append("Repo oficjalne (minimalny zestaw): OK (Mint zena + Ubuntu noble{,-updates,-backports,-security}).")
+    else:
+        lines.append("Repo oficjalne (minimalny zestaw): pominięto (dystrybucja inna niż Mint 22.3 zena).")
 
     summary = "APT audit: PROBLEM" if critical else "APT audit: OK"
     notify(summary, "\n".join(lines), critical=critical)

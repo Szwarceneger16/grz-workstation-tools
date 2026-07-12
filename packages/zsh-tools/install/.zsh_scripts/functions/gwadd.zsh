@@ -8,7 +8,7 @@ gwadd() {
   local branch="$1"
   local target="$HOME/repos/.worktree/$branch"
 
-  gwta "$target" "$branch"
+  gwta "$target" "$branch" || return $?
 
   local env_src="$PWD/.env.lint.local"
   if [ -f "$env_src" ] && [ ! -e "$target/.env.lint.local" ]; then

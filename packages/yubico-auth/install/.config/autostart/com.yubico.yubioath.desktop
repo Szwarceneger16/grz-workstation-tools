@@ -2,7 +2,7 @@
 [Desktop Entry]
 Name=Yubico Authenticator
 GenericName=Yubico Authenticator
-Exec=/bin/sh -c "test -x \\$HOME/.local/share/yubico-authenticator/current/authenticator && exec \\$HOME/.local/bin/yubico-auth run --hidden"
+Exec=/bin/sh -c "cd && test -x .local/share/yubico-authenticator/current/authenticator && exec .local/bin/yubico-auth run --hidden"
 Icon=com.yubico.yubioath
 Type=Application
 Categories=Utility;
