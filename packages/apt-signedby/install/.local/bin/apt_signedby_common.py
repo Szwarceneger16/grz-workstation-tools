@@ -26,6 +26,17 @@ def read_text(path) -> str:
         return f.read()
 
 
+def _parents_traversable(start_dir: str) -> bool:
+    d = start_dir
+    while True:
+        if not (os.stat(d).st_mode & stat.S_IXOTH):
+            return False
+        parent = os.path.dirname(d)
+        if parent == d:
+            return True
+        d = parent
+
+
 def is_world_readable(path: str) -> bool:
     """True only if an 'other' user (e.g. _apt) can actually open the file: the file
     itself must be world-readable (o+r) AND every parent directory up to '/' must be
@@ -36,14 +47,13 @@ def is_world_readable(path: str) -> bool:
         st = os.stat(real)
         if not (st.st_mode & stat.S_IROTH):
             return False
-        d = os.path.dirname(real)
-        while True:
-            if not (os.stat(d).st_mode & stat.S_IXOTH):
-                return False
-            parent = os.path.dirname(d)
-            if parent == d:
-                return True
-            d = parent
+        if not _parents_traversable(os.path.dirname(real)):
+            return False
+        # APT opens the literal path it was given, not the resolved target;
+        # if a symlink component leading to that literal path sits under a
+        # non-traversable directory (e.g. /root), _apt can't reach it even
+        # though the resolved target is world-readable.
+        return _parents_traversable(os.path.dirname(os.path.abspath(path)))
     except (FileNotFoundError, PermissionError):
         return False
 

@@ -470,7 +470,7 @@ class Controller:
                             self.step(-1)
 
                 elif e.type == X.KeyRelease and e.detail == self.cfg["mod_keycode"]:
-                    if self.mod_down:
+                    if self.mod_down and not self.is_mod_key_still_down():
                         self.mod_down = False
                         self.pending = False
 

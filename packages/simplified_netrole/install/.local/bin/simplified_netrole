@@ -719,7 +719,16 @@ netrole_ensure_default_config() {
         return 0
     fi
 
-    cat > "$config_file" <<'EOF'
+    # Hardening (TOCTOU): ponów test symlinka tuż przed zapisem — między
+    # wcześniejszymi testami a mkdir -p ktoś mógł podmienić ścieżkę.
+    if [[ -L "$config_dir" || -L "$config_file" ]]; then
+        echo "[BŁĄD] Wykryto symlink tuż przed zapisem — odmawiam zapisu: $config_file" >&2
+        exit 1
+    fi
+
+    local tmp_file
+    tmp_file="$(mktemp "$config_dir/.config.json.XXXXXX")"
+    cat > "$tmp_file" <<'EOF'
 {
   "_defaults": {
     "dhcpTimeout": 8,
@@ -750,6 +759,7 @@ netrole_ensure_default_config() {
   }
 }
 EOF
+    mv -T "$tmp_file" "$config_file"
 }
 
 netrole_fix_config_owner() {

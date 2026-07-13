@@ -14,6 +14,8 @@ gwta() {
     local target="$1"
     local branch="${2:-${target:t}}"
 
+    mkdir -p -- "${target:h}"
+
     if git show-ref --verify --quiet "refs/heads/$branch"; then
         git worktree add "$target" "$branch"
     elif git show-ref --verify --quiet "refs/remotes/origin/$branch"; then

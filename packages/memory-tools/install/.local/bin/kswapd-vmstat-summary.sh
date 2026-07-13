@@ -131,7 +131,7 @@ for (( i=1; i<=reports; i++ )); do
   (( count++ ))
   s0=$s1
   st0=$st1
-  sleep "$interval"
+  (( i < reports )) && sleep "$interval"
 done
 
 typeset -F avg_scan=$(( sum_scan / count ))

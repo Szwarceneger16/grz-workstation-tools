@@ -321,6 +321,13 @@ def run_watch():
                     pending.add(full)
                     deadline = time.time() + 1.0  # debounce window
 
+                # A watched directory itself was deleted, replaced, or
+                # recreated - its contents may have changed wholesale even
+                # though this event's basename doesn't match WATCH_NAME_RE.
+                if full in WATCH_DIRS and (mask & (IN_CREATE | IN_DELETE | IN_DELETE_SELF | IN_MOVED_FROM | IN_MOVED_TO | IN_MOVE_SELF)):
+                    pending.add(full)
+                    deadline = time.time() + 1.0  # debounce window
+
                 # A configured watch directory (e.g. sources.list.d) just
                 # appeared but isn't watched yet (missing at startup, or
                 # deleted+recreated) - re-arm it so its own child events fire.
