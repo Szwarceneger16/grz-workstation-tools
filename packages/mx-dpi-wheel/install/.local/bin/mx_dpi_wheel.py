@@ -296,7 +296,7 @@ class Controller:
         self.root = self.d.screen().root
 
         self.root.change_attributes(
-            event_mask=X.KeyPressMask | X.KeyReleaseMask | X.ButtonPressMask | X.ButtonReleaseMask
+            event_mask=X.KeyPressMask | X.KeyReleaseMask
         )
 
         try:

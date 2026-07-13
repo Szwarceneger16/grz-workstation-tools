@@ -7,7 +7,7 @@ from typing import Iterable, List, Tuple
 # Opcje, które omijają weryfikację podpisu (złe praktyki)
 INSECURE_OPTS = ("trusted=yes", "trusted=1", "allow-insecure=yes", "allow-insecure=true")
 INSECURE_BOOL_VALUES = ("yes", "true", "1")
-INSECURE_OPT_KEYS = ("trusted", "allow-insecure")
+INSECURE_OPT_KEYS = ("trusted", "allow-insecure", "allow-weak", "allow-downgrade-to-insecure")
 
 DEB_LINE_RE = re.compile(
     r"^(deb|deb-src)\s+(?:\[(?P<opts>[^\]]+)\]\s+)?(?P<uri>\S+)\s+(?P<suite>\S+)(?:\s+(?P<comps>.+))?$",
@@ -222,13 +222,10 @@ def parse_sources_file_with_entries(path) -> Tuple[List[Entry], List[Issue]]:
         loc = f"stanza#{si}"
 
         if is_enabled:
-            trusted = d.get("trusted", "").strip().lower()
-            if trusted in INSECURE_BOOL_VALUES:
-                issues.append(("INSECURE_OPTION", path_str, loc, f"Trusted: {trusted}  ->  {target}"))
-
-            allow_insecure = d.get("allow-insecure", "").strip().lower()
-            if allow_insecure in INSECURE_BOOL_VALUES:
-                issues.append(("INSECURE_OPTION", path_str, loc, f"Allow-Insecure: {allow_insecure}  ->  {target}"))
+            for key in INSECURE_OPT_KEYS:
+                value = d.get(key, "").strip().lower()
+                if value in INSECURE_BOOL_VALUES:
+                    issues.append(("INSECURE_OPTION", path_str, loc, f"{key.title()}: {value}  ->  {target}"))
 
             issues.extend(validate_signed_by(signed_by, path_str, loc, "Signed-By:", target))
 

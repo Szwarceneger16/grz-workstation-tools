@@ -5,6 +5,12 @@ gwadd() {
       return $?
   	fi
 
+  if [[ $# -ne 1 || -z "$1" ]]; then
+      print -u2 "Usage: gwadd <branch>"
+      print -u2 "Try: gwadd --help"
+      return 2
+  fi
+
   local branch="$1"
   local target="$HOME/repos/.worktree/$branch"
 
