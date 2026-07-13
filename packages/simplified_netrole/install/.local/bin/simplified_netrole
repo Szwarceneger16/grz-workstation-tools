@@ -1,0 +1,1586 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+AUTO_CLEANUP="${AUTO_CLEANUP:-1}"
+CLEANUP_DONE=0
+
+# Jeden run = jeden network namespace + jeden profil Firefoxa.
+# Kolejne uruchomienia biorą najniższy wolny slot:
+#   usbwan-1, usbwan-2, usbwan-3, ...
+NETROLE_PROFILE_PREFIX="${NETROLE_PROFILE_PREFIX:-usbwan}"
+NETROLE_MAX_PROFILES="${NETROLE_MAX_PROFILES:-20}"
+
+ACTIVE_IFACE=""
+ACTIVE_NS=""
+ACTIVE_PROFILE=""
+ACTIVE_PROFILE_DIR=""
+ACTIVE_LOCK_DIR=""
+RESTORED_IFACE=""
+
+# Firefox binary.
+# Domyślnie bierze pierwszy firefox z PATH.
+# Możesz nadpisać:
+#   sudo FIREFOX_BIN=/opt/firefox/firefox ./usb-netns-firefox.sh
+FIREFOX_BIN="${FIREFOX_BIN:-$(command -v firefox || true)}"
+
+REAL_USER="${SUDO_USER:-$USER}"
+REAL_HOME="$(getent passwd "$REAL_USER" | cut -d: -f6)"
+REAL_UID="$(id -u "$REAL_USER")"
+
+if [[ -z "${REAL_HOME:-}" ]]; then
+    echo "[BŁĄD] Nie umiem ustalić katalogu domowego dla użytkownika: $REAL_USER" >&2
+    echo "       Sprawdź, czy użytkownik istnieje w /etc/passwd (getent passwd $REAL_USER)." >&2
+    exit 1
+fi
+
+# ---- Środowisko sesji graficznej użytkownika docelowego ----
+# Te zmienne tworzy sesja graficzna (display manager + kompozytor) przy logowaniu.
+# sudo je kasuje, dlatego odtwarzamy je: jawnie ustawiona zmienna wygrywa, a brakujące
+# wartości wykrywamy z systemu (loginctl + /proc/<pid>/environ procesów sesji usera).
+NETROLE_DISPLAY=""
+NETROLE_WAYLAND_DISPLAY=""
+NETROLE_XAUTHORITY=""
+NETROLE_XDG_RUNTIME_DIR=""
+NETROLE_DBUS_ADDR=""
+NETROLE_SESSION_TYPE=""
+NETROLE_GUI_ENV_RESOLVED=0
+
+_read_proc_env_var() {
+    local pid="$1"
+    local var="$2"
+
+    [[ -n "${pid:-}" ]] || return 1
+    [[ -e "/proc/$pid/environ" ]] || return 1
+
+    # /proc/PID/environ bywa nieczytelny (kernelowy ptrace-check przy open()),
+    # mimo że test -r przechodzi. Tłumimy więc też błąd otwarcia przekierowania,
+    # opakowując całą grupę w 2>/dev/null.
+    { tr '\0' '\n' < "/proc/$pid/environ" \
+        | sed -n "s/^${var}=//p" \
+        | head -n1; } 2>/dev/null
+}
+
+_pick_graphical_session() {
+    command -v loginctl >/dev/null 2>&1 || return 1
+
+    local sid
+    local type
+    local active
+    local sessions
+
+    # Sesja "display" usera to wprost ta graficzna na pierwszym planie.
+    sid="$(loginctl show-user "$REAL_USER" -p Display --value 2>/dev/null || true)"
+    if [[ -n "$sid" ]]; then
+        printf '%s\n' "$sid"
+        return 0
+    fi
+
+    sessions="$(loginctl show-user "$REAL_USER" -p Sessions --value 2>/dev/null || true)"
+
+    # Najpierw aktywna sesja graficzna...
+    for sid in $sessions; do
+        type="$(loginctl show-session "$sid" -p Type --value 2>/dev/null || true)"
+        active="$(loginctl show-session "$sid" -p Active --value 2>/dev/null || true)"
+        case "$type" in
+            x11|wayland)
+                [[ "$active" == "yes" ]] && { printf '%s\n' "$sid"; return 0; }
+                ;;
+        esac
+    done
+
+    # ...inaczej pierwsza graficzna jaką znajdziemy.
+    for sid in $sessions; do
+        type="$(loginctl show-session "$sid" -p Type --value 2>/dev/null || true)"
+        case "$type" in
+            x11|wayland)
+                printf '%s\n' "$sid"
+                return 0
+                ;;
+        esac
+    done
+
+    return 1
+}
+
+_find_xauthority() {
+    local rt="/run/user/$REAL_UID"
+    local cand
+
+    for cand in \
+        "$rt/gdm/Xauthority" \
+        "$rt"/.mutter-Xwaylandauth.* \
+        "$rt"/xauth_* \
+        "$REAL_HOME/.Xauthority"
+    do
+        [[ -e "$cand" ]] && { printf '%s\n' "$cand"; return 0; }
+    done
+
+    return 1
+}
+
+resolve_user_gui_env() {
+    [[ "$NETROLE_GUI_ENV_RESOLVED" == "1" ]] && return 0
+    NETROLE_GUI_ENV_RESOLVED=1
+
+    NETROLE_XDG_RUNTIME_DIR="/run/user/$REAL_UID"
+
+    local sid=""
+    local leader=""
+    local sdisplay=""
+    local h_display=""
+    local h_wayland=""
+    local h_xauth=""
+    local h_dbus=""
+    local pid
+    local candidates=()
+
+    sid="$(_pick_graphical_session || true)"
+    if [[ -n "$sid" ]] && command -v loginctl >/dev/null 2>&1; then
+        NETROLE_SESSION_TYPE="$(loginctl show-session "$sid" -p Type --value 2>/dev/null || true)"
+        sdisplay="$(loginctl show-session "$sid" -p Display --value 2>/dev/null || true)"
+        leader="$(loginctl show-session "$sid" -p Leader --value 2>/dev/null || true)"
+    fi
+
+    # Kandydaci do odczytu env: najpierw lider sesji, potem wszystkie procesy usera.
+    [[ -n "$leader" ]] && candidates+=("$leader")
+    if command -v pgrep >/dev/null 2>&1; then
+        while IFS= read -r pid; do
+            [[ -n "$pid" ]] && candidates+=("$pid")
+        done < <(pgrep -u "$REAL_USER" 2>/dev/null || true)
+    fi
+
+    for pid in "${candidates[@]+"${candidates[@]}"}"; do
+        [[ -z "$h_display" ]] && h_display="$(_read_proc_env_var "$pid" DISPLAY || true)"
+        [[ -z "$h_wayland" ]] && h_wayland="$(_read_proc_env_var "$pid" WAYLAND_DISPLAY || true)"
+        [[ -z "$h_xauth" ]]   && h_xauth="$(_read_proc_env_var "$pid" XAUTHORITY || true)"
+        [[ -z "$h_dbus" ]]    && h_dbus="$(_read_proc_env_var "$pid" DBUS_SESSION_BUS_ADDRESS || true)"
+
+        if [[ -n "$h_display" && -n "$h_xauth" && -n "$h_dbus" ]]; then
+            if [[ "$NETROLE_SESSION_TYPE" != "wayland" || -n "$h_wayland" ]]; then
+                break
+            fi
+        fi
+    done
+
+    # Priorytet per zmienna: jawny env -> harvest z /proc -> loginctl -> fallback.
+    NETROLE_DISPLAY="${DISPLAY:-}"
+    [[ -z "$NETROLE_DISPLAY" ]] && NETROLE_DISPLAY="$h_display"
+    [[ -z "$NETROLE_DISPLAY" ]] && NETROLE_DISPLAY="$sdisplay"
+    if [[ -z "$NETROLE_DISPLAY" && "$NETROLE_SESSION_TYPE" != "wayland" ]]; then
+        NETROLE_DISPLAY=":0"
+    fi
+
+    NETROLE_WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-}"
+    [[ -z "$NETROLE_WAYLAND_DISPLAY" ]] && NETROLE_WAYLAND_DISPLAY="$h_wayland"
+    if [[ -z "$NETROLE_WAYLAND_DISPLAY" && "$NETROLE_SESSION_TYPE" == "wayland" ]]; then
+        NETROLE_WAYLAND_DISPLAY="wayland-0"
+    fi
+
+    NETROLE_XAUTHORITY="${XAUTHORITY:-}"
+    [[ -z "$NETROLE_XAUTHORITY" ]] && NETROLE_XAUTHORITY="$h_xauth"
+    [[ -z "$NETROLE_XAUTHORITY" ]] && NETROLE_XAUTHORITY="$(_find_xauthority || true)"
+
+    NETROLE_DBUS_ADDR="${DBUS_SESSION_BUS_ADDRESS:-}"
+    [[ -z "$NETROLE_DBUS_ADDR" ]] && NETROLE_DBUS_ADDR="$h_dbus"
+    [[ -z "$NETROLE_DBUS_ADDR" ]] && NETROLE_DBUS_ADDR="unix:path=$NETROLE_XDG_RUNTIME_DIR/bus"
+
+    echo "[+] Sesja graficzna użytkownika $REAL_USER:" >&2
+    echo "    typ:             ${NETROLE_SESSION_TYPE:-nieznany}" >&2
+    echo "    DISPLAY:         ${NETROLE_DISPLAY:-brak}" >&2
+    echo "    WAYLAND_DISPLAY: ${NETROLE_WAYLAND_DISPLAY:-brak}" >&2
+    echo "    XAUTHORITY:      ${NETROLE_XAUTHORITY:-brak}" >&2
+    echo "    XDG_RUNTIME_DIR: $NETROLE_XDG_RUNTIME_DIR" >&2
+    echo "    DBUS:            $NETROLE_DBUS_ADDR" >&2
+
+    if [[ -z "$NETROLE_DISPLAY" && -z "$NETROLE_WAYLAND_DISPLAY" ]]; then
+        echo "[UWAGA] Nie wykryto lokalnej sesji graficznej dla $REAL_USER." >&2
+        echo "        Firefox może nie wystartować (potrzebny X11/Wayland)." >&2
+        echo "        Możesz ustawić ręcznie, np.:" >&2
+        echo "          sudo DISPLAY=:0 XAUTHORITY=$REAL_HOME/.Xauthority simplified_netrole" >&2
+    fi
+
+    return 0
+}
+
+_simplified_netrole_script_dir() {
+  local script_path
+  script_path="${BASH_SOURCE[0]}"
+
+  cd -- "$(dirname -- "$script_path")" >/dev/null 2>&1
+  pwd -P
+}
+
+_simplified_netrole_firefox_helper() {
+  local script_dir
+  script_dir="$(_simplified_netrole_script_dir)"
+
+  printf '%s\n' "$script_dir/simplified_netrole_utils/netrole-firefox-window"
+}
+
+_simplified_netrole_open_browser() {
+  if [ "$#" -lt 2 ]; then
+    echo "Użycie:"
+    echo "  simplified_netrole browser PROFILE IFACE [URL...]"
+    echo
+    echo "Przykład:"
+    echo "  simplified_netrole browser usbwan-1 eth0"
+    echo "  simplified_netrole browser usbwan-1 eth0 http://192.168.1.1/ http://192.168.10.3/"
+    echo "  (użyj nazwy interfejsu wewnątrz namespace, zwykle eth0)"
+    return 1
+  fi
+
+  need_root browser "$@"
+  resolve_user_gui_env
+
+  local profile_name
+  local iface
+  local helper
+  local open_urls_file
+  local open_urls=()
+  local line
+
+  profile_name="$1"
+  iface="$2"
+  shift 2
+
+  if [[ ! "$profile_name" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+    echo "[BŁĄD] Nieprawidłowa nazwa profilu: '$profile_name'" >&2
+    return 1
+  fi
+
+  helper="$(_simplified_netrole_firefox_helper)"
+
+  if [ ! -x "$helper" ]; then
+    echo "Nie znaleziono helpera Firefoksa albo nie jest wykonywalny:"
+    echo "  $helper"
+    echo
+    echo "Sprawdź, czy istnieje:"
+    echo "  simplified_netrole_utils/netrole-firefox-window"
+    return 2
+  fi
+
+  local profile_dir
+  profile_dir="$(firefox_profile_dir_for "$profile_name")"
+
+  local display_iface="$iface"
+  local original_iface_file="/run/simplified-netrole/$profile_name/original-iface"
+  if [[ -f "$original_iface_file" ]]; then
+    local persisted_iface
+    persisted_iface="$(cat "$original_iface_file" 2>/dev/null || true)"
+    [[ -n "${persisted_iface:-}" ]] && display_iface="$persisted_iface"
+  fi
+
+  if [ "$#" -gt 0 ]; then
+    open_urls=("$@")
+  else
+    open_urls_file="/run/simplified-netrole/$profile_name/open-urls"
+
+    if [ -r "$open_urls_file" ]; then
+      while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        open_urls+=("$line")
+      done < "$open_urls_file"
+    fi
+  fi
+
+  ip netns exec "$profile_name" runuser -u "$REAL_USER" -- env \
+    HOME="$REAL_HOME" \
+    USER="$REAL_USER" \
+    LOGNAME="$REAL_USER" \
+    DISPLAY="$NETROLE_DISPLAY" \
+    XAUTHORITY="$NETROLE_XAUTHORITY" \
+    WAYLAND_DISPLAY="$NETROLE_WAYLAND_DISPLAY" \
+    XDG_RUNTIME_DIR="$NETROLE_XDG_RUNTIME_DIR" \
+    DBUS_SESSION_BUS_ADDRESS="$NETROLE_DBUS_ADDR" \
+    MOZ_NO_REMOTE=1 \
+    NETROLE_FIREFOX_BIN="${FIREFOX_BIN:-}" \
+    NETROLE_FIREFOX_PROFILE_DIR="$profile_dir" \
+    NETROLE_FIREFOX_DISPLAY_IFACE="$display_iface" \
+    "$helper" "$profile_name" "$iface" "${open_urls[@]+"${open_urls[@]}"}"
+}
+
+need_root() {
+    if [[ "$EUID" -eq 0 ]]; then
+        return 0
+    fi
+
+    local self_path
+    local resolved_self
+
+    self_path="${BASH_SOURCE[0]}"
+
+    if [[ "$self_path" != */* ]]; then
+        resolved_self="$(command -v -- "$self_path" 2>/dev/null || true)"
+    else
+        resolved_self="$self_path"
+    fi
+
+    if [[ -z "${resolved_self:-}" ]]; then
+        echo "[BŁĄD] Nie umiem znaleźć ścieżki do samego siebie: $self_path"
+        echo "Uruchom ręcznie:"
+        echo "  sudo simplified_netrole"
+        exit 1
+    fi
+
+    resolved_self="$(readlink -f -- "$resolved_self")"
+
+    echo "[INFO] Ten tryb wymaga roota. Uruchamiam ponownie przez sudo..."
+    echo "       $resolved_self"
+    echo
+
+    # Przekazujemy też realny env sesji graficznej (póki jesteśmy jeszcze userem).
+    # sudo część z nich może odfiltrować — wtedy resolve_user_gui_env je odtworzy.
+    exec sudo \
+        AUTO_CLEANUP="${AUTO_CLEANUP:-1}" \
+        NETROLE_PROFILE_PREFIX="${NETROLE_PROFILE_PREFIX:-usbwan}" \
+        NETROLE_MAX_PROFILES="${NETROLE_MAX_PROFILES:-20}" \
+        ALLOW_WIFI_TO_NETNS="${ALLOW_WIFI_TO_NETNS:-0}" \
+        FIREFOX_BIN="${FIREFOX_BIN:-}" \
+        DISPLAY="${DISPLAY:-}" \
+        WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-}" \
+        XAUTHORITY="${XAUTHORITY:-}" \
+        XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-}" \
+        DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-}" \
+        "$resolved_self" "$@"
+}
+
+validate_netrole_prefix() {
+    if [[ ! "$NETROLE_PROFILE_PREFIX" =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]*$ ]]; then
+        echo "[BŁĄD] Nieprawidłowy NETROLE_PROFILE_PREFIX: '$NETROLE_PROFILE_PREFIX'" >&2
+        echo "       Dozwolone znaki: litery, cyfry, _ i -" >&2
+        exit 1
+    fi
+}
+
+validate_netrole_max_profiles() {
+    # Walidujemy zanim wartość trafi do kontekstu arytmetycznego (( ... )),
+    # gdzie nie-liczba psuje pętlę i jest klasycznym wektorem eval.
+    if [[ ! "$NETROLE_MAX_PROFILES" =~ ^[1-9][0-9]*$ ]]; then
+        echo "[BŁĄD] Nieprawidłowy NETROLE_MAX_PROFILES: '$NETROLE_MAX_PROFILES'" >&2
+        echo "       Podaj dodatnią liczbę całkowitą, np. NETROLE_MAX_PROFILES=20" >&2
+        exit 1
+    fi
+}
+
+check_firefox_exists() {
+    if [[ -z "${FIREFOX_BIN:-}" ]]; then
+        echo "[BŁĄD] Nie znaleziono komendy: firefox"
+        echo
+        echo "Jeżeli masz Firefoxa bezpośrednio od Mozilli, uruchom np.:"
+        echo "  sudo FIREFOX_BIN=/opt/firefox/firefox $0"
+        exit 1
+    fi
+
+    if [[ ! -x "$FIREFOX_BIN" ]]; then
+        echo "[BŁĄD] FIREFOX_BIN nie jest wykonywalny: $FIREFOX_BIN"
+        exit 1
+    fi
+
+    echo "[+] Firefox binary: $FIREFOX_BIN"
+}
+
+
+
+check_iface_exists() {
+    local IFACE="$1"
+
+    if ! ip link show "$IFACE" >/dev/null 2>&1; then
+        echo "[BŁĄD] Nie widzę interfejsu: $IFACE"
+        echo
+        echo "Aktualne interfejsy:"
+        ip -br link
+        exit 1
+    fi
+}
+
+is_snap_firefox() {
+    local BIN_REAL
+
+    BIN_REAL="$(readlink -f "$FIREFOX_BIN" 2>/dev/null || echo "$FIREFOX_BIN")"
+
+    case "$FIREFOX_BIN:$BIN_REAL" in
+        *"/snap/bin/firefox"*|*"/snap/firefox/"*|*"/usr/bin/snap"*)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+detect_firefox_profile_base() {
+    if is_snap_firefox; then
+        echo "$REAL_HOME/snap/firefox/common/.mozilla/firefox/netrole-profiles"
+    else
+        echo "$REAL_HOME/.local/share/netrole/firefox-profiles"
+    fi
+}
+
+ensure_firefox_profile_dir() {
+    local PROFILE="$1"
+    local PROFILE_BASE
+    local PROFILE_DIR
+
+    PROFILE_BASE="$(detect_firefox_profile_base)"
+    PROFILE_DIR="$PROFILE_BASE/$PROFILE"
+
+    # Logi idą na stderr; jedyną wartością na stdout jest ścieżka profilu,
+    # bo caller czyta ją przez podstawienie komendy.
+    echo >&2
+    echo "========== Firefox profile dir: $PROFILE ==========" >&2
+    echo "[+] Profile base: $PROFILE_BASE" >&2
+    echo "[+] Profile dir:  $PROFILE_DIR" >&2
+
+    if [[ -L "$PROFILE_DIR" ]]; then
+        echo "[BŁĄD] Katalog profilu to dowiązanie symboliczne: $PROFILE_DIR — odmawiam operacji." >&2
+        exit 1
+    fi
+
+    if [[ -d "$PROFILE_DIR" ]]; then
+        echo "[OK] Katalog profilu już istnieje: $PROFILE_DIR" >&2
+    else
+        echo "[+] Tworzę katalog profilu jako użytkownik: $REAL_USER" >&2
+        runuser -u "$REAL_USER" -- mkdir -p "$PROFILE_DIR"
+    fi
+
+    # Hardening (TOCTOU): ponów test symlinka tuż przed zmianą uprawnień —
+    # między pierwszym -L a tym miejscem ktoś mógł podmienić katalog na symlink.
+    if [[ -L "$PROFILE_DIR" ]]; then
+        echo "[BŁĄD] $PROFILE_DIR stał się dowiązaniem symbolicznym — przerywam." >&2
+        exit 1
+    fi
+
+    # -h: nie podążaj za symlinkami przy zmianie właściciela.
+    chown -h -R "$REAL_USER:" "$PROFILE_DIR"
+
+    # chmod jako użytkownik docelowy: gdyby ścieżkę podmieniono na symlink do
+    # uprzywilejowanego celu, user nie ma praw go zmienić (root by podążył) —
+    # więc w najgorszym razie głośno padniemy, nie zepsujemy cudzych plików.
+    runuser -u "$REAL_USER" -- chmod 700 "$PROFILE_DIR"
+
+    echo "$PROFILE_DIR"
+}
+
+firefox_profile_dir_for() {
+    local PROFILE="$1"
+    local PROFILE_BASE
+
+    PROFILE_BASE="$(detect_firefox_profile_base)"
+    printf '%s\n' "$PROFILE_BASE/$PROFILE"
+}
+
+netns_exists() {
+    local NS="$1"
+
+    ip netns list | awk '{print $1}' | grep -Fxq "$NS"
+}
+
+firefox_profile_in_use() {
+    local PROFILE="$1"
+    local PROFILE_DIR
+
+    PROFILE_DIR="$(firefox_profile_dir_for "$PROFILE")"
+
+    [[ -d "$PROFILE_DIR" ]] || return 1
+
+    # Najbardziej praktyczny test: Firefox uruchomiony z --profile "$PROFILE_DIR".
+    # Nie polegamy na samym istnieniu locków, bo mogą zostać po crashu.
+    if command -v pgrep >/dev/null 2>&1; then
+        pgrep -u "$REAL_USER" -af 'firefox' 2>/dev/null | grep -F -- "$PROFILE_DIR" >/dev/null
+        return $?
+    fi
+
+    # shellcheck disable=SC2009  # deliberate fallback when pgrep is unavailable
+    ps -u "$REAL_USER" -o args= 2>/dev/null | grep -F 'firefox' | grep -F -- "$PROFILE_DIR" >/dev/null
+}
+
+netrole_slot_in_use() {
+    local PROFILE="$1"
+    local NS="$PROFILE"
+
+    if netns_exists "$NS"; then
+        return 0
+    fi
+
+    if firefox_profile_in_use "$PROFILE"; then
+        return 0
+    fi
+
+    return 1
+}
+
+allocate_netrole_slot() {
+    local IDX
+    local PROFILE
+    local NS
+    local LOCK_BASE="/run/simplified-netrole/locks"
+
+    echo
+    echo "========== Wybór wolnego slotu netrole =========="
+
+    mkdir -p "$LOCK_BASE"
+
+    for ((IDX = 1; IDX <= NETROLE_MAX_PROFILES; IDX++)); do
+        PROFILE="${NETROLE_PROFILE_PREFIX}-${IDX}"
+        NS="$PROFILE"
+
+        if netrole_slot_in_use "$PROFILE"; then
+            echo "[INFO] Slot zajęty: $PROFILE"
+            continue
+        fi
+
+        if ! mkdir "$LOCK_BASE/$PROFILE" 2>/dev/null; then
+            echo "[INFO] Slot zajęty (blokada): $PROFILE"
+            continue
+        fi
+
+        # Recheck after acquiring the lock: a concurrent invocation may have
+        # created this namespace while we waited for the lock to be released.
+        if netrole_slot_in_use "$PROFILE"; then
+            rm -rf "$LOCK_BASE/$PROFILE" 2>/dev/null || true
+            echo "[INFO] Slot zajęty (po ponownym sprawdzeniu): $PROFILE"
+            continue
+        fi
+
+        ACTIVE_LOCK_DIR="$LOCK_BASE/$PROFILE"
+
+        ACTIVE_PROFILE="$PROFILE"
+        ACTIVE_NS="$NS"
+        ACTIVE_PROFILE_DIR="$(ensure_firefox_profile_dir "$ACTIVE_PROFILE" | tail -n 1)"
+
+        echo "[OK] Wybrany wolny slot: $ACTIVE_PROFILE"
+        echo "     namespace: $ACTIVE_NS"
+        echo "     profile:   $ACTIVE_PROFILE_DIR"
+        return 0
+    done
+
+    echo "[BŁĄD] Nie znaleziono wolnego slotu w zakresie 1..$NETROLE_MAX_PROFILES."
+    echo "Zwiększ limit, np.:"
+    echo "  sudo NETROLE_MAX_PROFILES=50 $0"
+    exit 1
+}
+
+release_netrole_slot_lock() {
+    # Lock chroni tylko wyścig w trakcie alokacji slotu. Gdy namespace już
+    # istnieje, slot jest chroniony przez netns_exists, więc lock można zwolnić.
+    # Inaczej przy AUTO_CLEANUP=0 (trap zdjęty) katalog locka zostawałby na
+    # zawsze i blokował slot aż do reboota.
+    if [[ -n "${ACTIVE_LOCK_DIR:-}" ]]; then
+        rm -rf "$ACTIVE_LOCK_DIR" 2>/dev/null || true
+        ACTIVE_LOCK_DIR=""
+    fi
+}
+
+kill_old_dhcp() {
+    local NS="$1"
+
+    if [[ -f "/run/dhclient-$NS.pid" ]]; then
+        local PID
+        PID="$(cat "/run/dhclient-$NS.pid" 2>/dev/null || true)"
+
+        if [[ -n "${PID:-}" ]] && [[ "$PID" =~ ^[0-9]+$ ]]; then
+            local PROC_COMM PROC_CMDLINE
+            PROC_COMM="$(cat "/proc/$PID/comm" 2>/dev/null || true)"
+            PROC_CMDLINE="$(tr '\0' ' ' < "/proc/$PID/cmdline" 2>/dev/null || true)"
+            if [[ "${PROC_COMM:-}" != "dhclient" ]] || [[ "$PROC_CMDLINE" != *"/run/dhclient-$NS.pid"* ]]; then
+                echo "[WARN] PID $PID (comm='${PROC_COMM:-unknown}') nie należy do $NS — pomijam"
+            elif kill "$PID" 2>/dev/null; then
+                echo "[+] Zabijam stary dhclient dla $NS: $PID"
+                sleep 1
+                kill -9 "$PID" 2>/dev/null || true
+            fi
+        fi
+
+        rm -f "/run/dhclient-$NS.pid"
+    fi
+
+    rm -f "/var/lib/dhcp/dhclient-$NS.leases" 2>/dev/null || true
+}
+
+cleanup_ns_if_exists() {
+    local NS="$1"
+
+    if ip netns list | awk '{print $1}' | grep -Fxq "$NS"; then
+        echo "[+] Czyszczę stary namespace: $NS"
+
+        ip netns pids "$NS" | xargs -r kill 2>/dev/null || true
+        sleep 1
+        ip netns pids "$NS" | xargs -r kill -9 2>/dev/null || true
+
+        ip netns del "$NS" 2>/dev/null || true
+    fi
+}
+
+prepare_iface_for_netns() {
+    local IFACE="$1"
+
+    echo "[+] Odłączam $IFACE od hostowego NetworkManagera przed przeniesieniem do namespace"
+
+    nmcli device set "$IFACE" autoconnect no >/dev/null 2>&1 || true
+    nmcli device disconnect "$IFACE" >/dev/null 2>&1 || true
+    ip addr flush dev "$IFACE" >/dev/null 2>&1 || true
+}
+
+_simplified_netrole_netns_network_helper() {
+    local self_dir
+    local helper_file
+
+    self_dir="$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")" && pwd)"
+    helper_file="$self_dir/simplified_netrole_utils/netrole-netns-network"
+
+    if [[ ! -x "$helper_file" ]]; then
+        echo "[BŁĄD] Brak helpera konfiguracji sieci namespace:"
+        echo "  $helper_file"
+        exit 1
+    fi
+
+    printf '%s\n' "$helper_file"
+}
+
+configure_network_in_namespace() {
+    local NS="$1"
+    local IFACE_IN_NS="${2:-eth0}"
+    local PROFILE_KEY="${3:-$IFACE_IN_NS}"
+    local helper_file
+
+    helper_file="$(_simplified_netrole_netns_network_helper)"
+
+    "$helper_file" \
+        --interactive \
+        --namespace "$NS" \
+        --iface "$IFACE_IN_NS" \
+        --profile-key "$PROFILE_KEY"
+}
+
+netrole_config_owner_user() {
+    if [[ -n "${SUDO_USER:-}" && "${SUDO_USER:-}" != "root" ]]; then
+        printf '%s\n' "$SUDO_USER"
+        return 0
+    fi
+
+    printf '%s\n' "${USER:-root}"
+}
+
+netrole_config_owner_home() {
+    local owner_user="$1"
+    local owner_home=""
+
+    owner_home="$(getent passwd "$owner_user" | awk -F: '{print $6}')"
+
+    if [[ -n "$owner_home" ]]; then
+        printf '%s\n' "$owner_home"
+        return 0
+    fi
+
+    if [[ "$owner_user" == "root" ]]; then
+        printf '%s\n' "/root"
+        return 0
+    fi
+
+    echo "[BŁĄD] Nie umiem ustalić HOME dla użytkownika: $owner_user" >&2
+    return 1
+}
+
+netrole_config_path() {
+    local owner_user
+    local owner_home
+
+    owner_user="$(netrole_config_owner_user)"
+    owner_home="$(netrole_config_owner_home "$owner_user")"
+
+    printf '%s\n' "$owner_home/.config/simplified-netrole/config.json"
+}
+
+netrole_ensure_default_config() {
+    local config_file="$1"
+    local config_dir
+
+    config_dir="$(dirname -- "$config_file")"
+
+    # Reject symlinks before any write: a user-controlled symlink under $HOME
+    # would let a local user use this root-run write as a file-creation primitive.
+    if [[ -L "$config_file" ]]; then
+        echo "[BŁĄD] Ścieżka configu jest symlinkiem — odmawiam zapisu: $config_file" >&2
+        exit 1
+    fi
+
+    local _dc="$config_dir"
+    while [[ "$_dc" != "/" && "$_dc" != "." ]]; do
+        if [[ -L "$_dc" ]]; then
+            echo "[BŁĄD] Komponent katalogu configu jest symlinkiem — odmawiam zapisu: $_dc" >&2
+            exit 1
+        fi
+        _dc="$(dirname -- "$_dc")"
+    done
+
+    mkdir -p "$config_dir"
+
+    if [[ -f "$config_file" ]]; then
+        return 0
+    fi
+
+    # Hardening (TOCTOU): ponów test symlinka tuż przed zapisem — między
+    # wcześniejszymi testami a mkdir -p ktoś mógł podmienić ścieżkę.
+    if [[ -L "$config_dir" || -L "$config_file" ]]; then
+        echo "[BŁĄD] Wykryto symlink tuż przed zapisem — odmawiam zapisu: $config_file" >&2
+        exit 1
+    fi
+
+    local tmp_file
+    tmp_file="$(mktemp "$config_dir/.config.json.XXXXXX")"
+    cat > "$tmp_file" <<'EOF'
+{
+  "_defaults": {
+    "dhcpTimeout": 8,
+    "onOffer": "add",
+    "dnsServers": ["1.1.1.1", "8.8.8.8"]
+  },
+  "NR_USBA0": {
+    "dhcpMode": "probe",
+    "staticAddrs": [
+      "192.168.1.51/24",
+      "192.168.10.51/24"
+    ],
+    "testIps": [
+      "192.168.1.1",
+      "192.168.10.3"
+    ]
+  },
+  "NR_USBC0": {
+    "dhcpMode": "probe",
+    "staticAddrs": [
+      "192.168.1.50/24",
+      "192.168.10.50/24"
+    ],
+    "testIps": [
+      "192.168.1.1",
+      "192.168.10.2"
+    ]
+  }
+}
+EOF
+    mv -T "$tmp_file" "$config_file"
+}
+
+netrole_fix_config_owner() {
+    local config_file="$1"
+    local owner_user
+
+    owner_user="$(netrole_config_owner_user)"
+
+    if [[ "$owner_user" != "root" ]]; then
+        local config_dir parent_dir parent_owner
+        config_dir="$(dirname -- "$config_file")"
+        parent_dir="$(dirname -- "$config_dir")"
+
+        # If a parent directory (e.g. ~/.config) was just created by root via
+        # mkdir -p, chown it back to the user so other per-user apps can still
+        # create their own config subdirectories.
+        if [[ "$parent_dir" != "/" ]]; then
+            parent_owner="$(stat -c '%U' "$parent_dir" 2>/dev/null || true)"
+            if [[ "$parent_owner" == "root" ]]; then
+                chown -h "$owner_user:" "$parent_dir" 2>/dev/null || true
+            fi
+        fi
+
+        chown -h -R "$owner_user:" "$config_dir" 2>/dev/null || true
+    fi
+}
+
+netrole_edit_config() {
+    local owner_user
+    local config_file
+    local exit_code
+
+    owner_user="$(netrole_config_owner_user)"
+    config_file="$(netrole_config_path)"
+
+    netrole_ensure_default_config "$config_file"
+
+    if [[ "$EUID" -eq 0 ]]; then
+        netrole_fix_config_owner "$config_file"
+    fi
+
+    echo "[+] Otwieram config:"
+    echo "    $config_file"
+    echo "[+] Użytkownik edycji:"
+    echo "    $owner_user"
+
+    if [[ "$EUID" -ne 0 ]]; then
+        if ! command -v code >/dev/null 2>&1; then
+            echo "[BŁĄD] Nie znaleziono komendy: code"
+            echo "Sprawdź, czy VS Code CLI jest dostępne w PATH."
+            exit 1
+        fi
+
+        code "$config_file"
+        exit 0
+    fi
+
+    if [[ "$owner_user" == "root" ]]; then
+        if ! command -v code >/dev/null 2>&1; then
+            echo "[BŁĄD] Nie znaleziono komendy: code"
+            echo "Sprawdź, czy VS Code CLI jest dostępne w PATH."
+            exit 1
+        fi
+
+        code "$config_file"
+        exit 0
+    fi
+
+    if command -v runuser >/dev/null 2>&1; then
+        exit_code=0
+        # shellcheck disable=SC2016  # $1 is intentional: positional arg for the inner bash -lc script
+        runuser -u "$owner_user" -- bash -lc 'command -v code >/dev/null 2>&1 || exit 127; code "$1"' _ "$config_file" || exit_code=$?
+
+        if [[ "$exit_code" -eq 127 ]]; then
+            echo "[BŁĄD] Użytkownik $owner_user nie ma komendy code w PATH."
+            echo "Uruchom bez sudo:"
+            echo "  simplified_netrole --editconfig"
+            echo
+            echo "Albo ręcznie:"
+            echo "  code $config_file"
+            exit 1
+        fi
+
+        exit "$exit_code"
+    fi
+
+    echo "[BŁĄD] Brak runuser — nie umiem bezpiecznie odpalić VS Code jako $owner_user."
+    echo "Otwórz bez sudo:"
+    echo "  simplified_netrole --editconfig"
+    echo
+    echo "Albo ręcznie:"
+    echo "  code $config_file"
+    exit 1
+}
+
+setup_ns() {
+    local NS="$1"
+    local IFACE="$2"
+
+    echo
+    echo "========== $NS / $IFACE =========="
+
+    check_iface_exists "$IFACE"
+    assert_iface_safe_for_netns "$IFACE"
+    prepare_iface_for_netns "$IFACE"
+
+    cleanup_ns_if_exists "$NS"
+    kill_old_dhcp "$NS"
+
+    echo "[+] Tworzę namespace: $NS"
+    ip netns add "$NS"
+
+    mkdir -p "/etc/netns/$NS"
+
+    echo "[+] Przenoszę $IFACE do $NS"
+    ip link set dev "$IFACE" down
+    ip link set dev "$IFACE" netns "$NS"
+
+    echo "[+] Konfiguruję interfejs jako eth0 w $NS"
+    ip netns exec "$NS" ip link set lo up
+    ip netns exec "$NS" ip link set dev "$IFACE" name eth0
+    ip netns exec "$NS" ip link set eth0 up
+
+    configure_network_in_namespace "$NS" eth0 "$IFACE"
+}
+
+launch_firefox() {
+    local NS="$1"
+    local PROFILE="$2"
+    local PROFILE_DIR="$3"
+    local ORIGINAL_IFACE="$4"
+    local HELPER
+    local LOG_FILE
+    local OPEN_URLS_FILE
+    local OPEN_URLS=()
+    local OPEN_URL_LINE
+
+    HELPER="$(_simplified_netrole_firefox_helper)"
+    local RUN_DIR="/run/simplified-netrole/$NS"
+    LOG_FILE="$RUN_DIR/firefox.log"
+    OPEN_URLS_FILE="$RUN_DIR/open-urls"
+
+    mkdir -p "$RUN_DIR"
+    chmod 700 "$RUN_DIR"
+    printf '%s\n' "$ORIGINAL_IFACE" > "$RUN_DIR/original-iface"
+
+    if [[ ! -x "$HELPER" ]]; then
+        echo "[BŁĄD] Nie znaleziono helpera Firefoksa albo nie jest wykonywalny:"
+        echo "  $HELPER"
+        exit 1
+    fi
+
+    if [[ -r "$OPEN_URLS_FILE" ]]; then
+        while IFS= read -r OPEN_URL_LINE; do
+            [[ -n "$OPEN_URL_LINE" ]] || continue
+            OPEN_URLS+=("$OPEN_URL_LINE")
+        done < "$OPEN_URLS_FILE"
+    fi
+
+    echo
+    echo "[+] Uruchamiam Firefox przez helper netrole-firefox-window:"
+    echo "    namespace:      $NS"
+    echo "    user:           $REAL_USER"
+    echo "    binary:         $FIREFOX_BIN"
+    echo "    profile name:   $PROFILE"
+    echo "    profile dir:    $PROFILE_DIR"
+    echo "    original iface: $ORIGINAL_IFACE"
+    echo "    iface in ns:    eth0"
+    echo "    helper:         $HELPER"
+    echo "    open URLs file: $OPEN_URLS_FILE"
+    echo "    log:            $LOG_FILE"
+
+    if [[ "${#OPEN_URLS[@]}" -gt 0 ]]; then
+        echo "    open URLs:"
+        printf '      - %s\n' "${OPEN_URLS[@]}"
+    else
+        echo "    open URLs:      brak"
+    fi
+
+    rm -f "$LOG_FILE"
+
+    if ! ip netns exec "$NS" runuser -u "$REAL_USER" -- env \
+        HOME="$REAL_HOME" \
+        USER="$REAL_USER" \
+        LOGNAME="$REAL_USER" \
+        DISPLAY="$NETROLE_DISPLAY" \
+        XAUTHORITY="$NETROLE_XAUTHORITY" \
+        WAYLAND_DISPLAY="$NETROLE_WAYLAND_DISPLAY" \
+        XDG_RUNTIME_DIR="$NETROLE_XDG_RUNTIME_DIR" \
+        DBUS_SESSION_BUS_ADDRESS="$NETROLE_DBUS_ADDR" \
+        MOZ_NO_REMOTE=1 \
+        NETROLE_FIREFOX_BIN="$FIREFOX_BIN" \
+        NETROLE_FIREFOX_PROFILE_DIR="$PROFILE_DIR" \
+        NETROLE_FIREFOX_DISPLAY_IFACE="$ORIGINAL_IFACE" \
+        "$HELPER" "$PROFILE" eth0 "${OPEN_URLS[@]+"${OPEN_URLS[@]}"}" \
+        >"$LOG_FILE" 2>&1
+    then
+        echo
+        echo "[BŁĄD] Helper Firefoksa zakończył się błędem."
+        echo "       Log: $LOG_FILE"
+        echo
+        echo "========== log Firefoksa/helpera =========="
+        cat "$LOG_FILE" || true
+        echo "==========================================="
+        return 1
+    fi
+}
+
+CANDIDATE_IFACES=()
+SELECTED_IFACE=""
+
+is_wifi_iface() {
+    local IFACE="$1"
+
+    if [[ -d "/sys/class/net/$IFACE/wireless" ]]; then
+        return 0
+    fi
+
+    if command -v iw >/dev/null 2>&1; then
+        iw dev 2>/dev/null | awk '/Interface/ {print $2}' | grep -Fxq "$IFACE"
+        return $?
+    fi
+
+    return 1
+}
+
+assert_iface_safe_for_netns() {
+    local IFACE="$1"
+
+    if is_wifi_iface "$IFACE"; then
+        echo "[BŁĄD] Interfejs $IFACE wygląda jak Wi-Fi."
+        echo
+        echo "Nie przenoszę Wi-Fi do network namespace, żeby nie odciąć hosta od sieci."
+        echo "Do testów użyj USB Ethernet albo wirtualnej karty testowej."
+        echo
+
+        if [[ "${ALLOW_WIFI_TO_NETNS:-0}" != "1" ]]; then
+            echo "Jeżeli naprawdę świadomie chcesz pozwolić na Wi-Fi:"
+            echo "  sudo ALLOW_WIFI_TO_NETNS=1 $0"
+            exit 1
+        fi
+
+        echo "[UWAGA] ALLOW_WIFI_TO_NETNS=1 — pozwalam mimo ryzyka: $IFACE"
+    fi
+}
+
+is_ethernet_iface() {
+    local IFACE="$1"
+    local TYPE_FILE="/sys/class/net/$IFACE/type"
+
+    [[ -f "$TYPE_FILE" ]] || return 1
+
+    # 1 = ARPHRD_ETHER
+    [[ "$(cat "$TYPE_FILE" 2>/dev/null || echo "")" == "1" ]]
+}
+
+is_virtual_or_unwanted_iface() {
+    local IFACE="$1"
+
+    case "$IFACE" in
+        lo|virbr*|docker*|br-*|veth*|tun*|tap*|wg*|zt*|tailscale*|vmnet*|vboxnet*)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+has_physical_device() {
+    local IFACE="$1"
+
+    [[ -e "/sys/class/net/$IFACE/device" ]]
+}
+
+iface_driver() {
+    local IFACE="$1"
+    local DRIVER_PATH
+
+    DRIVER_PATH="$(readlink -f "/sys/class/net/$IFACE/device/driver" 2>/dev/null || true)"
+
+    if [[ -n "$DRIVER_PATH" && -e "$DRIVER_PATH" ]]; then
+        basename "$DRIVER_PATH"
+    else
+        echo "unknown"
+    fi
+}
+
+iface_bus() {
+    local IFACE="$1"
+    local DEVPATH
+    local UDEV_PROPS
+    local BUSINFO
+
+    DEVPATH="$(readlink -f "/sys/class/net/$IFACE/device" 2>/dev/null || true)"
+
+    if [[ "$DEVPATH" == *"/usb"* ]]; then
+        echo "usb"
+        return 0
+    fi
+
+    if command -v udevadm >/dev/null 2>&1; then
+        UDEV_PROPS="$(udevadm info -q property -p "/sys/class/net/$IFACE" 2>/dev/null || true)"
+
+        if echo "$UDEV_PROPS" | grep -q '^ID_BUS=usb$'; then
+            echo "usb"
+            return 0
+        fi
+    fi
+
+    if command -v ethtool >/dev/null 2>&1; then
+        BUSINFO="$(ethtool -i "$IFACE" 2>/dev/null | awk -F': ' '/bus-info:/ {print $2}' || true)"
+
+        case "$BUSINFO" in
+            usb*|*usb*)
+                echo "usb"
+                return 0
+                ;;
+            pci*|0000:*)
+                echo "pci/internal"
+                return 0
+                ;;
+        esac
+    fi
+
+    if [[ "$DEVPATH" == *"/pci"* ]]; then
+        echo "pci/internal"
+    else
+        echo "unknown"
+    fi
+}
+
+is_internal_iface() {
+    local IFACE="$1"
+    local BUS
+
+    BUS="$(iface_bus "$IFACE")"
+
+    [[ "$BUS" != "usb" ]]
+}
+
+iface_state() {
+    local IFACE="$1"
+
+    cat "/sys/class/net/$IFACE/operstate" 2>/dev/null || echo "unknown"
+}
+
+iface_mac() {
+    local IFACE="$1"
+
+    cat "/sys/class/net/$IFACE/address" 2>/dev/null || echo "unknown"
+}
+
+iface_ipv4() {
+    local IFACE="$1"
+
+    ip -4 -br addr show dev "$IFACE" 2>/dev/null | awk '{print $3}' | paste -sd "," - || true
+}
+
+collect_candidate_ifaces() {
+    local IFACE
+
+    CANDIDATE_IFACES=()
+
+    for IFACE_PATH in /sys/class/net/*; do
+        IFACE="$(basename "$IFACE_PATH")"
+
+        is_virtual_or_unwanted_iface "$IFACE" && continue
+        is_ethernet_iface "$IFACE" || continue
+        is_wifi_iface "$IFACE" && continue
+        has_physical_device "$IFACE" || continue
+
+        CANDIDATE_IFACES+=("$IFACE")
+    done
+}
+
+print_candidate_ifaces() {
+    local IDX=1
+    local IFACE
+    local MAC
+    local STATE
+    local DRIVER
+    local BUS
+    local IPV4
+    local WARN
+
+    echo
+    echo "========== Dostępne fizyczne interfejsy Ethernet =========="
+    echo
+
+    if [[ "${#CANDIDATE_IFACES[@]}" -eq 0 ]]; then
+        echo "[BŁĄD] Nie znaleziono żadnych fizycznych interfejsów Ethernet."
+        echo
+        echo "Aktualne interfejsy:"
+        ip -br link
+        exit 1
+    fi
+
+    printf "%-4s %-18s %-17s %-14s %-18s %-18s %s\n" \
+        "NR" "IFACE" "MAC" "STATE" "BUS" "DRIVER" "UWAGI"
+
+    for IFACE in "${CANDIDATE_IFACES[@]}"; do
+        MAC="$(iface_mac "$IFACE")"
+        STATE="$(iface_state "$IFACE")"
+        DRIVER="$(iface_driver "$IFACE")"
+        BUS="$(iface_bus "$IFACE")"
+        IPV4="$(iface_ipv4 "$IFACE")"
+        WARN=""
+
+        if [[ "$BUS" != "usb" ]]; then
+            WARN="UWAGA: prawdopodobnie internal/PCI"
+        fi
+
+        if [[ -n "$IPV4" ]]; then
+            WARN="$WARN IPv4:$IPV4"
+        fi
+
+        printf "%-4s %-18s %-17s %-14s %-18s %-18s %s\n" \
+            "$IDX" "$IFACE" "$MAC" "$STATE" "$BUS" "$DRIVER" "$WARN"
+
+        IDX=$((IDX + 1))
+    done
+
+    echo
+}
+
+select_iface_for_profile() {
+    local PROFILE="$1"
+    local ALREADY_SELECTED="${2:-}"
+    local CHOICE
+    local IFACE
+    local ANSWER
+
+    while true; do
+        read -rp "Wybierz numer interfejsu dla profilu $PROFILE: " CHOICE
+
+        if ! [[ "$CHOICE" =~ ^[0-9]+$ ]]; then
+            echo "[BŁĄD] Podaj numer z listy."
+            continue
+        fi
+
+        if (( CHOICE < 1 || CHOICE > ${#CANDIDATE_IFACES[@]} )); then
+            echo "[BŁĄD] Numer poza zakresem."
+            continue
+        fi
+
+        IFACE="${CANDIDATE_IFACES[$((CHOICE - 1))]}"
+
+        if [[ -n "$ALREADY_SELECTED" && "$IFACE" == "$ALREADY_SELECTED" ]]; then
+            echo "[BŁĄD] Ten interfejs jest już wybrany dla pierwszego profilu: $IFACE"
+            echo "Wybierz inny."
+            continue
+        fi
+
+        if is_internal_iface "$IFACE"; then
+            echo
+            echo "[UWAGA] Wybrałeś interfejs: $IFACE"
+            echo "        Ten interfejs wygląda na internal/PCI, nie USB."
+            echo "        Jeżeli to karta hosta/systemowa, możesz sobie odciąć normalną sieć w głównym systemie."
+            read -rp "        Użyć mimo to? [y/N]: " ANSWER
+
+            case "$ANSWER" in
+                y|Y|yes|YES|t|T|tak|TAK)
+                    ;;
+                *)
+                    echo "[+] Pomijam $IFACE. Wybierz ponownie."
+                    echo
+                    continue
+                    ;;
+            esac
+        fi
+
+        SELECTED_IFACE="$IFACE"
+        return 0
+    done
+}
+
+choose_interface_interactively() {
+    collect_candidate_ifaces
+    print_candidate_ifaces
+
+    select_iface_for_profile "$ACTIVE_PROFILE"
+    ACTIVE_IFACE="$SELECTED_IFACE"
+
+    echo "[OK] $ACTIVE_PROFILE użyje: $ACTIVE_IFACE"
+    echo
+}
+
+kill_dhcp_pidfile() {
+    local NS="$1"
+    local PIDFILE="/run/dhclient-$NS.pid"
+    local LEASEFILE="/var/lib/dhcp/dhclient-$NS.leases"
+
+    if [[ -f "$PIDFILE" ]]; then
+        local PID
+        PID="$(cat "$PIDFILE" 2>/dev/null || true)"
+
+        if [[ -n "${PID:-}" ]] && [[ "$PID" =~ ^[0-9]+$ ]]; then
+            local PROC_COMM PROC_CMDLINE
+            PROC_COMM="$(cat "/proc/$PID/comm" 2>/dev/null || true)"
+            PROC_CMDLINE="$(tr '\0' ' ' < "/proc/$PID/cmdline" 2>/dev/null || true)"
+            if [[ "${PROC_COMM:-}" != "dhclient" ]] || [[ "$PROC_CMDLINE" != *"$PIDFILE"* ]]; then
+                echo "[WARN] PID $PID (comm='${PROC_COMM:-unknown}') nie należy do $NS — pomijam"
+            elif kill "$PID" 2>/dev/null; then
+                echo "[+] Zabijam dhclient dla $NS: $PID"
+                sleep 1
+                kill -9 "$PID" 2>/dev/null || true
+            fi
+        fi
+
+        rm -f "$PIDFILE"
+    fi
+
+    rm -f "$LEASEFILE" 2>/dev/null || true
+}
+
+kill_ns_processes() {
+    local NS="$1"
+
+    local PIDS
+    PIDS="$(ip netns pids "$NS" 2>/dev/null || true)"
+
+    if [[ -n "$PIDS" ]]; then
+        echo "[+] Zabijam procesy w namespace $NS:"
+        echo "$PIDS"
+
+        echo "$PIDS" | xargs -r kill 2>/dev/null || true
+        sleep 1
+        echo "$PIDS" | xargs -r kill -9 2>/dev/null || true
+    fi
+}
+
+move_iface_back() {
+    local NS="$1"
+    local IFACE="$2"
+    local RESTORE="$IFACE"
+    local MAC
+    local MAC_COMPACT
+    local SLOT
+
+    RESTORED_IFACE=""
+
+    [[ -n "${NS:-}" ]] || return 0
+    [[ -n "${IFACE:-}" ]] || return 0
+
+    if ! ip netns list | awk '{print $1}' | grep -Fxq "$NS"; then
+        return 0
+    fi
+
+    # Jeżeli oryginalna nazwa jest już zajęta na hoście, wybierz unikalną
+    # (jak robi to usb-netns-clean), żeby nie zderzyć się z istniejącym linkiem.
+    if ip link show "$RESTORE" >/dev/null 2>&1; then
+        MAC="$(ip -n "$NS" link show eth0 2>/dev/null | awk '/link\/ether/ {print $2}')"
+        SLOT="${NS##*-}"
+        if [[ -n "${MAC:-}" ]]; then
+            MAC_COMPACT="${MAC//:/}"
+            RESTORE="nr${SLOT}-${MAC_COMPACT: -6}"
+        else
+            RESTORE="nr${SLOT}-restored"
+        fi
+        RESTORE="${RESTORE:0:15}"
+        echo "[!] Nazwa $IFACE jest zajęta na hoście — przywracam jako: $RESTORE"
+    fi
+
+    if ip -n "$NS" link show eth0 >/dev/null 2>&1; then
+        echo "[+] Przenoszę eth0 z $NS z powrotem jako $RESTORE"
+
+        ip -n "$NS" link set eth0 down 2>/dev/null || true
+        if ip -n "$NS" link set eth0 name "$RESTORE" 2>/dev/null; then
+            if ip -n "$NS" link set "$RESTORE" netns 1 2>/dev/null; then
+                RESTORED_IFACE="$RESTORE"
+            else
+                echo "[!] Przeniesienie $RESTORE do głównego namespace nie powiodło się" >&2
+            fi
+        else
+            echo "[!] Rename eth0→$RESTORE nie powiódł się — przenoszę pod nazwą eth0"
+            if ip -n "$NS" link set eth0 netns 1 2>/dev/null; then
+                RESTORED_IFACE="eth0"
+            else
+                echo "[!] Przeniesienie eth0 do głównego namespace nie powiodło się" >&2
+            fi
+        fi
+
+    elif ip -n "$NS" link show "$IFACE" >/dev/null 2>&1; then
+        echo "[+] Przenoszę $IFACE z $NS z powrotem do głównego namespace"
+
+        ip -n "$NS" link set "$IFACE" down 2>/dev/null || true
+        if ip -n "$NS" link set "$IFACE" netns 1 2>/dev/null; then
+            RESTORED_IFACE="$IFACE"
+        else
+            echo "[!] Przeniesienie $IFACE do głównego namespace nie powiodło się" >&2
+        fi
+    fi
+}
+
+clean_firefox_locks() {
+    local PROFILE="$1"
+    local PROFILE_DIRS=()
+    local PROFILE_DIR
+
+    PROFILE_DIRS+=("$REAL_HOME/.local/share/netrole/firefox-profiles/$PROFILE")
+    PROFILE_DIRS+=("$REAL_HOME/snap/firefox/common/.mozilla/firefox/netrole-profiles/$PROFILE")
+
+    for PROFILE_DIR in "${PROFILE_DIRS[@]}"; do
+        [[ -d "$PROFILE_DIR" ]] || continue
+
+        echo "[+] Usuwam ewentualne locki Firefoksa: $PROFILE_DIR"
+        rm -f "$PROFILE_DIR/.parentlock" "$PROFILE_DIR/lock" 2>/dev/null || true
+    done
+}
+
+leave_iface_disconnected_on_host() {
+    local IFACE="$1"
+
+    if [[ -z "${IFACE:-}" ]]; then
+        return 0
+    fi
+
+    if ! ip link show "$IFACE" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    echo "[+] Zostawiam $IFACE na hoście jako rozłączony/autoconnect=no"
+
+    nmcli device set "$IFACE" autoconnect no >/dev/null 2>&1 || true
+    nmcli device disconnect "$IFACE" >/dev/null 2>&1 || true
+    ip addr flush dev "$IFACE" >/dev/null 2>&1 || true
+    ip link set dev "$IFACE" down >/dev/null 2>&1 || true
+}
+
+cleanup_one() {
+    local NS="$1"
+    local IFACE="$2"
+
+    [[ -n "${NS:-}" ]] || return 0
+
+    echo
+    echo "========== Cleanup $NS / ${IFACE:-unknown} =========="
+
+    kill_dhcp_pidfile "$NS"
+
+    RESTORED_IFACE=""
+
+    if ip netns list | awk '{print $1}' | grep -qx "$NS"; then
+        kill_ns_processes "$NS"
+        move_iface_back "$NS" "${IFACE:-}"
+
+        echo "[+] Usuwam namespace: $NS"
+        ip netns del "$NS" 2>/dev/null || true
+    else
+        echo "[OK] Namespace nie istnieje: $NS"
+    fi
+
+    rm -rf "/etc/netns/$NS" 2>/dev/null || true
+
+    # Osierocony lock slotu (np. po AUTO_CLEANUP=0) — posprzątaj go też tutaj.
+    rm -rf "/run/simplified-netrole/locks/$NS" 2>/dev/null || true
+
+    local HOST_IFACE="${RESTORED_IFACE:-${IFACE:-}}"
+
+    if [[ -n "${HOST_IFACE:-}" ]] && ip link show "$HOST_IFACE" >/dev/null 2>&1; then
+        echo "[+] Interfejs wrócił do głównego systemu: $HOST_IFACE"
+        leave_iface_disconnected_on_host "$HOST_IFACE"
+    fi
+
+    clean_firefox_locks "$NS"
+}
+
+cleanup_all() {
+    local EXIT_CODE=$?
+
+    if [[ "${CLEANUP_DONE:-0}" == "1" ]]; then
+        exit "$EXIT_CODE"
+    fi
+
+    CLEANUP_DONE=1
+
+    echo
+    echo "[+] Automatyczne sprzątanie..."
+
+    cleanup_one "${ACTIVE_NS:-}" "${ACTIVE_IFACE:-}"
+
+    if [[ -n "${ACTIVE_LOCK_DIR:-}" ]]; then
+        rm -rf "$ACTIVE_LOCK_DIR" 2>/dev/null || true
+    fi
+
+    echo
+    echo "[OK] Cleanup zakończony."
+    echo
+    echo "Stan końcowy:"
+    ip -br link || true
+    echo
+    ip netns list || true
+
+    exit "$EXIT_CODE"
+}
+
+wait_before_cleanup() {
+    echo
+    echo "============================================================"
+    echo "[OK] Środowisko netrole działa."
+    echo
+    echo "Zostaw to okno terminala otwarte."
+    echo "Gdy skończysz pracę, naciśnij ENTER tutaj."
+    echo "Możesz też użyć Ctrl+C — wtedy cleanup też się wykona."
+    echo "============================================================"
+    echo
+
+    read -rp "Naciśnij ENTER, aby zamknąć namespace i posprzątać..."
+}
+
+main() {
+    need_root "$@"
+    validate_netrole_prefix
+    validate_netrole_max_profiles
+    check_firefox_exists
+
+    echo "[+] Użytkownik docelowy: $REAL_USER"
+    echo "[+] HOME użytkownika: $REAL_HOME"
+
+    resolve_user_gui_env
+
+    trap cleanup_all EXIT INT TERM
+
+    allocate_netrole_slot
+    choose_interface_interactively
+
+    echo
+    echo "[+] Używam interfejsu:"
+    echo "    $ACTIVE_IFACE -> $ACTIVE_NS -> Firefox profile: $ACTIVE_PROFILE_DIR"
+
+    setup_ns "$ACTIVE_NS" "$ACTIVE_IFACE"
+
+    # Namespace istnieje — slot jest już chroniony przez netns_exists,
+    # więc zwalniamy lock (ważne zwłaszcza przy AUTO_CLEANUP=0).
+    release_netrole_slot_lock
+
+    launch_firefox "$ACTIVE_NS" "$ACTIVE_PROFILE" "$ACTIVE_PROFILE_DIR" "$ACTIVE_IFACE"
+
+    echo
+    echo "[OK] Gotowe."
+    echo
+    echo "Testy:"
+    echo "  sudo ip netns exec $ACTIVE_NS ip route"
+    echo "  sudo ip netns exec $ACTIVE_NS ping -c 3 192.168.1.1"
+    echo "  sudo ip netns exec $ACTIVE_NS curl ifconfig.me"
+    echo
+    echo "Log Firefoxa:"
+    echo "  /run/simplified-netrole/$ACTIVE_NS/firefox.log"
+
+    if [[ "$AUTO_CLEANUP" == "1" ]]; then
+        wait_before_cleanup
+    else
+        echo
+        echo "[INFO] AUTO_CLEANUP=0, więc namespace zostaje aktywny."
+        echo "Ręczny cleanup:"
+        echo "  sudo usb-netns-clean"
+        trap - EXIT INT TERM
+    fi
+}
+
+_simplified_netrole_usage() {
+    echo "Użycie:"
+    echo "  simplified_netrole"
+    echo "  simplified_netrole run"
+    echo "  simplified_netrole browser PROFILE IFACE [URL]"
+    echo
+    echo "Zmienne:"
+    echo "  NETROLE_PROFILE_PREFIX=usbwan"
+    echo "  NETROLE_MAX_PROFILES=20"
+    echo "  AUTO_CLEANUP=1"
+    echo
+    echo "Przykłady:"
+    echo "  sudo simplified_netrole"
+    echo "  sudo NETROLE_MAX_PROFILES=50 simplified_netrole"
+    echo "  simplified_netrole browser usb-eth-test eth0"
+    echo "  simplified_netrole browser usb-eth-test eth0 https://example.com"
+}
+
+_simplified_netrole_dispatch() {
+    case "${1:-run}" in
+        run)
+            shift || true
+            main "$@"
+            ;;
+
+        browser)
+            shift
+            _simplified_netrole_open_browser "$@"
+            ;;
+        --editconfig|--edit-config)
+            netrole_edit_config
+            ;;
+
+        --config-path|--print-config-path)
+            netrole_config_path
+            exit 0
+            ;;
+
+        --print-gui-env|--gui-env)
+            need_root --print-gui-env
+            resolve_user_gui_env
+            printf 'DISPLAY=%s\n' "$NETROLE_DISPLAY"
+            printf 'WAYLAND_DISPLAY=%s\n' "$NETROLE_WAYLAND_DISPLAY"
+            printf 'XAUTHORITY=%s\n' "$NETROLE_XAUTHORITY"
+            printf 'XDG_RUNTIME_DIR=%s\n' "$NETROLE_XDG_RUNTIME_DIR"
+            printf 'DBUS_SESSION_BUS_ADDRESS=%s\n' "$NETROLE_DBUS_ADDR"
+            printf 'SESSION_TYPE=%s\n' "$NETROLE_SESSION_TYPE"
+            exit 0
+            ;;
+        -h|--help|help)
+            _simplified_netrole_usage
+            ;;
+
+        *)
+            echo "[BŁĄD] Nieznana subkomenda: $1"
+            echo
+            _simplified_netrole_usage
+            exit 1
+            ;;
+    esac
+}
+
+_simplified_netrole_dispatch "$@"

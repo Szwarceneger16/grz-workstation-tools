@@ -1,0 +1,7 @@
+[Unit]
+Description=Check for Yubico Authenticator updates
+ConditionPathExists=%h/.local/share/yubico-authenticator/current
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/yubico-auth check --notify

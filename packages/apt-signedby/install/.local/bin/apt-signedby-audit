@@ -1,0 +1,128 @@
+#!/usr/bin/env python3
+import argparse
+import glob
+import hashlib
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+from apt_signedby_common import parse_deb822_sources, parse_list_file
+
+SOURCES_MAIN = "/etc/apt/sources.list"
+SOURCES_DIR = "/etc/apt/sources.list.d"
+
+IGNORE_SUFFIXES = (
+    ".bak", ".backup", ".old", ".save", ".disabled",
+    ".dpkg-dist", ".dpkg-old", ".ucf-dist", ".ucf-old", "~"
+)
+
+def list_source_files():
+    files = []
+    if os.path.exists(SOURCES_MAIN):
+        files.append(SOURCES_MAIN)
+    if os.path.isdir(SOURCES_DIR):
+        for p in sorted(glob.glob(os.path.join(SOURCES_DIR, "*"))):
+            if any(p.endswith(suf) for suf in IGNORE_SUFFIXES):
+                continue
+            # APT w praktyce czyta .list i .sources (Deb822). Inne nazwy ignorujemy, żeby nie robić false-positive.
+            if p.endswith(".list") or p.endswith(".sources"):
+                files.append(p)
+    return files
+
+def format_issues(issues, limit=30):
+    # deterministyczne sortowanie
+    issues_sorted = sorted(issues, key=lambda x: (str(x[1]), str(x[2]), x[0], str(x[3])))
+    shown = issues_sorted[:limit]
+    lines = []
+    for kind, file, loc, msg in shown:
+        lines.append(f"- {kind}: {file}:{loc}: {msg}")
+    extra = len(issues_sorted) - len(shown)
+    if extra > 0:
+        lines.append(f"... plus {extra} kolejnych")
+    return "\n".join(lines), issues_sorted
+
+def notify(title, body, popup=False):
+    # notify-send (Cinnamon) – urgency critical
+    if shutil_which("notify-send"):
+        subprocess.run(["notify-send", "-u", "critical", "-a", "APT Signed-By Audit", title, body], check=False)
+
+    # zenity popup (czytelne, „czerwone”)
+    if popup and shutil_which("zenity"):
+        # Pango markup – czerwony nagłówek
+        text = f"<span foreground='red'><b>{title}</b></span>\n\n{escape_markup(body)}"
+        subprocess.run(["zenity", "--warning", "--title=APT Signed-By Audit", "--width=900", "--height=520", "--text", text], check=False)
+
+def escape_markup(s: str) -> str:
+    return (s.replace("&", "&amp;")
+             .replace("<", "&lt;")
+             .replace(">", "&gt;"))
+
+def shutil_which(cmd: str) -> bool:
+    from shutil import which
+    return which(cmd) is not None
+
+def state_paths(state_dir: str):
+    sd = Path(state_dir)
+    sd.mkdir(parents=True, exist_ok=True)
+    return sd / "last_hash", sd / "last_ts"
+
+def should_notify(state_dir: str, new_hash: str, cooldown: int):
+    hp, tp = state_paths(state_dir)
+    now = int(time.time())
+
+    old_hash = hp.read_text().strip() if hp.exists() else ""
+    old_ts = int(tp.read_text().strip()) if tp.exists() and tp.read_text().strip().isdigit() else 0
+
+    if new_hash == old_hash and (now - old_ts) < cooldown:
+        return False
+
+    hp.write_text(new_hash)
+    tp.write_text(str(now))
+    return True
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--notify", action="store_true", help="wysyłaj powiadomienia gdy jest problem")
+    ap.add_argument("--popup", action="store_true", help="dodatkowo pokaż okno (zenity) gdy jest problem")
+    ap.add_argument("--cooldown-secs", type=int, default=120, help="minimalny odstęp (sekundy) między identycznymi alertami")
+    ap.add_argument("--state-dir", default=str(Path.home() / ".cache" / "apt-signedby-audit"), help="katalog na stan (hash/cooldown)")
+    args = ap.parse_args()
+
+    files = list_source_files()
+
+    issues = []
+    for f in files:
+        try:
+            if f.endswith(".sources"):
+                issues.extend(parse_deb822_sources(f))
+            else:
+                issues.extend(parse_list_file(f))
+        except Exception as e:
+            issues.append(("READ_ERROR", f, "?", f"nie udało się przeanalizować: {e}"))
+
+    report, issues_sorted = format_issues(issues)
+
+    if issues_sorted:
+        title = f"APT repo problem: {len(issues_sorted)} issue(s) z signed-by/Signed-By"
+        body = report
+
+        # hash + cooldown (żeby nie spamować)
+        digest = hashlib.sha256(report.encode("utf-8", errors="ignore")).hexdigest()
+        do = should_notify(args.state_dir, digest, args.cooldown_secs) if args.notify or args.popup else True
+
+        # terminal czerwony (jeśli uruchamiasz ręcznie)
+        sys.stderr.write("\033[31m" + title + "\033[0m\n" + body + "\n")
+
+        if do and (args.notify or args.popup):
+            notify(title, body, popup=args.popup)
+
+        sys.exit(2)
+
+    else:
+        print("OK: wszystkie aktywne wpisy APT mają signed-by/Signed-By i nie widzę niebezpiecznych opcji.")
+        sys.exit(0)
+
+if __name__ == "__main__":
+    main()

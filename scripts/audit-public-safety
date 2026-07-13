@@ -77,7 +77,12 @@ done
 typeset -a install_dirs
 install_dirs=(packages/*/install(N/))
 if (( ${#install_dirs} )); then
-  word_pattern='password|passwd|secret|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret'
+  # Generic secret-ish words in shipped runtime code. `passwd` is matched only
+  # as a value assignment (`passwd=`, `passwd :`, quoted keys like `"passwd":`)
+  # so the Unix passwd database and user-resolution idioms (`getent passwd`,
+  # `/etc/passwd`, a `passwd_entry` variable) do not trip the scan, while a
+  # real `db_passwd=...` or `"db_passwd": "..."` still does.
+  word_pattern="password|passwd[\"']?[[:space:]]*[:=]|secret|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret"
   typeset -a word_hits
   word_hits=(${(f)"$(scan -i "$word_pattern" "${install_dirs[@]}")"})
   word_hits=(${word_hits:#*.example})

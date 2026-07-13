@@ -1,0 +1,361 @@
+#!/usr/bin/env python3
+import argparse, os, re, sys, time, struct, select, subprocess
+import ctypes
+from pathlib import Path
+from datetime import datetime
+
+from apt_signedby_common import (
+    INSECURE_OPTS,
+    issue_to_violation,
+    parse_list_file_with_entries,
+    parse_sources_file_with_entries,
+)
+
+# --- Config: what we consider "minimal official repos" for Mint 22.3 (Zena) ---
+REQUIRED_MINT = {
+    "suite": "zena",
+    "host_substr": "packages.linuxmint.com",
+    "components": {"main", "upstream", "import", "backport"},
+    "signed_by_hint": "linuxmint",
+}
+REQUIRED_UBUNTU_SUITES = {
+    "noble": {"main", "restricted", "universe", "multiverse"},
+    "noble-updates": {"main", "restricted", "universe", "multiverse"},
+    "noble-backports": {"main", "restricted", "universe", "multiverse"},
+    "noble-security": {"main", "restricted", "universe", "multiverse"},
+}
+UBUNTU_SIGNED_BY_HINT = "ubuntu-archive-keyring.gpg"
+
+WATCH_DIRS = [
+    "/etc/apt",
+    "/etc/apt/sources.list.d",
+]
+WATCH_FILES = []
+
+# We only trigger audit notifications for these file patterns
+WATCH_NAME_RE = re.compile(r"(?:^sources\.list$|\.list$|\.sources$)", re.IGNORECASE)
+
+# --- Helpers ---
+def now_str():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+def _os_release():
+    data = {}
+    try:
+        with open("/etc/os-release") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                data[k] = v.strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return data
+
+def official_minimum_applies():
+    """The hardcoded 'official minimum repos' set is specific to Linux Mint 22.3
+    (zena, noble base). Enforce it only there; on any other distro/version we have no
+    baseline and must not raise a false-critical 'missing official repo' alarm."""
+    osr = _os_release()
+    return osr.get("ID") == "linuxmint" and osr.get("VERSION_CODENAME") == "zena"
+
+def notify(summary: str, body: str, critical: bool):
+    # Cinnamon will render critical notifications more prominently (often red).
+    args = [
+        "notify-send",
+        "--app-name=apt-audit",
+        "--urgency=critical" if critical else "--urgency=normal",
+        "--icon=dialog-warning" if critical else "--icon=dialog-information",
+        summary,
+        body,
+    ]
+    try:
+        subprocess.run(args, check=False)
+    except FileNotFoundError:
+        # Fallback: at least log to stdout for journalctl
+        print(f"[notify-missing] {summary}\n{body}", flush=True)
+
+def parse_list_file(path: Path):
+    """Parse traditional .list lines and return entries + violations."""
+    try:
+        entries, issues = parse_list_file_with_entries(path)
+    except Exception:
+        return [], [(str(path), 0, "nie mogę odczytać pliku", "")]
+    return entries, [issue_to_violation(issue) for issue in issues]
+
+
+def parse_sources_file(path: Path):
+    """Parse Deb822 .sources and return entries + violations (Enabled: no respected)."""
+    try:
+        entries, issues = parse_sources_file_with_entries(path)
+    except Exception:
+        return [], [(str(path), 0, "nie mogę odczytać pliku", "")]
+    return entries, [issue_to_violation(issue) for issue in issues]
+
+
+def collect_entries():
+    """Collect entries from /etc/apt sources."""
+    entries = []
+    violations = []
+
+    # sources.list
+    sl = Path("/etc/apt/sources.list")
+    if sl.exists():
+        e, v = parse_list_file(sl)
+        entries.extend(e)
+        violations.extend(v)
+
+    # sources.list.d
+    sdir = Path("/etc/apt/sources.list.d")
+    if sdir.exists():
+        for p in sorted(sdir.iterdir()):
+            if p.is_dir():
+                continue
+            if p.suffix.lower() == ".list":
+                e, v = parse_list_file(p)
+                entries.extend(e)
+                violations.extend(v)
+            elif p.suffix.lower() == ".sources":
+                e, v = parse_sources_file(p)
+                entries.extend(e)
+                violations.extend(v)
+
+    # Active entries only
+    entries = [e for e in entries if e.get("enabled", True)]
+    return entries, violations
+
+def check_official_minimum(entries):
+    """Return list of missing/issue strings for official repo set."""
+    issues = []
+
+    # deb-src-only entries don't provide binary packages; ignore them here
+    # so a source-only mirror can't satisfy the "official repos present" check.
+    binary_entries = [e for e in entries if e.get("type", "deb") == "deb"]
+
+    # Mint repo presence + components (union across entries, same suite/host/keyring)
+    mint_components = set()
+    mint_seen = False
+    for e in binary_entries:
+        if e["suite"] != REQUIRED_MINT["suite"]:
+            continue
+        if REQUIRED_MINT["host_substr"] not in (e["uri"] or ""):
+            continue
+        if REQUIRED_MINT["signed_by_hint"] not in (e["signed_by"] or "").lower():
+            continue
+        mint_seen = True
+        mint_components |= set(e["components"])
+
+    if not REQUIRED_MINT["components"].issubset(mint_components):
+        missing = sorted(REQUIRED_MINT["components"] - mint_components)
+        if not mint_seen:
+            issues.append(
+                f"Brak minimalnego repo Mint: {REQUIRED_MINT['host_substr']} {REQUIRED_MINT['suite']} "
+                f"({', '.join(sorted(REQUIRED_MINT['components']))}) z Signed-By zawierającym '{REQUIRED_MINT['signed_by_hint']}'."
+            )
+        else:
+            issues.append(f"Repo Mint {REQUIRED_MINT['suite']}: brakuje komponentów: {', '.join(missing)}.")
+
+    # Ubuntu suites presence; allow any mirror URI, but require ubuntu keyring Signed-By hint
+    seen = {s: set() for s in REQUIRED_UBUNTU_SUITES.keys()}
+    for e in binary_entries:
+        s = e["suite"]
+        if s not in REQUIRED_UBUNTU_SUITES:
+            continue
+        if UBUNTU_SIGNED_BY_HINT not in (e["signed_by"] or ""):
+            # if signed-by doesn't look like ubuntu archive keyring, don't count as "official"
+            continue
+        seen[s] |= set(e["components"])
+
+    for suite, need_comps in REQUIRED_UBUNTU_SUITES.items():
+        if not need_comps.issubset(seen.get(suite, set())):
+            missing = sorted(list(need_comps - seen.get(suite, set())))
+            if not seen.get(suite):
+                issues.append(f"Brak repo Ubuntu dla: {suite} (wymagane: {', '.join(sorted(need_comps))}).")
+            else:
+                issues.append(f"Repo Ubuntu {suite}: brakuje komponentów: {', '.join(missing)}.")
+
+    return issues
+
+def format_violations(violations, max_lines=8):
+    if not violations:
+        return f"Signed-By: OK (wszędzie jest signed-by/Signed-By i brak niebezpiecznych opcji: {', '.join(INSECURE_OPTS)})."
+    out = ["Signed-By: PROBLEM:"]
+    for (f, ln, reason, line) in violations[:max_lines]:
+        where = f"{f}:{ln}" if ln else f
+        snippet = (line.strip()[:160] + ("…" if len(line.strip()) > 160 else "")) if line else ""
+        if snippet:
+            out.append(f"- {where}: {reason} | {snippet}")
+        else:
+            out.append(f"- {where}: {reason}")
+    if len(violations) > max_lines:
+        out.append(f"(… i jeszcze {len(violations)-max_lines} pozycji)")
+    return "\n".join(out)
+
+def audit(trigger: str):
+    entries, violations = collect_entries()
+    applies = official_minimum_applies()
+    official_issues = check_official_minimum(entries) if applies else []
+
+    critical = bool(violations or official_issues)
+
+    # Build message
+    lines = []
+    lines.append(f"Czas: {now_str()}")
+    lines.append(f"Trigger: {trigger}")
+    lines.append("")
+    lines.append(format_violations(violations))
+    lines.append("")
+    if official_issues:
+        lines.append("Repo oficjalne (minimalny zestaw): PROBLEM:")
+        for s in official_issues[:8]:
+            lines.append(f"- {s}")
+        if len(official_issues) > 8:
+            lines.append(f"(… i jeszcze {len(official_issues)-8} pozycji)")
+    elif applies:
+        lines.append("Repo oficjalne (minimalny zestaw): OK (Mint zena + Ubuntu noble{,-updates,-backports,-security}).")
+    else:
+        lines.append("Repo oficjalne (minimalny zestaw): pominięto (dystrybucja inna niż Mint 22.3 zena).")
+
+    summary = "APT audit: PROBLEM" if critical else "APT audit: OK"
+    notify(summary, "\n".join(lines), critical=critical)
+
+    # Also log to journal
+    print(f"[{now_str()}] {summary} | {trigger}", flush=True)
+    if critical:
+        print("\n".join(lines), flush=True)
+
+# --- inotify watcher (no external deps) ---
+libc = ctypes.CDLL("libc.so.6", use_errno=True)
+IN_NONBLOCK = 0o0004000
+IN_CLOEXEC  = 0o2000000
+
+IN_ACCESS        = 0x00000001
+IN_MODIFY        = 0x00000002
+IN_ATTRIB        = 0x00000004
+IN_CLOSE_WRITE   = 0x00000008
+IN_MOVED_FROM    = 0x00000040
+IN_MOVED_TO      = 0x00000080
+IN_CREATE        = 0x00000100
+IN_DELETE        = 0x00000200
+IN_DELETE_SELF   = 0x00000400
+IN_MOVE_SELF     = 0x00000800
+IN_IGNORED       = 0x00008000
+
+WATCH_MASK = (
+    IN_MODIFY | IN_ATTRIB | IN_CLOSE_WRITE |
+    IN_MOVED_FROM | IN_MOVED_TO | IN_CREATE | IN_DELETE |
+    IN_DELETE_SELF | IN_MOVE_SELF
+)
+
+def inotify_init():
+    fd = libc.inotify_init1(IN_NONBLOCK | IN_CLOEXEC)
+    if fd < 0:
+        err = ctypes.get_errno()
+        raise OSError(err, os.strerror(err))
+    return fd
+
+def inotify_add(fd, path):
+    wd = libc.inotify_add_watch(fd, path.encode("utf-8"), WATCH_MASK)
+    if wd < 0:
+        err = ctypes.get_errno()
+        raise OSError(err, os.strerror(err))
+    return wd
+
+def run_watch():
+    # Initial audit on login/start
+    audit("startup/login")
+
+    fd = inotify_init()
+    wd_map = {}
+
+    # Watch directories
+    for d in WATCH_DIRS:
+        if os.path.isdir(d):
+            wd_map[inotify_add(fd, d)] = d
+
+    # Watch specific files
+    for f in WATCH_FILES:
+        if os.path.exists(f):
+            wd_map[inotify_add(fd, f)] = f
+
+    if not wd_map:
+        notify("APT audit: PROBLEM", f"{now_str()}\nNie udało się założyć watchy na /etc/apt (brak ścieżek?).", critical=True)
+        sys.exit(1)
+
+    pending = set()
+    deadline = None
+
+    EVENT_STRUCT = struct.Struct("iIII")  # wd, mask, cookie, len
+
+    while True:
+        timeout = None
+        if deadline is not None:
+            timeout = max(0.0, deadline - time.time())
+
+        r, _, _ = select.select([fd], [], [], timeout)
+
+        if r:
+            try:
+                data = os.read(fd, 4096)
+            except BlockingIOError:
+                data = b""
+
+            off = 0
+            while off + EVENT_STRUCT.size <= len(data):
+                wd, mask, cookie, name_len = EVENT_STRUCT.unpack_from(data, off)
+                off += EVENT_STRUCT.size
+                name = b""
+                if name_len:
+                    name = data[off:off+name_len].split(b"\0", 1)[0]
+                    off += name_len
+                base = wd_map.get(wd, "")
+                fname = name.decode("utf-8", "replace") if name else ""
+                full = base
+                if os.path.isdir(base) and fname:
+                    full = os.path.join(base, fname)
+
+                # Filter only relevant file patterns
+                bn = os.path.basename(full)
+                if WATCH_NAME_RE.search(bn):
+                    pending.add(full)
+                    deadline = time.time() + 1.0  # debounce window
+
+                # A watched directory itself was deleted, replaced, or
+                # recreated - its contents may have changed wholesale even
+                # though this event's basename doesn't match WATCH_NAME_RE.
+                if full in WATCH_DIRS and (mask & (IN_CREATE | IN_DELETE | IN_DELETE_SELF | IN_MOVED_FROM | IN_MOVED_TO | IN_MOVE_SELF)):
+                    pending.add(full)
+                    deadline = time.time() + 1.0  # debounce window
+
+                # A configured watch directory (e.g. sources.list.d) just
+                # appeared but isn't watched yet (missing at startup, or
+                # deleted+recreated) - re-arm it so its own child events fire.
+                if full in WATCH_DIRS and full not in wd_map.values() and os.path.isdir(full):
+                    try:
+                        wd_map[inotify_add(fd, full)] = full
+                    except OSError:
+                        pass
+
+                # Kernel auto-removed this watch (target deleted/moved/unmounted);
+                # drop it so a later recycled wd number can't be mislabeled.
+                if mask & IN_IGNORED:
+                    wd_map.pop(wd, None)
+
+        else:
+            # timeout fired -> run audit if pending
+            if deadline is not None and time.time() >= deadline:
+                trig = ", ".join(sorted(list(pending))[:4])
+                if len(pending) > 4:
+                    trig += f" (… +{len(pending)-4})"
+                audit(f"zmiana plików APT: {trig}")
+                pending.clear()
+                deadline = None
+
+if __name__ == "__main__":
+    argparse.ArgumentParser(description="Watcher zmian w konfiguracji APT z automatycznym audytem.").parse_args()
+    try:
+        run_watch()
+    except Exception as e:
+        notify("APT audit: PROBLEM", f"{now_str()}\nWyjątek watchera: {e}", critical=True)
+        raise

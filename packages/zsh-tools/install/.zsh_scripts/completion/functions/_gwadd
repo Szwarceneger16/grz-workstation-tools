@@ -1,0 +1,10 @@
+#compdef gwadd
+
+_gwadd() {
+  autoload -Uz _comp_all_branches
+  _arguments -S \
+    '(-h --help)'{-h,--help}'[pokaż help]' \
+    '1:branch:_comp_all_branches'
+}
+
+_gwadd "$@"

@@ -1,0 +1,14 @@
+#!/usr/bin/env xdg-open
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=MX DPI Wheel Runtime
+Comment=Uruchom overlay MX DPI Wheel po zalogowaniu
+Exec=/bin/sh -c "cd && exec .local/bin/mx_dpi_wheel.py --run"
+Icon=input-mouse
+Terminal=false
+Categories=Utility;
+X-GNOME-Autostart-enabled=true
+StartupNotify=false
+Hidden=false
+NoDisplay=true

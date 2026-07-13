@@ -1,0 +1,12 @@
+[Unit]
+Description=Run Yubico Authenticator update checker
+
+[Timer]
+OnStartupSec=3m
+OnUnitActiveSec=1d
+RandomizedDelaySec=30m
+Persistent=true
+Unit=yubico-auth-check.service
+
+[Install]
+WantedBy=timers.target

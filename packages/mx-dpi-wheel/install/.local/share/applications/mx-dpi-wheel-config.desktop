@@ -1,0 +1,12 @@
+#!/usr/bin/env xdg-open
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=MX DPI Wheel Configuration
+Comment=Konfiguracja poziomow DPI dla MX DPI Wheel
+Exec=/bin/sh -c "cd && exec .local/bin/mx_dpi_wheel.py --gui"
+Icon=input-mouse
+Terminal=false
+Categories=Settings;
+StartupNotify=true
+NoDisplay=false
