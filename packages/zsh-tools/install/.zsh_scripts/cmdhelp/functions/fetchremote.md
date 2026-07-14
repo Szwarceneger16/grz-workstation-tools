@@ -1,36 +1,33 @@
 # fetchremote
 
-`fetchremote` — pobiera branch z `origin`, tworząc albo aktualizując lokalny branch o tej samej nazwie.
-
-Uruchamia:
-
-```bash
-git fetch origin <branch>:<branch>
-```
+`fetchremote` — zachowana nazwa zgodnościowa dla `fr`.
 
 ## Użycie
 
 ```bash
 fetchremote <branch>
-fetchremote [-h|--help]
+fetchremote -h
+fetchremote --help
 ```
-
-## Opcje
-
-- `<branch>` — nazwa brancha do pobrania z `origin`
-- `-h`, `--help` — pokaż pomoc
 
 ## Co robi
 
-Używane przez `gwfr` jako pierwszy krok (pobranie brancha), przed `gwadd`.
+Wywołuje:
 
-## Efekt końcowy
+```bash
+fr <branch>
+```
 
-Masz lokalny branch o tej samej nazwie, gotowy do `gwadd`/`checkout`/`worktree`.
+Pobiera branch z `origin` do lokalnego brancha o tej samej nazwie, aktualizuje `origin/<branch>` i ustawia upstream lokalnego brancha.
 
-## Przykłady
+Nowe skrypty i funkcje powinny używać krótszej nazwy:
+
+```bash
+fr <branch>
+```
+
+## Przykład
 
 ```bash
 fetchremote feature/foo
-fetchremote --help
 ```
