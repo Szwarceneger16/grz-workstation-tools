@@ -1,10 +1,10 @@
-#compdef gwfr
+#compdef fetchremote
 
-_gwfr() {
+_fetchremote() {
   autoload -Uz _comp_origin_branches
   _arguments -S \
     '(-h --help)'{-h,--help}'[pokaż help]' \
     '1:branch:_comp_origin_branches'
 }
 
-_gwfr "$@"
+_fetchremote "$@"

@@ -1,31 +1,47 @@
 # gwfr
 
-Worktree fetch remote": fetch z remote + dodanie worktree
+`gwfr` — pobiera branch z `origin`, tworzy śledzący go lokalny branch i od razu dodaje dla niego worktree.
+
+Nazwa rozwija się jako **git worktree fetch remote**.
 
 ## Użycie
 
 ```bash
- gwfr <branch>
-gwfr [-h|--help]
+gwfr <branch>
+gwfr -h
+gwfr --help
 ```
-
-## Opcje
-
-- `-h`, `--help` — pokaż pomoc
 
 ## Co robi
 
-`gwfr` woła po kolei:
-- `fetchremote <branch>` — pobiera branch z `origin`
-- `gwadd <branch>` — dodaje worktree dla tego brancha
+`gwfr` wywołuje kolejno:
 
-## Efekt końcowy
+1. `fr <branch>` — pobiera branch, aktualizuje `origin/<branch>` i ustawia upstream lokalnego brancha;
+2. `gwadd <branch>` — tworzy worktree dla lokalnego brancha.
 
-Po jednej komendzie masz pobranego brancha i worktree w ~/.worktree.
+Worktree powstaje pod:
+
+```text
+~/repos/.worktree/<branch>
+```
+
+Dodatkowe zachowanie, takie jak linkowanie `.env.lint.local`, jest dziedziczone z `gwadd`.
 
 ## Przykłady
 
 ```bash
-gwfr feature/foo #wezmie branch z origin
-gwfr --help
+gwfr feature/foo
+gwfr claude/openwrt-restore-safety-we9fh9
 ```
+
+Dla brancha zawierającego `/` powstanie odpowiadająca mu zagnieżdżona ścieżka, na przykład:
+
+```text
+~/repos/.worktree/claude/openwrt-restore-safety-we9fh9
+```
+
+## Uwagi
+
+- Branch musi istnieć na `origin`.
+- `gwfr` nie przechodzi automatycznie do utworzonego katalogu.
+- Jeśli branch jest już checkoutowany w innym worktree, Git odmówi utworzenia kolejnego worktree dla tego samego lokalnego brancha.
