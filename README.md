@@ -105,15 +105,15 @@ run only when `STOW_TARGET` resolves to `$HOME`.
 
 ## Package hooks (user layer only)
 
-The privileged layer is fully declarative — there are **no system hooks**. For custom
-verification logic that can't be expressed as a manifest, a package may ship a `verify.hook.sh`
-hook, which runs after stow-link verification and user unit verification.
+The privileged layer is fully declarative — there are **no system hooks**. The allowed hooks are
+escape hatches for steps that can't be expressed as a manifest:
 
 | File in `packages/<name>/` | When it runs |
 |---|---|
+| `install.hook.sh` | `./run.sh install <name>`, after stow (idempotent finishing step) |
 | `verify.hook.sh` | `./run.sh verify <name>`, after stow-link and user unit verification |
 
-The hook must be executable, run as the normal user (**no `sudo`**), be idempotent, and exit
+Each hook must be executable, run as the normal user (**no `sudo`**), be idempotent, and exit
 non-zero to signal failure. It receives: `GRZ_REPO_ROOT`, `GRZ_PACKAGE`, `STOW_TARGET`.
 Any other `*.hook.sh` is rejected by `check-repo`.
 
@@ -134,7 +134,14 @@ Add the package name to `manifests/ignore-all-install.txt` (one per line).
 
 ## Bootstrap
 
-Copy the relevant snippet from `bootstrap/` into your `~/.zshrc` / `~/.profile` to load rc fragments from `~/.config/zsh/rc.d/`.
+Installing `zsh-tools` runs its `install.hook.sh`, which idempotently appends a marked loader
+block to `~/.zshrc` / `~/.profile` (creating them if missing) so `~/.config/zsh/rc.d/*.zsh` and
+`~/.config/profile.d/*.sh` are sourced. The repo never owns or rewrites those files — it only
+adds the block, and skips if a loader loop is already present. So a clean `./run.sh install
+zsh-tools` is self-sufficient; no manual step is needed.
+
+The snippets under `bootstrap/` are the same block for reference or manual setup. If you pasted
+an older snippet by hand, the hook detects the existing loop and will not duplicate it.
 
 ## Third-party components
 

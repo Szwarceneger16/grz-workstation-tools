@@ -18,7 +18,7 @@ repo_root="${0:A:h:h}"
 packages_dir="$repo_root/packages"
 
 errors=0
-allowed_hooks=(verify.hook.sh)
+allowed_hooks=(install.hook.sh verify.hook.sh)
 protected_paths_file="$repo_root/manifests/protected-system-paths.txt"
 typeset -a protected_paths
 protected_paths=()
@@ -568,6 +568,22 @@ check_user_layer() {
   done
 }
 
+# Shell startup files are never owned by any package (AGENTS.md): rejects a
+# package shipping install/.zshrc or install/.profile, which stow would
+# otherwise install as the user's ~/.zshrc or ~/.profile, silently bypassing
+# the modular rc.d/profile.d bootstrap (scripts/ensure-rcd-loaders).
+check_shell_startup_files() {
+  local package="$1"
+  local install_dir="$packages_dir/$package/install"
+  local rel
+
+  for rel in .zshrc .profile; do
+    if [[ -e "$install_dir/$rel" || -L "$install_dir/$rel" ]]; then
+      err "$package: must not ship install/$rel: shell startup files are not owned by any package (see AGENTS.md)"
+    fi
+  done
+}
+
 typeset -a packages_to_check
 packages_to_check=()
 (( $# > 0 )) && [[ "$1" == "--" ]] && shift
@@ -589,6 +605,7 @@ for package in "${packages_to_check[@]}"; do
   check_hooks "$package"
   check_system_layer "$package"
   check_user_layer "$package"
+  check_shell_startup_files "$package"
 done
 
 if (( errors > 0 )); then

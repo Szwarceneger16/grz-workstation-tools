@@ -1,4 +1,9 @@
 # git worktree remove (by branch name)
+# OMZ's git plugin defines `gwtrm` as a bare `git worktree remove` alias
+# (caller supplies a worktree PATH); unalias it so this function (looks up
+# the worktree path from a BRANCH name instead) wins instead of tripping
+# zsh's "defining function based on alias" parser error.
+(( $+aliases[gwtrm] )) && unalias gwtrm
 gwtrm() {
     if [[ "$1" == "-h" || "$1" == "--help" ]]; then
       cmdhelp "${funcstack[1]}"

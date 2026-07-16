@@ -1,4 +1,9 @@
 # git worktree add (path-based; branch name is derived from the path)
+# OMZ's git plugin defines `gwta` as a bare `git worktree add` alias (caller
+# supplies path AND branch explicitly); unalias it so this richer function
+# (derives branch from path, creates local/tracking branch as needed) wins
+# instead of tripping zsh's "defining function based on alias" parser error.
+(( $+aliases[gwta] )) && unalias gwta
 gwta() {
     if [[ "$1" == "-h" || "$1" == "--help" ]]; then
       cmdhelp "${funcstack[1]}"

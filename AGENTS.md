@@ -141,16 +141,23 @@ do not add per-package shell code for activate/deactivate.
 
 ## Package hook rules (user layer only)
 
-The only remaining hook is `verify.hook.sh` — an escape hatch for custom verification logic
-that can't be expressed as a manifest. `check-repo` rejects any other `*.hook.sh`.
+The allowed hooks are `install.hook.sh` and `verify.hook.sh` — escape hatches for steps that
+can't be expressed as a manifest. `check-repo` rejects any other `*.hook.sh`.
 
 | Hook (in `packages/<pkg>/`) | Trigger |
 |---|---|
+| `install.hook.sh` | `./run.sh install <pkg>`, after stow (idempotent finishing step) |
 | `verify.hook.sh` | `./run.sh verify <pkg>`, after stow-link and user unit verification |
 
 Rules: executable; run as the normal user with **no `sudo`**; idempotent; exit non-zero to abort;
-must live in the package root (never under `install/`). Hook receives `GRZ_REPO_ROOT`,
+must live in the package root (never under `install/`). Hooks receive `GRZ_REPO_ROOT`,
 `GRZ_PACKAGE`, `STOW_TARGET`. Do not run the hook to inspect it — read it.
+
+Because the repo never owns `~/.zshrc` / `~/.profile`, `zsh-tools`'s `install.hook.sh` appends
+a marked loader block to them (via `scripts/ensure-rcd-loaders`) so `~/.config/zsh/rc.d/*.zsh`
+and `~/.config/profile.d/*.sh` are sourced — idempotently, without rewriting the user's config.
+The block/sentinels are byte-identical to the private-consumer counterpart so both repos
+converge on one loop. `verify.hook.sh` checks the same, read-only.
 
 ## Shell script rules
 

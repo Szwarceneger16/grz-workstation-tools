@@ -1,0 +1,159 @@
+#!/usr/bin/env zsh
+emulate -L zsh
+set -euo pipefail
+script_name="${0:t}"
+
+# Idempotently make sure ~/.zshrc sources ~/.config/zsh/rc.d/*.zsh and ~/.profile
+# sources ~/.config/profile.d/*.sh. This is how the shell bootstrap works WITHOUT
+# any package owning ~/.zshrc or ~/.profile: we only append a clearly-marked
+# managed block, never rewrite the user's own content.
+#
+# The managed block and its sentinels are intentionally repo-neutral and byte
+# identical to the grz-workstation-tools counterpart, so whichever repo installs first
+# adds the block and the other detects it and does nothing.
+#
+# Usage:
+#   ensure-rcd-loaders [--check] [--verbose]
+# Env:
+#   STOW_TARGET   home directory to operate on (default: $HOME)
+
+usage() {
+  print -u2 -- "usage: $script_name [--check] [--verbose]"
+}
+
+check_only=0
+verbose=0
+while (( $# > 0 )); do
+  case "$1" in
+    --check) check_only=1 ;;
+    --verbose|-v) verbose=1 ;;
+    -h|--help) usage; exit 0 ;;
+    *) print -u2 -- "$script_name: unknown option: $1"; usage; exit 64 ;;
+  esac
+  shift
+done
+
+target="${STOW_TARGET:-$HOME}"
+
+vprint() { (( verbose )) && print -- "$@"; return 0; }
+
+# --- managed blocks (keep the sentinel lines identical across repos) ----------
+
+# Detection matches either our own sentinel line (an already-installed block,
+# any variant — see profile_block_with_bashrc below) or an actual for/source
+# loop header globbing the rc.d/profile.d directory — not a bare mention of the
+# path. A commented-out old snippet, an echo, or a variable that merely names
+# the path does NOT count as present (otherwise install would report success
+# but never source the fragments).
+zsh_detect='(^# >>> zsh rc\.d loader \(managed\) >>>$)|(^[[:space:]]*for[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]+in[[:space:]].*\.config/zsh/rc\.d/\*\.zsh)'
+zsh_block=$'# >>> zsh rc.d loader (managed) >>>\n# Sources ~/.config/zsh/rc.d/*.zsh so packages can drop rc fragments there.\n# Managed by grz-workstation-tools / shell-bootstrap. Safe to remove this block.\nif [[ -d "$HOME/.config/zsh/rc.d" ]]; then\n  for zsh_rc_file in "$HOME"/.config/zsh/rc.d/*.zsh(N); do\n    source "$zsh_rc_file"\n  done\nfi\n# <<< zsh rc.d loader (managed) <<<'
+# Canonical (readlink -f) suffix of a legacy repo-owned stow symlink for this
+# file (either repo's packages/<pkg>/install/<file> layout). Captures the
+# repo-root prefix in $match[1] so ensure_loader can verify it's one of the
+# known sibling repos (see repo_marker_file below) before auto-replacing.
+zsh_legacy_target='^(.*)/packages/[^/]+/install/\.zshrc$'
+
+# Recognized sibling repos carry this marker file at their root; a dangling
+# symlink is only auto-replaced if it resolves under a directory bearing one
+# of these identities (see ensure_loader). Without this, any stow-like repo
+# using the same packages/<pkg>/install/<file> convention would match and get
+# its dangling symlink deleted, which is not ours to decide.
+repo_marker_file='.rcd-loader-repo-id'
+known_repo_ids=(grz-workstation-tools private-consumer)
+
+profile_detect='(^# >>> profile\.d loader \(managed\) >>>$)|(^[[:space:]]*for[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]+in[[:space:]].*\.config/profile\.d/\*\.sh)'
+# Plain variant: appended to a pre-existing ~/.profile (the common case — most
+# systems' default ~/.profile already sources ~/.bashrc itself, so adding
+# another copy here would source it twice at every login).
+profile_block_loop_only=$'# >>> profile.d loader (managed) >>>\n# Sources ~/.config/profile.d/*.sh at login. Managed by grz-workstation-tools /\n# shell-bootstrap. Safe to remove this block.\nif [ -d "$HOME/.config/profile.d" ]; then\n  for profile_file in "$HOME"/.config/profile.d/*.sh; do\n    [ -r "$profile_file" ] && . "$profile_file"\n  done\nfi\n# <<< profile.d loader (managed) <<<'
+# With-bashrc variant: used only when ~/.profile is being freshly created (no
+# pre-existing file that would already source ~/.bashrc on its own), so Bash
+# login shells keep working. Same sentinel as the loop-only variant, so either
+# one satisfies profile_detect above.
+profile_block_with_bashrc=$'# >>> profile.d loader (managed) >>>\n# Sources ~/.bashrc for Bash login shells (this file is being freshly created,\n# so unlike a pre-existing ~/.profile it would otherwise never do this) and\n# ~/.config/profile.d/*.sh at login. Managed by grz-workstation-tools / mint\n# shell-bootstrap. Safe to remove this block.\nif [ -n "$BASH_VERSION" ]; then\n  if [ -f "$HOME/.bashrc" ]; then\n    . "$HOME/.bashrc"\n  fi\nfi\nif [ -d "$HOME/.config/profile.d" ]; then\n  for profile_file in "$HOME"/.config/profile.d/*.sh; do\n    [ -r "$profile_file" ] && . "$profile_file"\n  done\nfi\n# <<< profile.d loader (managed) <<<'
+profile_legacy_target='^(.*)/packages/[^/]+/install/\.profile$'
+
+# ensure_loader <file> <detect> <block> <label> <legacy_target>
+# returns 0 if already present or successfully added; sets missing_count in --check.
+integer missing=0
+
+ensure_loader() {
+  local file="$1" detect="$2" block="$3" label="$4" legacy_target="$5"
+  local resolved candidate_root marker_id known_id recognized
+
+  # Replace only a DANGLING symlink whose canonical target still looks like a
+  # legacy repo-owned stow link (packages/<pkg>/install/<file>, either repo's
+  # layout) AND whose candidate repo root carries a recognized identity marker
+  # (repo_marker_file). A symlink that still resolves is the user's own,
+  # dotfiles-managed file: leave the link and append to its target below
+  # (grep/append follow the symlink), so we never orphan their config. A
+  # dangling symlink to anything else — including a shape match under a
+  # directory we can't identify as a known sibling repo — is not ours to
+  # guess about — refuse instead of deleting it.
+  if [[ -L "$file" && ! -e "$file" ]]; then
+    resolved="$(readlink -f -- "$file" 2>/dev/null)" || resolved=""
+    recognized=0
+    if [[ -n "$resolved" && "$resolved" =~ $legacy_target ]]; then
+      candidate_root="${match[1]}"
+      if [[ -f "$candidate_root/$repo_marker_file" ]]; then
+        marker_id="$(<"$candidate_root/$repo_marker_file")"
+        for known_id in "${known_repo_ids[@]}"; do
+          [[ "$marker_id" == "$known_id" ]] && { recognized=1; break }
+        done
+      fi
+    fi
+    if (( recognized )); then
+      if (( check_only )); then
+        vprint "  $label: $file is a dangling legacy stow symlink — would replace with a real file"
+        missing=$(( missing + 1 ))
+        return 0
+      fi
+      vprint "  $label: replacing dangling legacy stow symlink $file -> $resolved"
+      rm -f "$file"
+    else
+      print -u2 -- "$script_name: $label: $file is a dangling symlink to an unrecognized target${resolved:+" ($resolved)"} — refusing to delete it automatically."
+      print -u2 -- "$script_name: inspect it (ls -la -- \"$file\"); if it is safe to remove, delete it yourself and re-run."
+      exit 1
+    fi
+  fi
+
+  if [[ -f "$file" ]] && grep -Eq -- "$detect" "$file"; then
+    vprint "  $label: already present in $file"
+    return 0
+  fi
+
+  if (( check_only )); then
+    vprint "  $label: MISSING from $file"
+    missing=$(( missing + 1 ))
+    return 0
+  fi
+
+  # Append the managed block, keeping a blank line before it when the file has
+  # existing content that does not already end with a newline.
+  if [[ -f "$file" && -s "$file" ]]; then
+    [[ "$(tail -c1 "$file")" == "" ]] || print -- "" >> "$file"
+    print -- "" >> "$file"
+  fi
+  print -r -- "$block" >> "$file"
+  vprint "  $label: appended managed block to $file"
+}
+
+# Only a freshly-created ~/.profile (no pre-existing non-empty file) gets the
+# with-bashrc variant — see profile_block_with_bashrc above.
+profile_file="$target/.profile"
+if [[ -f "$profile_file" && -s "$profile_file" ]]; then
+  profile_block="$profile_block_loop_only"
+else
+  profile_block="$profile_block_with_bashrc"
+fi
+
+ensure_loader "$target/.zshrc" "$zsh_detect"     "$zsh_block"     "zsh rc.d"  "$zsh_legacy_target"
+ensure_loader "$profile_file"  "$profile_detect" "$profile_block" "profile.d" "$profile_legacy_target"
+
+if (( check_only )); then
+  if (( missing > 0 )); then
+    print -u2 -- "$script_name: $missing loader block(s) missing under $target"
+    exit 1
+  fi
+  vprint "$script_name: all loader blocks present under $target"
+fi

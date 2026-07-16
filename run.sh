@@ -1451,6 +1451,42 @@ selector_system_arg() {
   esac
 }
 
+# Selects which of $selector's user packages carry an install.hook.sh, setting
+# the global hook_packages array (same "select_* sets a global" convention as
+# select_user_packages). Called by parse_install BEFORE run_stow_action so the
+# static check-repo preflight rejects a bad hook before stow mutates
+# $STOW_TARGET; run_install_hooks (after stow) executes the same hook_packages.
+select_install_hook_packages() {
+  local selector="$1"
+  local package
+  typeset -ga hook_packages
+  hook_packages=()
+
+  select_user_packages "$selector"
+  for package in "${selected_user_packages[@]}"; do
+    [[ -f "$repo_root/packages/$package/install.hook.sh" ]] && hook_packages+=("$package")
+  done
+}
+
+# Runs each already-selected, already check-repo-validated install.hook.sh
+# after stow (see select_install_hook_packages + run_check_repo_for_packages,
+# called earlier in parse_install). Hooks are user-level (no sudo) and
+# idempotent; they exist so a package can finish an install step stow cannot
+# express (e.g. appending a loader block to ~/.zshrc without owning the file).
+# Receives the same env as verify.hook.sh.
+run_install_hooks() {
+  local package hook
+
+  (( ${#hook_packages[@]} > 0 )) || return 0
+
+  for package in "${hook_packages[@]}"; do
+    hook="$repo_root/packages/$package/install.hook.sh"
+    [[ -x "$hook" ]] || die "install hook is not executable: $hook"
+    GRZ_REPO_ROOT="$repo_root" GRZ_PACKAGE="$package" STOW_TARGET="$target" "$hook" ||
+      die "$package install hook failed"
+  done
+}
+
 run_stow_action() {
   local action="$1"
   local selector="$2"
@@ -1557,7 +1593,11 @@ parse_install() {
     exit 64
   }
 
+  select_install_hook_packages "$selector"
+  run_check_repo_for_packages "${hook_packages[@]}"
+
   run_stow_action install "$selector" "$verbose"
+  run_install_hooks
   run_system_action install "$selector" "$verbose"
 
   if (( do_verify )); then
