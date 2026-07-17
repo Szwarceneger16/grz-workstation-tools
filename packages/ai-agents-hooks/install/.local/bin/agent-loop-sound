@@ -1,0 +1,469 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+agent="${1:?agent name required}"
+sound="${2:?sound path required}"
+
+# Priorytet:
+# 1. AGENT_SOUND_DURATION_SECONDS
+# 2. trzeci argument
+# 3. 15 sekund
+duration="${AGENT_SOUND_DURATION_SECONDS:-${3:-15}}"
+
+# 80 = inne aplikacje grają na 80% swojej aktualnej głośności.
+duck_percent="${AGENT_DUCK_PERCENT:-80}"
+
+# 100 = nasz dźwięk agenta wymuszamy na 100%.
+agent_volume_percent="${AGENT_SOUND_VOLUME_PERCENT:-100}"
+
+if ! command -v pw-play >/dev/null 2>&1; then
+  printf 'pw-play not found\n' >&2
+  exit 1
+fi
+
+if [ ! -f "$sound" ]; then
+  printf 'sound file not found: %s\n' "$sound" >&2
+  exit 1
+fi
+
+case "$duration" in
+  ''|*[!0-9.]*)
+    printf 'invalid duration: %s\n' "$duration" >&2
+    exit 1
+    ;;
+esac
+
+cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/agent-loop-sounds"
+runtime_dir="${XDG_RUNTIME_DIR:-/tmp}/agent-loop-sounds"
+
+mkdir -p "$cache_dir" "$runtime_dir"
+
+safe_agent="$(printf '%s' "$agent" | tr -cd '[:alnum:]_-')"
+
+cache_key="$(
+  python3 - "$sound" "$duration" <<'PY'
+import hashlib
+import os
+import sys
+
+path, duration = sys.argv[1:3]
+
+h = hashlib.sha256()
+h.update(os.path.abspath(path).encode())
+h.update(b"\0")
+h.update(duration.encode())
+h.update(b"\0")
+
+st = os.stat(path)
+h.update(str(st.st_size).encode())
+h.update(b"\0")
+h.update(str(st.st_mtime_ns).encode())
+
+print(h.hexdigest()[:24])
+PY
+)"
+
+loop_sound="${cache_dir}/${safe_agent}-${cache_key}-${duration}s.wav"
+
+stop_file="$(mktemp "${runtime_dir}/${safe_agent}.stop.XXXXXX")"
+duck_state="$(mktemp "${runtime_dir}/${safe_agent}.duck.XXXXXX")"
+
+rm -f "$stop_file"
+: > "$duck_state"
+
+player_pid=""
+notify_pid=""
+duck_monitor_pid=""
+
+duck_supported() {
+  command -v pactl >/dev/null 2>&1
+}
+
+restore_ducked_streams() {
+  duck_supported || return 0
+
+  python3 - "$duck_state" <<'PY'
+import re
+import subprocess
+import sys
+
+state_path = sys.argv[1]
+
+entries = []
+seen = set()
+
+try:
+    with open(state_path, "r", encoding="utf-8") as f:
+        for line in f:
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) != 3:
+                continue
+
+            idx, saved_pid, vols = parts
+
+            if idx in seen:
+                continue
+
+            seen.add(idx)
+            entries.append((idx, saved_pid, vols.split()))
+except FileNotFoundError:
+    sys.exit(0)
+
+try:
+    out = subprocess.check_output(
+        ["pactl", "list", "sink-inputs"],
+        text=True,
+        stderr=subprocess.DEVNULL,
+    )
+except Exception:
+    sys.exit(0)
+
+blocks = re.split(r"\n(?=Sink Input #)", out)
+current = {}
+
+for block in blocks:
+    m = re.search(r"Sink Input #(\d+)", block)
+    if not m:
+        continue
+
+    idx = m.group(1)
+
+    pid_match = re.search(r'application\.process\.id = "([^"]+)"', block)
+    proc_pid = pid_match.group(1) if pid_match else ""
+
+    current[idx] = proc_pid
+
+for idx, saved_pid, vols in reversed(entries):
+    if not vols:
+        continue
+
+    if idx not in current:
+        continue
+
+    # Nie przywracaj, jeśli PipeWire/Pulse zdążył użyć tego numeru dla innego procesu.
+    if saved_pid and current.get(idx) != saved_pid:
+        continue
+
+    subprocess.run(
+        ["pactl", "set-sink-input-volume", idx, *vols],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+PY
+}
+
+cleanup() {
+  if [ -n "${duck_monitor_pid:-}" ]; then
+    kill "$duck_monitor_pid" >/dev/null 2>&1 || true
+    wait "$duck_monitor_pid" 2>/dev/null || true
+  fi
+
+  if [ -n "${player_pid:-}" ]; then
+    kill "$player_pid" >/dev/null 2>&1 || true
+    wait "$player_pid" 2>/dev/null || true
+  fi
+
+  if [ -n "${notify_pid:-}" ]; then
+    kill "$notify_pid" >/dev/null 2>&1 || true
+    wait "$notify_pid" 2>/dev/null || true
+  fi
+
+  restore_ducked_streams || true
+
+  rm -f "$stop_file" "$duck_state"
+}
+
+trap cleanup EXIT INT TERM
+
+# Cache: generuj tylko gdy brakuje gotowego loopa.
+# Plik wynikowy ma dokładnie duration sekund:
+# original -> reversed -> original -> reversed...
+if [ ! -f "$loop_sound" ]; then
+  tmp_loop="${loop_sound}.tmp.$$"
+
+  python3 - "$sound" "$tmp_loop" "$duration" <<'PY'
+import os
+import sys
+import wave
+
+src, dst, duration_s = sys.argv[1], sys.argv[2], float(sys.argv[3])
+
+if duration_s <= 0:
+    raise SystemExit("duration must be positive")
+
+with wave.open(src, "rb") as r:
+    params = r.getparams()
+    frames = r.readframes(r.getnframes())
+
+frame_size = params.nchannels * params.sampwidth
+source_frame_count = len(frames) // frame_size
+
+if source_frame_count <= 0:
+    raise SystemExit("empty wav")
+
+reversed_frames = b"".join(
+    frames[i:i + frame_size]
+    for i in range(len(frames) - frame_size, -1, -frame_size)
+)
+
+target_frames = int(round(params.framerate * duration_s))
+target_bytes = target_frames * frame_size
+
+chunks = [frames, reversed_frames]
+out = bytearray()
+idx = 0
+
+while len(out) < target_bytes:
+    out.extend(chunks[idx % 2])
+    idx += 1
+
+out = out[:target_bytes]
+
+with wave.open(dst, "wb") as w:
+    w.setparams(params)
+    w.writeframes(bytes(out))
+
+os.replace(dst, sys.argv[2])
+PY
+
+  mv -f "$tmp_loop" "$loop_sound" 2>/dev/null || true
+fi
+
+find_agent_stream() {
+  duck_supported || return 1
+
+  local pid="$1"
+  local file="$2"
+
+  python3 - "$pid" "$file" <<'PY'
+import os
+import re
+import subprocess
+import sys
+
+agent_pid, agent_file = sys.argv[1:3]
+agent_base = os.path.basename(agent_file)
+
+try:
+    out = subprocess.check_output(
+        ["pactl", "list", "sink-inputs"],
+        text=True,
+        stderr=subprocess.DEVNULL,
+    )
+except Exception:
+    sys.exit(1)
+
+blocks = re.split(r"\n(?=Sink Input #)", out)
+
+for block in blocks:
+    pid_match = re.search(r'application\.process\.id = "([^"]+)"', block)
+    proc_pid = pid_match.group(1) if pid_match else ""
+
+    if proc_pid == agent_pid:
+        sys.exit(0)
+
+    # Fallback: pw-play bywa widoczny jako pw-cat,
+    # ale często w bloku zostaje nazwa/ścieżka pliku.
+    if agent_base and agent_base in block:
+        sys.exit(0)
+
+    if agent_file and agent_file in block:
+        sys.exit(0)
+
+sys.exit(1)
+PY
+}
+
+duck_other_streams() {
+  duck_supported || return 0
+
+  local agent_pid="$1"
+  local agent_file="$2"
+
+  python3 - "$duck_state" "$duck_percent" "$agent_volume_percent" "$agent_pid" "$agent_file" <<'PY'
+import os
+import re
+import subprocess
+import sys
+
+state_path, duck_percent_s, agent_volume_s, agent_pid, agent_file = sys.argv[1:6]
+agent_base = os.path.basename(agent_file)
+
+try:
+    duck_percent = int(duck_percent_s)
+except Exception:
+    duck_percent = 80
+
+try:
+    agent_volume = int(agent_volume_s)
+except Exception:
+    agent_volume = 100
+
+duck_percent = max(1, min(100, duck_percent))
+agent_volume = max(1, min(150, agent_volume))
+
+saved_indexes = set()
+
+try:
+    with open(state_path, "r", encoding="utf-8") as f:
+        for line in f:
+            idx = line.split("\t", 1)[0].strip()
+            if idx:
+                saved_indexes.add(idx)
+except FileNotFoundError:
+    pass
+
+try:
+    out = subprocess.check_output(
+        ["pactl", "list", "sink-inputs"],
+        text=True,
+        stderr=subprocess.DEVNULL,
+    )
+except Exception:
+    sys.exit(0)
+
+blocks = re.split(r"\n(?=Sink Input #)", out)
+new_state = []
+
+for block in blocks:
+    m = re.search(r"Sink Input #(\d+)", block)
+    if not m:
+        continue
+
+    idx = m.group(1)
+
+    pid_match = re.search(r'application\.process\.id = "([^"]+)"', block)
+    proc_pid = pid_match.group(1) if pid_match else ""
+
+    is_agent_stream = False
+
+    if agent_pid and proc_pid == agent_pid:
+        is_agent_stream = True
+    elif agent_base and agent_base in block:
+        is_agent_stream = True
+    elif agent_file and agent_file in block:
+        is_agent_stream = True
+
+    # Nasz dźwięk: nie duckuj, tylko wymuś pełną głośność.
+    if is_agent_stream:
+        subprocess.run(
+            ["pactl", "set-sink-input-volume", idx, f"{agent_volume}%"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        continue
+
+    if idx in saved_indexes:
+        continue
+
+    volume_line = None
+    for line in block.splitlines():
+        if line.strip().startswith("Volume:"):
+            volume_line = line
+            break
+
+    if not volume_line:
+        continue
+
+    volumes = [int(x) for x in re.findall(r":\s*(\d+)\s*/", volume_line)]
+
+    if not volumes:
+        continue
+
+    ducked = [max(0, int(v * duck_percent / 100)) for v in volumes]
+
+    subprocess.run(
+        ["pactl", "set-sink-input-volume", idx, *map(str, ducked)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+
+    new_state.append(idx + "\t" + proc_pid + "\t" + " ".join(map(str, volumes)) + "\n")
+
+if new_state:
+    with open(state_path, "a", encoding="utf-8") as f:
+        f.writelines(new_state)
+PY
+}
+
+expire_ms="$(
+  python3 - "$duration" <<'PY'
+import sys
+print(int(round(float(sys.argv[1]) * 1000)))
+PY
+)"
+
+(
+  if notify-send --help 2>&1 | grep -q -- '--action'; then
+    action="$(
+      notify-send \
+        --app-name="$agent" \
+        --icon=audio-speakers \
+        --urgency=critical \
+        --expire-time="$expire_ms" \
+        --action=stop=Stop \
+        --wait \
+        "$agent skończył zadanie" \
+        "Gram dźwięk zakończenia. Kliknij Stop, żeby uciszyć." \
+        2>/dev/null || true
+    )"
+
+    if [ "$action" = "stop" ]; then
+      : > "$stop_file"
+    fi
+  else
+    notify-send \
+      --app-name="$agent" \
+      --icon=audio-speakers \
+      --urgency=critical \
+      --expire-time="$expire_ms" \
+      "$agent skończył zadanie" \
+      "Gram dźwięk zakończenia." \
+      >/dev/null 2>&1 || true
+  fi
+) &
+notify_pid="$!"
+
+pw-play "$loop_sound" >/dev/null 2>&1 &
+player_pid="$!"
+
+# Daj PipeWire chwilę na utworzenie sink-inputu.
+# Ducking odpalamy dopiero gdy umiemy rozpoznać nasz stream,
+# żeby nie przyciszyć własnego dźwięku.
+agent_stream_found=0
+
+for _ in $(seq 1 30); do
+  if find_agent_stream "$player_pid" "$loop_sound"; then
+    agent_stream_found=1
+    break
+  fi
+  sleep 0.05
+done
+
+if [ "$agent_stream_found" -eq 1 ]; then
+  duck_other_streams "$player_pid" "$loop_sound" || true
+
+  (
+    while kill -0 "$player_pid" >/dev/null 2>&1; do
+      [ -e "$stop_file" ] && break
+      duck_other_streams "$player_pid" "$loop_sound" || true
+      sleep 0.25
+    done
+  ) &
+  duck_monitor_pid="$!"
+fi
+
+while kill -0 "$player_pid" >/dev/null 2>&1; do
+  if [ -e "$stop_file" ]; then
+    kill "$player_pid" >/dev/null 2>&1 || true
+    wait "$player_pid" 2>/dev/null || true
+    break
+  fi
+  sleep 0.1
+done
+
+wait "$player_pid" 2>/dev/null || true
+player_pid=""

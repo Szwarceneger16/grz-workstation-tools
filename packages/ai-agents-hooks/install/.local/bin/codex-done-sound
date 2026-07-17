@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -u
+
+cmd="$HOME/.local/bin/agent-loop-sound"
+sound="$HOME/.local/share/agent-sounds/codex.wav"
+
+if command -v setsid >/dev/null 2>&1; then
+  setsid -f "$cmd" "Codex" "$sound" 15 </dev/null >/dev/null 2>&1
+else
+  nohup "$cmd" "Codex" "$sound" 15 </dev/null >/dev/null 2>&1 &
+fi
+
+exit 0
