@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+set -u
+
+# netrole USB Ethernet replug guard.
+#
+# Odpalany po fizycznym hotplugu (przez regułę udev + systemd-run) dla
+# interfejsu o stałej nazwie netrole (konwencja: prefiks "nr-", np. nr-usba0).
+# Zadanie: "odebrać" kartę NetworkManagerowi (autoconnect no, disconnect, flush
+# adresów), ale zostawić link jako UP, żeby NM widział urządzenie jako
+# *disconnected*, a nie *unavailable* — dzięki temu simplified_netrole może je
+# potem przenieść do własnego network namespace.
+#
+# Skrypt jest generyczny: nazwę interfejsu dostaje w $1 i akceptuje tylko nazwy
+# pasujące do konwencji netrole (^nr-[a-z0-9]+$). Mapowanie MAC -> nazwa oraz
+# odpalenie tego guarda konfiguruje netrole-apply-eth-labels (reguła udev +
+# pliki .link generowane z ~/.config/simplified-netrole/config.json).
+
+netrole_iface="${1:-}"
+
+# Akceptuj wyłącznie nazwy w konwencji netrole; wszystko inne cicho ignoruj.
+if [[ ! "$netrole_iface" =~ ^nr-[a-z0-9]+$ ]]; then
+  exit 0
+fi
+
+lock_file="/run/netrole-usb-eth-guard-${netrole_iface}.lock"
+
+exec 9>"$lock_file"
+if ! flock -n 9; then
+  exit 0
+fi
+
+log_msg() {
+  logger -t netrole-usb-eth-guard -- "$*"
+}
+
+log_msg "start for $netrole_iface"
+
+for attempt in $(seq 1 20); do
+  if [ -e "/sys/class/net/$netrole_iface" ]; then
+    break
+  fi
+  sleep 0.5
+done
+
+if [ ! -e "/sys/class/net/$netrole_iface" ]; then
+  log_msg "$netrole_iface not present, exiting"
+  exit 0
+fi
+
+sleep 2
+
+udevadm trigger --subsystem-match=net --sysname-match="$netrole_iface" --action=change >/dev/null 2>&1 || true
+udevadm settle --timeout=5 >/dev/null 2>&1 || true
+nmcli general reload >/dev/null 2>&1 || true
+
+for attempt in $(seq 1 30); do
+  if [ ! -e "/sys/class/net/$netrole_iface" ]; then
+    log_msg "$netrole_iface disappeared during guard"
+    exit 0
+  fi
+
+  nmcli device set "$netrole_iface" autoconnect no >/dev/null 2>&1 || true
+  nmcli device disconnect "$netrole_iface" >/dev/null 2>&1 || true
+  ip addr flush dev "$netrole_iface" >/dev/null 2>&1 || true
+
+  # Ważne: zostawiamy link jako UP, żeby NM widział urządzenie jako disconnected,
+  # a nie unavailable.
+  ip link set dev "$netrole_iface" up >/dev/null 2>&1 || true
+
+  sleep 0.5
+done
+
+vendor="$(nmcli -g GENERAL.VENDOR device show "$netrole_iface" 2>/dev/null | head -n 1 || true)"
+product="$(nmcli -g GENERAL.PRODUCT device show "$netrole_iface" 2>/dev/null | head -n 1 || true)"
+auto="$(nmcli -g GENERAL.AUTOCONNECT device show "$netrole_iface" 2>/dev/null | head -n 1 || true)"
+state="$(nmcli -g GENERAL.STATE device show "$netrole_iface" 2>/dev/null | head -n 1 || true)"
+
+log_msg "done for $netrole_iface vendor=[$vendor] product=[$product] autoconnect=[$auto] state=[$state]"
+exit 0

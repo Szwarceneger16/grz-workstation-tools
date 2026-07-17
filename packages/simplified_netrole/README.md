@@ -22,6 +22,7 @@ To narzędzie jest przeznaczone głównie do wygodnego i względnie bezpiecznego
 - [Czego to nie robi](#czego-to-nie-robi)
 - [Wymagania](#wymagania)
 - [Instalacja / układ plików](#instalacja--układ-plików)
+- [Etykiety i guard USB-Ethernet](#etykiety-i-guard-usb-ethernet)
 - [Szybki start](#szybki-start)
 - [Główny workflow](#główny-workflow)
 - [Konfiguracja JSON](#konfiguracja-json)
@@ -51,12 +52,20 @@ Aktualna struktura:
 .
 ├── install
 │   └── .local
-│       └── bin
-│           ├── simplified_netrole
-│           ├── simplified_netrole_utils
-│           │   ├── netrole-firefox-window
-│           │   └── netrole-netns-network
-│           └── usb-netns-clean
+│       ├── bin
+│       │   ├── simplified_netrole
+│       │   ├── netrole-apply-eth-labels
+│       │   ├── simplified_netrole_utils
+│       │   │   ├── netrole-firefox-window
+│       │   │   └── netrole-netns-network
+│       │   └── usb-netns-clean
+│       └── share
+│           └── simplified-netrole
+│               └── config.example.json
+├── install.hook.sh
+├── system-install
+│   └── usr/local/sbin/netrole-usb-eth-guard
+├── system-install.manifest
 └── README.md
 ```
 
@@ -75,9 +84,19 @@ simplified_netrole_utils/netrole-firefox-window
   Helper Firefoksa. Tworzy/aktualizuje izolowany profil Firefoksa i uruchamia
   okno przeglądarki w namespace z przekazanymi URL-ami.
 
+netrole-apply-eth-labels
+  Generuje z ~/.config/simplified-netrole/config.json regułę udev i pliki .link
+  (stała nazwa nr-* + odpalenie guarda po hotplugu) i wdraża je do /etc (sudo).
+  Patrz sekcja "Etykiety i guard USB-Ethernet".
+
 usb-netns-clean
   Narzędzie cleanup. Sprząta namespace, zabija procesy w namespace i próbuje
   oddać interfejsy do hosta.
+
+netrole-usb-eth-guard  (system-install → /usr/local/sbin)
+  Generyczny guard hotplugu. Po podłączeniu adaptera "odbiera" go
+  NetworkManagerowi (autoconnect no, disconnect, flush), zostawiając link UP,
+  żeby NM widział go jako disconnected, nie unavailable.
 ```
 
 ---
@@ -186,6 +205,8 @@ Docelowy układ po instalacji:
 ~/.local/bin/usb-netns-clean
 ~/.local/bin/simplified_netrole_utils/netrole-firefox-window
 ~/.local/bin/simplified_netrole_utils/netrole-netns-network
+~/.local/bin/netrole-apply-eth-labels
+~/.local/share/simplified-netrole/config.example.json
 ```
 
 Instalacja przez Stow (zalecana, z katalogu głównego repozytorium):
@@ -194,15 +215,80 @@ Instalacja przez Stow (zalecana, z katalogu głównego repozytorium):
 ./run.sh install simplified_netrole
 ```
 
+Instalacja obejmuje też część **systemową** (`system-install`) — guard
+`/usr/local/sbin/netrole-usb-eth-guard` kopiowany przez sudo. Zobacz sekcję
+[Etykiety i guard USB-Ethernet](#etykiety-i-guard-usb-ethernet), żeby dokończyć
+konfigurację sprzętu.
+
 Deinstalacja:
 
 ```bash
-./run.sh uninstall simplified_netrole
+netrole-apply-eth-labels --remove                # usuwa wygenerowane reguły udev + .link (rób to PRZED odinstalowaniem pakietu)
+./run.sh uninstall simplified_netrole            # usuwa część user + guard
 ```
 
 Pliki są zarządzane przez GNU Stow — nie kopiuj ich ręcznie do `$HOME`, żeby uniknąć konfliktów przy przyszłych aktualizacjach lub deinstalacji.
 
 Po instalacji katalog `~/.local/bin` musi być na `PATH`.
+
+---
+
+## Etykiety i guard USB-Ethernet
+
+Zanim `simplified_netrole` przeniesie kartę do namespace, adapter USB-Ethernet
+powinien mieć **stałą nazwę** (konwencja `nr-*`, np. `nr-usba0`) i nie być
+przejmowany przez hostowy NetworkManager. Załatwiają to trzy elementy:
+
+- `/usr/local/sbin/netrole-usb-eth-guard` — generyczny guard (część
+  `system-install`, wersjonowany, instalowany przez `./run.sh install`).
+- `/etc/systemd/network/09-<linkName>.link` — mapuje MAC → stała nazwa.
+- `/etc/udev/rules.d/99-netrole-usb-eth-labels.rules` — etykiety + odpalenie
+  guarda po `ACTION=="add"`.
+
+Pliki `.link` i reguła udev zawierają **MAC-i konkretnego sprzętu**, więc nie są
+w repo — generuje je `netrole-apply-eth-labels` z Twojego lokalnego configu.
+
+### Konfiguracja
+
+1. Otwórz config i wpisz realne MAC-i (`~/.local/share/simplified-netrole/config.example.json`
+   to wzorzec; realny plik to `~/.config/simplified-netrole/config.json`, seedowany
+   przy instalacji):
+
+   ```jsonc
+   "NR_USBA0": {
+     "mac": "aa:bb:cc:dd:ee:01",   // przykład — wpisz REALNY MAC swojego adaptera
+     "linkName": "nr-usba0",        // stała nazwa (musi pasować do ^nr-[a-z0-9]+$)
+     "role": "USB-A",
+     "dhcpMode": "probe", ...        // pola sieciowe używa netrole-netns-network
+   }
+   ```
+
+   MAC znajdziesz np.: `ip -o link show | grep -i <coś>` albo
+   `nmcli -g GENERAL.HWADDR device show <iface>`.
+
+2. Podgląd (bez zmian w systemie):
+
+   ```bash
+   netrole-apply-eth-labels --print
+   ```
+
+3. Wdrożenie (poprosi o sudo — zapisuje `/etc/...` i przeładowuje udev):
+
+   ```bash
+   netrole-apply-eth-labels
+   ```
+
+4. Podłącz adapter ponownie. Nazwa `.link` i guard zadziałają na hotplug; log:
+
+   ```bash
+   journalctl -t netrole-usb-eth-guard
+   nmcli device        # interfejs powinien być "disconnected", nie "unavailable"
+   ```
+
+Usunięcie wygenerowanych plików: `netrole-apply-eth-labels --remove`.
+
+> Uwaga: `netrole-apply-eth-labels` odmówi wdrożenia, dopóki w configu jest
+> placeholderowy MAC `00:00:00:00:00:00`.
 
 ---
 

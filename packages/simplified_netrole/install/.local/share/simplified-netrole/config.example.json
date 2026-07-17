@@ -1,0 +1,36 @@
+{
+  "_comment": "Przykładowy config simplified_netrole. Skopiuj do ~/.config/simplified-netrole/config.json i wpisz REALNE MAC-i swoich adapterów USB-Ethernet (pole 'mac'). Pola mac/linkName/role opisują sprzęt i są używane przez netrole-apply-eth-labels do wygenerowania reguł udev i plików .link. Pozostałe pola (dhcpMode/staticAddrs/testIps) używa netrole-netns-network.",
+  "_defaults": {
+    "dhcpTimeout": 8,
+    "onOffer": "add",
+    "dnsServers": ["1.1.1.1", "8.8.8.8"]
+  },
+  "NR_USBA0": {
+    "mac": "00:00:00:00:00:00",
+    "linkName": "nr-usba0",
+    "role": "USB-A",
+    "dhcpMode": "probe",
+    "staticAddrs": [
+      "192.168.1.51/24",
+      "192.168.10.51/24"
+    ],
+    "testIps": [
+      "192.168.1.1",
+      "192.168.10.3"
+    ]
+  },
+  "NR_USBC0": {
+    "mac": "00:00:00:00:00:00",
+    "linkName": "nr-usbc0",
+    "role": "USB-C",
+    "dhcpMode": "probe",
+    "staticAddrs": [
+      "192.168.1.50/24",
+      "192.168.10.50/24"
+    ],
+    "testIps": [
+      "192.168.1.1",
+      "192.168.10.2"
+    ]
+  }
+}

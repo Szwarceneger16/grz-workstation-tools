@@ -1,0 +1,8 @@
+# System-install manifest: path mode owner group (relative to /).
+# Wdrażane przez scripts/system-copy-select (sudo install -D). Tylko generyczne,
+# nie-sekretne pliki — treść jest wersjonowana i weryfikowana bajt po bajcie.
+#
+# Guard jest generyczny (nazwę interfejsu dostaje w $1). Reguły udev i pliki .link
+# ze sprzętowymi MAC-ami NIE są tutaj — generuje je netrole-apply-eth-labels z
+# ~/.config/simplified-netrole/config.json, więc repo pozostaje publikowalne.
+usr/local/sbin/netrole-usb-eth-guard 0755 root root

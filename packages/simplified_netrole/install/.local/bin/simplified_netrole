@@ -736,6 +736,9 @@ netrole_ensure_default_config() {
     "dnsServers": ["1.1.1.1", "8.8.8.8"]
   },
   "NR_USBA0": {
+    "mac": "00:00:00:00:00:00",
+    "linkName": "nr-usba0",
+    "role": "USB-A",
     "dhcpMode": "probe",
     "staticAddrs": [
       "192.168.1.51/24",
@@ -747,6 +750,9 @@ netrole_ensure_default_config() {
     ]
   },
   "NR_USBC0": {
+    "mac": "00:00:00:00:00:00",
+    "linkName": "nr-usbc0",
+    "role": "USB-C",
     "dhcpMode": "probe",
     "staticAddrs": [
       "192.168.1.50/24",
