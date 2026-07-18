@@ -135,14 +135,20 @@ run_stow() {
         }
       }
 
+      # Extracts the target-relative path. Source paths contain ".../stow/<pkg>/";
+      # anchoring on "/stow/" avoids mistaking a package-named config subdirectory
+      # (e.g. .config/<pkg-name>) for the stow root.
       function package_relative_path(path, marker, pos) {
         sub(/ \(cwd=.*/, "", path)
-        marker = "/" package "/"
+        marker = "/stow/" package "/"
         pos = index(path, marker)
         if (pos > 0) {
           return substr(path, pos + length(marker))
         }
-        if (path ~ "/" package "$" || path == package) {
+        if (path ~ ("/stow/" package "$") || path == package) {
+          return ""
+        }
+        if (path == "." || path == "") {
           return ""
         }
         return path
@@ -316,7 +322,29 @@ done
 cd "$stow_dir"
 
 typeset -a stow_args
-stow_args=(--target="$target" --no-folding)
+stow_args=(
+  --target="$target"
+  --no-folding
+  --ignore='(^|/)\.git(/|$)'
+  --ignore='(^|/)\.gitignore$'
+  --ignore='(^|/)\.gitattributes$'
+  --ignore='(^|/)\.gitmodules$'
+  --ignore='(^|/)\.gitkeep$'
+  --ignore='(^|/)\.stow-local-ignore$'
+  --ignore='(^|/)__pycache__(/|$)'
+  --ignore='(^|/)\.pytest_cache(/|$)'
+  --ignore='(^|/)\.mypy_cache(/|$)'
+  --ignore='(^|/)\.ruff_cache(/|$)'
+  --ignore='(^|/)\.tox(/|$)'
+  --ignore='(^|/)\.nox(/|$)'
+  --ignore='\.py[co]$'
+  --ignore='(^|/)\.DS_Store$'
+  --ignore='(^|/)Thumbs\.db$'
+  --ignore='~$'
+  --ignore='\.sw[opx]$'
+  --ignore='(^|/)\.#'
+  --ignore='(^|/)#.*#$'
+)
 
 if (( verbose )); then
   print -- "repo_root: $repo_root"

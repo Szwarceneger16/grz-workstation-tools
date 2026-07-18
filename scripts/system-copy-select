@@ -11,9 +11,16 @@ typeset -ga protected_paths
 protected_paths=()
 sudo_session_active=0
 
+# --- Per-repo runner config (env-var prefix). NOT part of the synced canonical engine. ---
+runner_conf="$repo_root/runner.conf"
+[[ -r "$runner_conf" ]] && source "$runner_conf"
+: "${RUNNER_ENV_PREFIX:?runner.conf must define RUNNER_ENV_PREFIX (e.g. GRZ or MINT)}"
+env_prefix="$RUNNER_ENV_PREFIX"
+
 finish_sudo_session() {
   (( sudo_session_active )) || return 0
-  if [[ "${GRZ_KEEP_SUDO_SESSION:-0}" == "1" ]]; then
+  local _keep_var="${env_prefix}_KEEP_SUDO_SESSION"
+  if [[ "${(P)_keep_var:-0}" == "1" ]]; then
     sudo_session_active=0
     return 0
   fi
@@ -727,7 +734,10 @@ process_package_configs() {
 
     if [[ "$src" == "skip" ]]; then
       print -u2 -- "warning - skipping config: $dest (run './run.sh activate $package' after creating it)"
-      (( configs_missing++ ))
+      # Plain assignment, not (( configs_missing++ )): under set -e a zsh
+      # arithmetic command whose value is 0 (the post-increment result on the
+      # first skip) returns status 1 and would abort the whole install.
+      configs_missing=$(( configs_missing + 1 ))
       continue
     fi
 
@@ -772,7 +782,9 @@ activate_units() {
   local package="$1"
   local unit unit_file unit_dir dest_name base instance_path
   local verify_failures=0
-  local -A activation_bases  # service bases that should not be started directly
+  local -A activation_bases    # service bases that should not be started directly
+  local -A timer_managed_bases # subset owned by a .timer (safe to defer-start)
+  local -a deferred_oneshots   # timer-managed oneshots started after triggers are enabled
 
   load_units_metadata "$package"
   (( ${#system_units[@]} > 0 )) || return 0
@@ -797,7 +809,9 @@ activate_units() {
       fi
     fi
     for base in "${(@f)$(activation_bases_for_unit "$unit_dir" "$unit")}"; do
-      [[ -n "$base" ]] && activation_bases[$base]=1
+      [[ -n "$base" ]] || continue
+      activation_bases[$base]=1
+      [[ "$unit" == *.timer ]] && timer_managed_bases[$base]=1
     done
   done
 
@@ -834,12 +848,40 @@ activate_units() {
         ;;
       *.service)
         if [[ -n "${activation_bases[${unit%.service}]+x}" ]]; then
-          print -- "Skipping $unit (managed by a socket, path, or timer unit)"
+          # enable --now on a timer starts only the timer, so a timer-managed
+          # oneshot would produce no result until the first tick. Such a oneshot
+          # is run once so activation ends in a defined state — but only after
+          # every trigger unit is activated, and non-fatally (see the
+          # deferred_oneshots loop below), so a transient failure cannot abort
+          # activation with its timer still disabled. A socket/path-managed
+          # service must instead start from its activation context (the live
+          # connection/watch), so starting it here would run it prematurely or
+          # fail; those, and long-running services, stay trigger-managed (skipped).
+          # Use the shared directive parser, not an exact-line grep: systemd
+          # treats whitespace around '=' and leading indentation as insignificant
+          # (systemd.syntax), so `Type = oneshot` or an indented line must still
+          # be recognized, otherwise the promised initial run is missed.
+          unit_file="$(resolve_unit_file_path "$unit_dir" "$unit")"
+          if [[ -n "${timer_managed_bases[${unit%.service}]+x}" &&
+                "$(systemd_directive_value Type "$unit_file")" == oneshot ]]; then
+            deferred_oneshots+=("$unit")
+          else
+            print -- "Skipping $unit (managed by a socket, path, or timer unit)"
+          fi
         else
-          # Per system-units.manifest semantics, a standalone system service
-          # is start-only (never enabled), unlike user units.
-          print -- "Starting $unit"
-          sudo -n systemctl start "$unit"
+          # A standalone system service that ships an [Install] section wants
+          # to persist across boots, so enable it (creating its .wants link) as
+          # well as running it; --now also runs it once, which for a oneshot
+          # applies its policy immediately. Services without an [Install]
+          # section are one-shot-at-activation and are only started.
+          unit_file="$(resolve_unit_file_path "$unit_dir" "$unit")"
+          if unit_has_install_section "$unit_file"; then
+            print -- "Enabling and starting $unit"
+            sudo -n systemctl enable --now "$unit"
+          else
+            print -- "Starting $unit"
+            sudo -n systemctl start "$unit"
+          fi
         fi
         ;;
       *.target|*.mount)
@@ -857,6 +899,12 @@ activate_units() {
         fi
         ;;
     esac
+  done
+
+  for unit in "${deferred_oneshots[@]}"; do
+    print -- "Starting $unit once at activation (timer-managed oneshot)"
+    sudo -n systemctl start "$unit" ||
+      print -u2 -- "warning: initial run of $unit failed; its timer is enabled and will retry"
   done
 }
 
@@ -936,11 +984,19 @@ deactivate_units() {
           print -- "Skipping $unit (template service managed by an Accept=yes socket)"
           continue
         }
-        # These units are never enabled by activate_units (system-units.manifest
-        # services are start-only), so only stop them here — disabling could
-        # strip an enablement created outside this tool.
-        print -- "Stopping $unit"
-        sudo -n systemctl stop "$unit" || print -u2 -- "warning: failed to stop $unit (ignored)"
+        # Symmetric with activate_units: only a *standalone* service that ships an
+        # [Install] section was enabled at activation, so disable it here. A
+        # trigger-managed service (timer/path/socket) was never enabled by this
+        # tool — it was skipped or its timer defer-started it — so only stop it;
+        # disabling could strip an enablement created outside this tool. A
+        # service without [Install] was only started, so likewise just stop it.
+        if [[ -z "${activation_bases[${unit%.service}]+x}" ]] && unit_has_install_section "$unit_file"; then
+          print -- "Disabling and stopping $unit"
+          sudo -n systemctl disable --now "$unit" || print -u2 -- "warning: failed to disable/stop $unit (ignored)"
+        else
+          print -- "Stopping $unit"
+          sudo -n systemctl stop "$unit" || print -u2 -- "warning: failed to stop $unit (ignored)"
+        fi
         ;;
     esac
   done

@@ -1,0 +1,13 @@
+# Explicit opt-in for set-id / sticky bits on system-install files.
+# One repo-relative destination per line (exact match, relative to / and without
+# a leading slash), e.g.:
+#   usr/local/bin/some-setuid-helper
+#
+# By default `check-repo` REJECTS any system-install.manifest entry whose mode
+# carries a setuid (4000), setgid (2000), or sticky (1000) bit, because such a
+# file is a privilege-escalation primitive (e.g. a setuid-root binary). Listing
+# a path here is the conscious acknowledgement that the set-id/sticky mode is
+# intended for that exact file. `system-config.manifest` (secret configs) may
+# never use these bits at all and is not affected by this list.
+#
+# Lines starting with # are comments. Empty file = no set-id paths allowed.

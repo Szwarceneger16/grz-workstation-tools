@@ -1,0 +1,144 @@
+#!/usr/bin/env zsh
+emulate -L zsh
+set -euo pipefail
+
+# Keeps the canonical engine file set (scripts/runner-canonical-files.txt) in
+# sync between the canon (grz-workstation-tools) and its consumers (e.g.
+# private-consumer). Direction is always consumer-pulls-canon: this
+# never writes to the canon and is never run by the canon against a consumer.
+#
+#   sync-runner pull [<ref>]  fetch canon from RUNNER_CANONICAL_REMOTE (read-only,
+#                             anonymous), overlay the canonical files onto THIS
+#                             repo, then relock. Does not touch runner.conf,
+#                             .rcd-loader-repo-id, manifests content or packages.
+#   sync-runner lock          (re)write runner.lock from local canonical files
+#                             (run in the canon after editing the engine).
+#   sync-runner check         verify local canonical files against runner.lock
+#                             (run in CI; fails on any drift or set change).
+
+script_name="${0:t}"
+repo_root="${0:A:h:h}"
+canon_list="$repo_root/scripts/runner-canonical-files.txt"
+lock_file="$repo_root/runner.lock"
+
+runner_conf="$repo_root/runner.conf"
+[[ -r "$runner_conf" ]] && source "$runner_conf"
+
+tmp=""  # clone scratch dir; global so the EXIT trap can clean it up
+
+die() { print -u2 -- "$script_name: $*"; exit 1; }
+
+usage() {
+  print -u2 -- "usage: $script_name pull [<ref>]   # sync canonical engine from RUNNER_CANONICAL_REMOTE"
+  print -u2 -- "       $script_name lock           # (re)write runner.lock from local canonical files"
+  print -u2 -- "       $script_name check          # verify local canonical files against runner.lock"
+}
+
+# Populates the global array canon_files from a canonical-list file.
+read_canon_list() {
+  local list="$1" line
+  canon_files=()
+  [[ -f "$list" ]] || die "canonical list not found: $list"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    canon_files+=("$line")
+  done < "$list"
+  (( ${#canon_files[@]} > 0 )) || die "no canonical files listed in $list"
+}
+
+cmd_lock() {
+  local -a canon_files
+  read_canon_list "$canon_list"
+  local f
+  for f in "${canon_files[@]}"; do
+    [[ -f "$repo_root/$f" ]] || die "canonical file missing: $f"
+  done
+  ( cd "$repo_root" && sha256sum -- "${canon_files[@]}" ) | sort -k2 > "$lock_file"
+  print -- "wrote ${lock_file:t} (${#canon_files[@]} files)"
+}
+
+cmd_check() {
+  local -a canon_files
+  read_canon_list "$canon_list"
+  [[ -f "$lock_file" ]] || die "no runner.lock — run '$script_name lock' (canon) or '$script_name pull' (consumer)"
+
+  local f
+  for f in "${canon_files[@]}"; do
+    [[ -f "$repo_root/$f" ]] || die "canonical file missing: $f"
+  done
+
+  # The lock must describe exactly the canonical set (catches an added/removed
+  # canonical file that a pure content check would miss).
+  local locked expected
+  locked="$(awk 'NF{print $2}' "$lock_file" | sort)"
+  expected="$(printf '%s\n' "${canon_files[@]}" | sort)"
+  [[ "$locked" == "$expected" ]] ||
+    die "runner.lock file set differs from ${canon_list:t} (canonical set changed — relock in the canon and re-sync)"
+
+  ( cd "$repo_root" && sha256sum -c --quiet -- "$lock_file" ) ||
+    die "canonical engine drifted from runner.lock — do not hand-edit the vendored engine; edit it in the canon and run '$script_name pull'"
+  print -- "ok - canonical engine matches runner.lock (${#canon_files[@]} files)"
+}
+
+cmd_pull() {
+  local ref="${1:-main}"
+  : "${RUNNER_CANONICAL_REMOTE:?runner.conf must set RUNNER_CANONICAL_REMOTE for pull}"
+  command -v git >/dev/null 2>&1 || die "git is required for pull"
+
+  tmp="$(mktemp -d)" || die "mktemp failed"
+  trap '[[ -n "${tmp:-}" ]] && rm -rf "$tmp"' EXIT
+
+  print -- "fetching canon $RUNNER_CANONICAL_REMOTE @ $ref (read-only, anonymous)"
+  git clone --quiet -- "$RUNNER_CANONICAL_REMOTE" "$tmp/canon" || die "git clone failed"
+  ( cd "$tmp/canon" && git checkout --quiet "$ref" ) || die "ref not found in canon: $ref"
+  local sha; sha="$(cd "$tmp/canon" && git rev-parse HEAD)"
+
+  # The previously-synced set (from our current lock) is the authoritative record
+  # of files this tool manages here; capture it before the overlay so files the
+  # canon has since dropped from its list can be deleted below. Without this,
+  # cmd_lock would relock to the new (smaller) set and 'check' would still pass
+  # while a stale engine artifact lingered in the consumer.
+  local -a prev_files
+  prev_files=()
+  [[ -f "$lock_file" ]] && prev_files=("${(@f)$(awk 'NF{print $2}' "$lock_file")}")
+
+  # The canon's own list is authoritative (so a newly added canonical file is
+  # picked up here, not silently missed).
+  local -a canon_files
+  read_canon_list "$tmp/canon/scripts/runner-canonical-files.txt"
+
+  local f srcf destf
+  for f in "${canon_files[@]}"; do
+    srcf="$tmp/canon/$f"
+    [[ -f "$srcf" ]] || die "canon is missing a listed canonical file: $f"
+    destf="$repo_root/$f"
+    mkdir -p "${destf:h}"
+    cp -- "$srcf" "$destf"
+    chmod "--reference=$srcf" -- "$destf"
+  done
+  print -- "synced ${#canon_files[@]} canonical files from ${RUNNER_CANONICAL_REMOTE} @ ${sha}"
+
+  # Remove files that were canonical in the previous sync but are no longer in
+  # the canon's list, so a rename/removal in the canon leaves no stale copy here.
+  local pf
+  for pf in "${prev_files[@]}"; do
+    [[ -n "$pf" ]] || continue
+    (( ${canon_files[(Ie)$pf]} )) && continue
+    if [[ -e "$repo_root/$pf" ]]; then
+      print -- "removing no-longer-canonical file: $pf"
+      rm -f -- "$repo_root/$pf"
+    fi
+  done
+
+  cmd_lock
+  print -- "next: run './scripts/check-repo' and './run.sh verify all' to validate the synced engine"
+}
+
+(( $# > 0 )) || { usage; exit 64; }
+case "$1" in
+  lock)  shift; cmd_lock ;;
+  check) shift; cmd_check ;;
+  pull)  shift; cmd_pull "${1:-}" ;;
+  -h|--help) usage ;;
+  *) usage; exit 64 ;;
+esac

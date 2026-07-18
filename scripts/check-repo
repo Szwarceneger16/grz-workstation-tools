@@ -23,6 +23,10 @@ protected_paths_file="$repo_root/manifests/protected-system-paths.txt"
 typeset -a protected_paths
 protected_paths=()
 
+allow_setid_file="$repo_root/manifests/allow-setid-system-paths.txt"
+typeset -gA allow_setid_paths
+allow_setid_paths=()
+
 _load_protected_paths() {
   local line
   [[ -f "$protected_paths_file" ]] || return 0
@@ -30,6 +34,17 @@ _load_protected_paths() {
     [[ -z "$line" || "$line" == \#* ]] && continue
     protected_paths+=("$line")
   done < "$protected_paths_file"
+}
+
+# Paths explicitly opted-in (exact match, repo-relative, no leading slash) to carry a
+# setuid/setgid/sticky bit in system-install.manifest.
+_load_allow_setid_paths() {
+  local line
+  [[ -f "$allow_setid_file" ]] || return 0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    allow_setid_paths[$line]=1
+  done < "$allow_setid_file"
 }
 
 _is_protected_rel_path() {
@@ -47,8 +62,40 @@ err() {
 
 is_meta_file() {
   local rel="$1"
+  # Files Stow ignores and never links (mirror scripts/stow-select --ignore):
+  # git metadata and stow markers a package may carry without being installed.
+  # Kept logically identical to is_install_meta_file in run.sh.
   case "$rel" in
     .gitkeep|*/.gitkeep|.stow-local-ignore|*/.stow-local-ignore) return 0 ;;
+    .gitignore|*/.gitignore|.gitattributes|*/.gitattributes|.gitmodules|*/.gitmodules) return 0 ;;
+    .git/*|*/.git/*) return 0 ;;
+  esac
+  return 1
+}
+
+# Filenames GNU Stow silently drops at install time. A package must not ship
+# such junk: stow skips it (no link), then `./run.sh verify`/`test` enumerate it
+# from install/ and report a missing stow link. Keep this in sync with the
+# `--ignore` list in scripts/stow-select (junk subset only; the git-infra
+# entries and .gitkeep/.stow-local-ignore are legitimate meta, see is_meta_file).
+is_stow_ignored() {
+  local rel="$1" base="${rel:t}"
+  case "$rel" in
+    __pycache__/*|*/__pycache__/*) return 0 ;;
+    .pytest_cache/*|*/.pytest_cache/*) return 0 ;;
+    .mypy_cache/*|*/.mypy_cache/*) return 0 ;;
+    .ruff_cache/*|*/.ruff_cache/*) return 0 ;;
+    .tox/*|*/.tox/*) return 0 ;;
+    .nox/*|*/.nox/*) return 0 ;;
+  esac
+  case "$base" in
+    __pycache__|.pytest_cache|.mypy_cache|.ruff_cache|.tox|.nox) return 0 ;;
+    *.pyc|*.pyo) return 0 ;;
+    .DS_Store|Thumbs.db) return 0 ;;
+    *~) return 0 ;;
+    *.swp|*.swo|*.swx) return 0 ;;
+    .#*) return 0 ;;
+    \#*\#) return 0 ;;
   esac
   return 1
 }
@@ -56,8 +103,9 @@ is_meta_file() {
 load_4col_manifest() {
   local manifest="$1" line rel_path mode owner group extra
   local line_no=0
-  typeset -gA manifest_paths
+  typeset -gA manifest_paths manifest_modes
   manifest_paths=()
+  manifest_modes=()
   [[ -f "$manifest" ]] || return 0
   while IFS= read -r line || [[ -n "$line" ]]; do
     line_no=$(( line_no + 1 ))
@@ -89,6 +137,7 @@ load_4col_manifest() {
       continue
     fi
     manifest_paths[$rel_path]=1
+    manifest_modes[$rel_path]=$mode
   done < "$manifest"
 }
 
@@ -107,6 +156,11 @@ _check_config_manifest_security() {
     [[ "$mode" =~ '^[0-7]{3,4}$' ]] || continue
     (( (8#$mode & 8#077) == 0 )) ||
       err "$package: system-config.manifest entry must have root-only mode (no group/world bits): $rel_path (got: $mode)"
+    # Configs have no allow-list (unlike system-install.manifest), so set-id/
+    # sticky bits are always rejected: they would install a user-supplied source
+    # as a setuid/setgid-root file via process_package_configs.
+    (( (8#$mode & 8#7000) == 0 )) ||
+      err "$package: system-config.manifest entry must not use set-id/sticky bits: $rel_path (got: $mode)"
   done < "$manifest"
 }
 
@@ -441,7 +495,7 @@ check_system_layer() {
   local units_manifest="$packages_dir/$package/system-units.manifest"
   local config_manifest="$packages_dir/$package/system-config.manifest"
   local f rel base real_rel
-  typeset -A install_paths config_paths unit_names accept_service_templates
+  typeset -A install_paths install_modes config_paths unit_names accept_service_templates
 
   [[ ! -L "$sys_dir" ]] || { err "$package: system-install must not be a symlink"; return 0; }
   [[ -d "$sys_dir" ]] || return 0
@@ -453,15 +507,24 @@ check_system_layer() {
 
   load_4col_manifest "$install_manifest"
   install_paths=("${(@kv)manifest_paths}")
+  install_modes=("${(@kv)manifest_modes}")
   for rel in "${(@k)install_paths}"; do
     _is_protected_rel_path "$rel" &&
       err "$package: protected system path in system-install.manifest: $rel"
+    # set-id/sticky (octal 7000 bits) is a privilege-escalation primitive and
+    # requires explicit opt-in in manifests/allow-setid-system-paths.txt.
+    if (( (8#${install_modes[$rel]} & 8#7000) != 0 )); then
+      [[ -n "${allow_setid_paths[$rel]-}" ]] ||
+        err "$package: set-id/sticky mode ${install_modes[$rel]} on '$rel' requires an entry in manifests/allow-setid-system-paths.txt"
+    fi
   done
 
   # Check 1: every system-install file is declared.
   for f in "$sys_dir"/**/*(DN.); do
     rel="${f#$sys_dir/}"
     is_meta_file "$rel" && continue
+    is_stow_ignored "$rel" &&
+      { err "$package: system-install file would be skipped by Stow (remove it): $rel"; continue; }
     [[ -n "${install_paths[$rel]-}" ]] || err "$package: system file not in system-install.manifest: $rel"
   done
   for f in "$sys_dir"/**/*(DN@); do
@@ -538,6 +601,16 @@ check_user_layer() {
     return 0
   fi
 
+  # Reject files Stow would silently skip (see is_stow_ignored): otherwise stow
+  # omits them and verify/test then report the link as missing.
+  local rel
+  for f in "$install_dir"/**/*(DN.) "$install_dir"/**/*(DN@); do
+    rel="${f#$install_dir/}"
+    is_meta_file "$rel" && continue
+    is_stow_ignored "$rel" &&
+      err "$package: install file would be skipped by Stow (remove it): $rel"
+  done
+
   load_units_manifest "$units_manifest" user
   unit_names=("${(@kv)manifest_paths}")
   accept_service_templates=()
@@ -598,6 +671,7 @@ else
 fi
 
 _load_protected_paths
+_load_allow_setid_paths
 check_helper_parity
 
 for package in "${packages_to_check[@]}"; do

@@ -24,6 +24,15 @@ jobs:
           zsh -n scripts/system-copy-select
           zsh -n scripts/stow-select
           zsh -n scripts/list-packages
+          zsh -n scripts/ensure-rcd-loaders
+          zsh -n scripts/audit-public-safety
+          zsh -n scripts/sync-runner
 
       - name: Run check-repo
         run: ./scripts/check-repo
+
+      - name: Runner engine drift check
+        run: ./scripts/sync-runner check
+
+      - name: Audit public safety (secret/path leak scan)
+        run: ./scripts/audit-public-safety

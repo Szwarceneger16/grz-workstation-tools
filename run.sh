@@ -6,8 +6,17 @@ script_name="${0:t}"
 repo_root="${0:A:h}"
 stow_dir="$repo_root/stow"
 ignore_all_file="$repo_root/manifests/ignore-all-install.txt"
-target="${GRZ_STOW_TARGET:-${STOW_TARGET:-$HOME}}"
+
+# --- Per-repo runner config (env-var prefix). NOT part of the synced canonical engine. ---
+runner_conf="$repo_root/runner.conf"
+[[ -r "$runner_conf" ]] && source "$runner_conf"
+: "${RUNNER_ENV_PREFIX:?runner.conf must define RUNNER_ENV_PREFIX (e.g. GRZ or MINT)}"
+env_prefix="$RUNNER_ENV_PREFIX"
+
+_stow_target_var="${env_prefix}_STOW_TARGET"
+target="${(P)_stow_target_var:-${STOW_TARGET:-$HOME}}"
 run_sudo_cleanup=0
+verify_verbose=0
 
 finish_run_sudo_session() {
   (( run_sudo_cleanup )) || return 0
@@ -22,14 +31,22 @@ trap finish_run_sudo_session EXIT
 usage() {
   print -u2 -- "usage: $script_name install [--verbose] [--verify] [--test] all|all-user|all-system|<package>"
   print -u2 -- "       $script_name uninstall [--verbose] all|all-user|all-system|<package>"
+  print -u2 -- "       $script_name uninstall --orphaned [--dry-run] [-y] <package>"
   print -u2 -- "       $script_name activate all|all-user|all-system|<package>"
-  print -u2 -- "       $script_name verify all|all-user|all-system|<package>"
-  print -u2 -- "       $script_name test all|all-user|all-system|<package>"
+  print -u2 -- "       $script_name verify [--verbose] all|all-user|all-system|<package>"
+  print -u2 -- "       $script_name test [--verbose] all|all-user|all-system|<package>"
 }
 
 die() {
   print -u2 -- "$script_name: $*"
   exit 1
+}
+
+# Verbose-only print (no-op unless verify_verbose=1). Always returns 0 so it is
+# safe to call under set -e without guarding its exit status.
+vprint() {
+  (( verify_verbose )) || return 0
+  print -- "$@"
 }
 
 stow_target_is_home() {
@@ -132,8 +149,17 @@ select_system_packages() {
 is_install_meta_file() {
   local rel_path="$1"
 
+  # Files Stow ignores and never links (mirror scripts/stow-select --ignore).
+  # These are skipped by verification so a package may carry repo-management
+  # files (git metadata, stow markers) without a phantom "missing link" failure.
   case "$rel_path" in
     .gitkeep|*/.gitkeep|.stow-local-ignore|*/.stow-local-ignore)
+      return 0
+      ;;
+    .gitignore|*/.gitignore|.gitattributes|*/.gitattributes|.gitmodules|*/.gitmodules)
+      return 0
+      ;;
+    .git/*|*/.git/*)
       return 0
       ;;
   esac
@@ -244,7 +270,10 @@ verify_user_package() {
   hook="$repo_root/packages/$package/verify.hook.sh"
   if [[ -f "$hook" ]]; then
     [[ -x "$hook" ]] || die "verify hook is not executable: $hook"
-    GRZ_REPO_ROOT="$repo_root" GRZ_PACKAGE="$package" STOW_TARGET="$target" "$hook"
+    # Explicit `|| return 1`: errexit is suppressed when this function is called
+    # as an `if` condition (run_verify/run_tests_for_user_package), so a failing
+    # hook would otherwise fall through to the "ok" print and tally as passed.
+    env "${env_prefix}_REPO_ROOT=$repo_root" "${env_prefix}_PACKAGE=$package" "STOW_TARGET=$target" "${env_prefix}_VERBOSE=$verify_verbose" "$hook" || return 1
   fi
 
   print -- "ok - user package verified: $package"
@@ -935,6 +964,7 @@ verify_user_live_units() {
   esac
 
   print -- "Verifying live user systemd units for $package"
+  vprint "+ systemd-analyze --user verify ${unit_paths[*]}"
   systemd-analyze --user verify "${unit_paths[@]}" || {
     print -u2 -- "not ok - live user systemd unit verification failed: $package"
     return 1
@@ -1374,6 +1404,7 @@ test_system_package() {
 run_verify() {
   local selector="$1"
   local verify_context="${2:-standalone}"
+  verify_verbose="${3:-0}"
   local package
 
   select_user_packages "$selector"
@@ -1381,14 +1412,21 @@ run_verify() {
 
   (( ${#selected_user_packages[@]} > 0 || ${#selected_system_packages[@]} > 0 )) || die "no packages selected for: $selector"
 
+  local ok=0 fail=0
   for package in "${selected_user_packages[@]}"; do
-    verify_user_package "$package"
+    if verify_user_package "$package"; then ok=$(( ok + 1 )); else fail=$(( fail + 1 )); fi
   done
 
   for package in "${selected_system_packages[@]}"; do
-    verify_system_package "$package" "$verify_context" 1 || { finish_system_verify_sudo; return 1; }
+    if verify_system_package "$package" "$verify_context" 1; then ok=$(( ok + 1 )); else fail=$(( fail + 1 )); fi
   done
   finish_system_verify_sudo
+
+  if (( fail > 0 )); then
+    print -u2 -- "verify: FAILED — $fail of $(( ok + fail )) check(s) failed"
+    return 1
+  fi
+  print -- "verify: OK — $ok check(s) passed"
 }
 
 run_tests_for_user_package() {
@@ -1400,7 +1438,10 @@ run_tests_for_user_package() {
     print -u2 -- "not ok - $package has user-units.manifest test failure(s)"
     return 1
   }
-  verify_user_package "$package"
+  # Explicit `|| return 1` throughout: this helper runs as an `if` condition in
+  # run_test, which suppresses errexit, so a bare failing call would be masked by
+  # a later "ok - no tests"/passing test and tally the package as success.
+  verify_user_package "$package" || return 1
 
   tests=("$repo_root/packages/$package/tests"/*.sh(N))
   if (( ${#tests[@]} == 0 )); then
@@ -1411,7 +1452,7 @@ run_tests_for_user_package() {
   for test_file in "${tests[@]}"; do
     [[ -x "$test_file" ]] || die "test is not executable: $test_file"
     print -- "Testing: $package ${test_file:t}"
-    GRZ_REPO_ROOT="$repo_root" GRZ_PACKAGE="$package" STOW_TARGET="$target" "$test_file"
+    env "${env_prefix}_REPO_ROOT=$repo_root" "${env_prefix}_PACKAGE=$package" "STOW_TARGET=$target" "${env_prefix}_VERBOSE=$verify_verbose" "$test_file" || return 1
   done
 }
 
@@ -1424,13 +1465,83 @@ run_test() {
 
   (( ${#selected_user_packages[@]} > 0 || ${#selected_system_packages[@]} > 0 )) || die "no packages selected for: $selector"
 
+  local ok=0 fail=0
   for package in "${selected_user_packages[@]}"; do
-    run_tests_for_user_package "$package"
+    if run_tests_for_user_package "$package"; then ok=$(( ok + 1 )); else fail=$(( fail + 1 )); fi
   done
 
   for package in "${selected_system_packages[@]}"; do
-    test_system_package "$package"
+    if test_system_package "$package"; then ok=$(( ok + 1 )); else fail=$(( fail + 1 )); fi
   done
+
+  if (( fail > 0 )); then
+    print -u2 -- "test: FAILED — $fail of $(( ok + fail )) check(s) failed"
+    return 1
+  fi
+  print -- "test: OK — $ok check(s) passed"
+}
+
+parse_verify() {
+  local selector=""
+  local verbose=0
+
+  while (( $# > 0 )); do
+    case "$1" in
+      --verbose|-v)
+        verbose=1
+        ;;
+      --)
+        shift
+        (( $# == 1 )) || { usage; exit 64; }
+        [[ -z "$selector" ]] || { usage; exit 64; }
+        selector="$1"
+        ;;
+      -*)
+        die "unknown verify option: $1"
+        ;;
+      *)
+        [[ -z "$selector" ]] || { usage; exit 64; }
+        selector="$1"
+        ;;
+    esac
+    shift
+  done
+
+  [[ -n "$selector" ]] || { usage; exit 64; }
+
+  run_verify "$selector" standalone "$verbose"
+}
+
+parse_test() {
+  local selector=""
+  local verbose=0
+
+  while (( $# > 0 )); do
+    case "$1" in
+      --verbose|-v)
+        verbose=1
+        ;;
+      --)
+        shift
+        (( $# == 1 )) || { usage; exit 64; }
+        [[ -z "$selector" ]] || { usage; exit 64; }
+        selector="$1"
+        ;;
+      -*)
+        die "unknown test option: $1"
+        ;;
+      *)
+        [[ -z "$selector" ]] || { usage; exit 64; }
+        selector="$1"
+        ;;
+    esac
+    shift
+  done
+
+  [[ -n "$selector" ]] || { usage; exit 64; }
+
+  verify_verbose="$verbose"
+  run_test "$selector"
 }
 
 selector_stow_arg() {
@@ -1482,7 +1593,7 @@ run_install_hooks() {
   for package in "${hook_packages[@]}"; do
     hook="$repo_root/packages/$package/install.hook.sh"
     [[ -x "$hook" ]] || die "install hook is not executable: $hook"
-    GRZ_REPO_ROOT="$repo_root" GRZ_PACKAGE="$package" STOW_TARGET="$target" "$hook" ||
+    env "${env_prefix}_REPO_ROOT=$repo_root" "${env_prefix}_PACKAGE=$package" "STOW_TARGET=$target" "$hook" ||
       die "$package install hook failed"
   done
 }
@@ -1519,10 +1630,10 @@ run_system_action() {
 
   if (( verbose )); then
     run_sudo_cleanup=1
-    GRZ_KEEP_SUDO_SESSION=1 "$repo_root/scripts/system-copy-select" "$action" --verbose -- "$system_selector"
+    env "${env_prefix}_KEEP_SUDO_SESSION=1" "$repo_root/scripts/system-copy-select" "$action" --verbose -- "$system_selector"
   else
     run_sudo_cleanup=1
-    GRZ_KEEP_SUDO_SESSION=1 "$repo_root/scripts/system-copy-select" "$action" -- "$system_selector"
+    env "${env_prefix}_KEEP_SUDO_SESSION=1" "$repo_root/scripts/system-copy-select" "$action" -- "$system_selector"
   fi
 }
 
@@ -1535,7 +1646,7 @@ run_system_activation() {
 
   system_selector="$(selector_system_arg "$selector")"
   run_sudo_cleanup=1
-  GRZ_KEEP_SUDO_SESSION=1 "$repo_root/scripts/system-copy-select" activate -- "$system_selector"
+  env "${env_prefix}_KEEP_SUDO_SESSION=1" "$repo_root/scripts/system-copy-select" activate -- "$system_selector"
 }
 
 run_check_repo_for_packages() {
@@ -1664,15 +1775,243 @@ parse_activate() {
   done
 }
 
+# Prompts on the controlling terminal so it works even when stdin is redirected;
+# falls back to stdin when no terminal is available (e.g. non-interactive tests).
+# Returns 0 only on an explicit yes; defaults to no on empty/EOF/other input.
+confirm_reap() {
+  local prompt="$1"
+  local reply=""
+
+  if [[ -c /dev/tty ]] && { : < /dev/tty; } 2>/dev/null; then
+    print -n -- "$prompt" > /dev/tty
+    IFS= read -r reply < /dev/tty || reply=""
+  else
+    print -n -- "$prompt"
+    IFS= read -r reply || reply=""
+  fi
+  [[ "${(L)reply}" == (y|yes) ]]
+}
+
+# Removes a package's orphaned stow symlinks (and, when installing into $HOME,
+# deactivates its user units) after the package's source tree has already been
+# deleted from the repo, so the normal `uninstall` / `stow --delete` path can no
+# longer act on it. Installed stow links are identified by their (canonicalized)
+# target still pointing under this repo's own "$repo_root/stow/<pkg>/" (or
+# "$repo_root/packages/<pkg>/install/"), which survives tree deletion as a
+# dangling link. Matching is anchored to $repo_root so a package reinstalled
+# from a different stow-based checkout of the same name is left alone.
+#
+# Only symlinks whose target matches the package marker are ever removed; real
+# files and directories are never touched. The scan is bounded to the known
+# stow-managed subtrees. system-install files copied to "/" are out of scope.
+#
+# A package that was only ever enabled via `systemctl --user enable`, without
+# shipping a unit file in its own stow tree, leaves no marker-matched link at
+# all -- its only trace is a dangling systemd "*.wants/<unit>" enablement
+# link. Such units are additionally detected by naming convention ("$package"
+# or "$package-*") plus brokenness (the link must already be dangling); this
+# heuristic pass only ever feeds unit deactivation, never the removed-symlinks
+# report above, and never touches a live, healthy unit.
+reap_orphaned_package() {
+  local package="$1"
+  local dry_run="$2"
+  local assume_yes="$3"
+  local root scan_root link link_target link_raw unit wants_link
+  local marker_stow marker_pkg
+  local -a scan_roots found_links unit_names wants_links wants_only_units
+  local removed=0 skipped=0
+
+  validate_package_name "$package"
+  case "$package" in
+    all|all-user|all-system)
+      die "orphaned uninstall requires a single package name, not: $package"
+      ;;
+  esac
+
+  if package_has_user_install "$package"; then
+    die "package '$package' still has a source tree in this repo; use: $script_name uninstall $package"
+  fi
+
+  [[ -d "$target" ]] || die "target directory does not exist: $target"
+  command -v readlink >/dev/null 2>&1 || die "readlink is required"
+
+  marker_stow="$repo_root/stow/$package/"
+  marker_pkg="$repo_root/packages/$package/install/"
+  # All documented user-install roots (AGENTS.md file-path mapping + README's
+  # rc.d/profile.d loaders). The marker-prefix filter below discards any link
+  # not pointing into this package's tree, so a broad root list is safe; missing
+  # a root would silently strand that package's dangling links on --orphaned.
+  scan_roots=(
+    ".local/bin"
+    ".local/my-custom-bin"
+    ".local/share/applications"
+    ".config/systemd/user"
+    ".config/autostart"
+    ".config/zsh/rc.d"
+    ".config/profile.d"
+    ".zsh_scripts"
+  )
+
+  found_links=()
+  for root in "${scan_roots[@]}"; do
+    scan_root="$target/$root"
+    [[ -d "$scan_root" ]] || continue
+    while IFS= read -r link; do
+      [[ -n "$link" ]] || continue
+      # Resolve only this symlink's own (possibly relative, possibly
+      # dangling) target to an absolute path, without following further
+      # symlinks: readlink -f/-m would chase the *entire* chain, which
+      # wrongly sweeps up e.g. a systemd "*.wants/<unit>" link (-> "../<unit>")
+      # whenever the unit file it points at happens to be a dangling stow
+      # link itself. The ":a" modifier only makes the path absolute and
+      # collapses ".."/"." lexically, so a one-hop resolution is enough to
+      # compare against $repo_root.
+      link_raw="$(readlink -- "$link")" || continue
+      if [[ "$link_raw" == /* ]]; then
+        link_target="$link_raw"
+      else
+        link_target="${link:h}/$link_raw"
+      fi
+      link_target="${link_target:a}"
+      if [[ "$link_target" == "$marker_stow"* || "$link_target" == "$marker_pkg"* ]]; then
+        found_links+=("$link")
+      fi
+    done < <(find "$scan_root" -type l 2>/dev/null)
+  done
+
+  # A package can have been enabled purely via `systemctl --user enable`
+  # with no unit file ever shipped in its own stow tree (e.g. a package whose
+  # only leftover is a dangling default.target.wants/<pkg>.service link). Such
+  # a link's own target ("../<unit>") one-hop-resolves to a path under $target,
+  # never under $repo_root, so it can never appear in found_links above; naming
+  # convention ("$package" or "$package-*") plus brokenness is the only signal
+  # left once the package tree is gone. Only a *dangling* link counts, so a
+  # live, healthy unit is never swept just because its name happens to start
+  # with the package name. `enable` places the link under .wants/, .requires/,
+  # or .upholds/ per the unit's WantedBy=/RequiredBy=/UpheldBy= (systemd.unit(5)),
+  # so all three enablement dirs are scanned.
+  wants_only_units=()
+  for wants_link in "$target/.config/systemd/user/"*.{wants,requires,upholds}/*(N); do
+    [[ -L "$wants_link" && ! -e "$wants_link" ]] || continue
+    unit="${wants_link:t}"
+    case "$unit" in
+      "$package".service|"$package".timer|"$package".path|"$package".socket|"$package".target| \
+      "$package"-*.service|"$package"-*.timer|"$package"-*.path|"$package"-*.socket|"$package"-*.target)
+        wants_only_units+=("$unit")
+        ;;
+    esac
+  done
+
+  if (( ${#found_links[@]} == 0 && ${#wants_only_units[@]} == 0 )); then
+    print -- "No orphaned symlinks found for '$package' under $target"
+    return 0
+  fi
+
+  # Deactivate user units first, derived from matched systemd/user unit links
+  # plus any wants-only leftovers detected above.
+  unit_names=()
+  for link in "${found_links[@]}"; do
+    if [[ "$link" == "$target/.config/systemd/user/"* ]]; then
+      case "${link:t}" in
+        *.service|*.timer|*.path|*.socket|*.target) unit_names+=("${link:t}") ;;
+      esac
+    fi
+  done
+  for unit in "${wants_only_units[@]}"; do
+    (( ${unit_names[(Ie)$unit]} )) || unit_names+=("$unit")
+  done
+
+  if (( ${#unit_names[@]} > 0 )); then
+    if ! stow_target_is_home; then
+      print -- "Skipping user unit deactivation for $package because STOW_TARGET is not HOME: $target"
+    elif ! command -v systemctl >/dev/null 2>&1; then
+      print -u2 -- "warning: systemctl not found; skipping user unit deactivation for $package"
+    else
+      for unit in "${unit_names[@]}"; do
+        if (( dry_run )); then
+          print -- "(dry-run) would disable and stop (user) $unit"
+          wants_links=("$target/.config/systemd/user/"*.{wants,requires,upholds}/"$unit"(N))
+          for wants_link in "${wants_links[@]}"; do
+            if [[ -L "$wants_link" ]]; then
+              print -- "(dry-run) would remove stale enablement link: $wants_link"
+            else
+              print -u2 -- "(dry-run) warning: not a symlink, would refuse to remove: $wants_link"
+            fi
+          done
+          continue
+        fi
+        if (( ! assume_yes )) && ! confirm_reap "Disable and stop user unit $unit? [y/N] "; then
+          print -- "Skipped unit $unit"
+          continue
+        fi
+        print -- "Disabling and stopping (user) $unit"
+        systemctl --user disable --now "$unit" ||
+          print -u2 -- "warning: failed to disable user unit $unit (ignored)"
+
+        # `disable` reads the unit's [Install] section to find its enablement
+        # symlink (under .wants/, .requires/, or .upholds/); once the unit file
+        # is itself a dangling stow link that read fails, so `disable` leaves the
+        # link behind. Remove any surviving link directly instead of trusting its
+        # exit status.
+        wants_links=("$target/.config/systemd/user/"*.{wants,requires,upholds}/"$unit"(N))
+        for wants_link in "${wants_links[@]}"; do
+          if [[ -L "$wants_link" ]]; then
+            print -- "Removing stale enablement link: $wants_link"
+            rm -- "$wants_link"
+          else
+            print -u2 -- "warning: not a symlink, refusing to remove: $wants_link"
+          fi
+        done
+      done
+    fi
+  fi
+
+  for link in "${found_links[@]}"; do
+    link_target="$(readlink -- "$link")"
+    print -- "orphaned symlink: $link -> $link_target"
+    if (( dry_run )); then
+      print -- "  (dry-run, skipping removal)"
+      skipped=$(( skipped + 1 ))
+      continue
+    fi
+    if (( ! assume_yes )) && ! confirm_reap "  Remove this symlink? [y/N] "; then
+      print -- "  skipped"
+      skipped=$(( skipped + 1 ))
+      continue
+    fi
+    if [[ -L "$link" ]]; then
+      rm -- "$link"
+      removed=$(( removed + 1 ))
+    else
+      print -u2 -- "  warning: no longer a symlink, skipping: $link"
+      skipped=$(( skipped + 1 ))
+    fi
+  done
+
+  print -- "Done: $removed removed, $skipped skipped for '$package'"
+}
+
 parse_uninstall() {
   local selector=""
   local verbose=0
+  local orphaned=0
+  local dry_run=0
+  local assume_yes=0
   local package
 
   while (( $# > 0 )); do
     case "$1" in
       --verbose|-v)
         verbose=1
+        ;;
+      --orphaned|--reap)
+        orphaned=1
+        ;;
+      --dry-run|-n)
+        dry_run=1
+        ;;
+      -y|--yes)
+        assume_yes=1
         ;;
       --)
         shift
@@ -1704,6 +2043,15 @@ parse_uninstall() {
     usage
     exit 64
   }
+
+  if (( ! orphaned )) && (( dry_run || assume_yes )); then
+    die "--dry-run and -y are only valid with --orphaned"
+  fi
+
+  if (( orphaned )); then
+    reap_orphaned_package "$selector" "$dry_run" "$assume_yes"
+    return
+  fi
 
   local any_user_units=0
 
@@ -1750,18 +2098,10 @@ case "$action" in
     parse_activate "$@"
     ;;
   verify)
-    (( $# == 1 )) || {
-      usage
-      exit 64
-    }
-    run_verify "$1"
+    parse_verify "$@"
     ;;
   test)
-    (( $# == 1 )) || {
-      usage
-      exit 64
-    }
-    run_test "$1"
+    parse_test "$@"
     ;;
   *)
     usage

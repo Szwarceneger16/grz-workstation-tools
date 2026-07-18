@@ -1,5 +1,13 @@
 # AGENTS.md
 
+## Contribution language (read first)
+
+All committed and published Git artifacts MUST be written in English: commit
+messages, pull-request titles, and pull-request descriptions. This applies to
+every repository that shares this management layer (this repo and
+`private-consumer`). Interactive replies to the user may stay in the
+user's language — only the Git artifacts are required to be English.
+
 ## Repository purpose
 
 This is a public Zsh toolkit repository. It provides a Zsh runtime (functions, completions, aliases, rc fragments) installed via GNU Stow.
@@ -116,8 +124,12 @@ package-specific behavior into `scripts/system-copy-select` or `run.sh`.
   before mutation and treats `daemon-reload` failure as fatal. `.timer` → enable if `[Install]`
   exists, then `restart`; `.path`/`.socket` → enable if `[Install]` exists, then `start`
   without restart; `.target`/`.mount` → enable only with `[Install]`, otherwise `start`;
-  `.service` → `start` only. Uninstall is best-effort teardown: triggers first, then the
-  remaining units in reverse manifest order.
+  a standalone `.service` → `enable --now` if `[Install]` exists (persisted across boots),
+  otherwise `start` only. A trigger-managed `.service` is skipped, except a **timer**-managed
+  `Type=oneshot`, which is deferred and started once after every trigger is enabled (a
+  socket/path-managed service must start from its own activation context, so it is never
+  started here). Uninstall is best-effort teardown: triggers first, then the remaining units
+  in reverse manifest order, `disable`-ing the `[Install]`-bearing services it enabled.
 - There are **no system hooks**. If something privileged isn't expressible as a manifest, raise it
   with the user rather than adding a sudo hook.
 
