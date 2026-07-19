@@ -46,7 +46,7 @@ vprint() { (( verbose )) && print -- "$@"; return 0; }
 # the path does NOT count as present (otherwise install would report success
 # but never source the fragments).
 zsh_detect='(^# >>> zsh rc\.d loader \(managed\) >>>$)|(^[[:space:]]*for[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]+in[[:space:]].*\.config/zsh/rc\.d/\*\.zsh)'
-zsh_block=$'# >>> zsh rc.d loader (managed) >>>\n# Sources ~/.config/zsh/rc.d/*.zsh so packages can drop rc fragments there.\n# Managed by grz-workstation-tools / shell-bootstrap. Safe to remove this block.\nif [[ -d "$HOME/.config/zsh/rc.d" ]]; then\n  for zsh_rc_file in "$HOME"/.config/zsh/rc.d/*.zsh(N); do\n    source "$zsh_rc_file"\n  done\nfi\n# <<< zsh rc.d loader (managed) <<<'
+zsh_block=$'# >>> zsh rc.d loader (managed) >>>\n# Sources ~/.config/zsh/rc.d/*.zsh so packages can drop rc fragments there.\n# Managed by grz-workstation-tools shell-bootstrap. Safe to remove this block.\nif [[ -d "$HOME/.config/zsh/rc.d" ]]; then\n  for zsh_rc_file in "$HOME"/.config/zsh/rc.d/*.zsh(N); do\n    source "$zsh_rc_file"\n  done\nfi\n# <<< zsh rc.d loader (managed) <<<'
 # Canonical (readlink -f) suffix of a legacy repo-owned stow symlink for this
 # file (either repo's packages/<pkg>/install/<file> layout). Captures the
 # repo-root prefix in $match[1] so ensure_loader can verify it's one of the
@@ -65,12 +65,12 @@ profile_detect='(^# >>> profile\.d loader \(managed\) >>>$)|(^[[:space:]]*for[[:
 # Plain variant: appended to a pre-existing ~/.profile (the common case — most
 # systems' default ~/.profile already sources ~/.bashrc itself, so adding
 # another copy here would source it twice at every login).
-profile_block_loop_only=$'# >>> profile.d loader (managed) >>>\n# Sources ~/.config/profile.d/*.sh at login. Managed by grz-workstation-tools /\n# shell-bootstrap. Safe to remove this block.\nif [ -d "$HOME/.config/profile.d" ]; then\n  for profile_file in "$HOME"/.config/profile.d/*.sh; do\n    [ -r "$profile_file" ] && . "$profile_file"\n  done\nfi\n# <<< profile.d loader (managed) <<<'
+profile_block_loop_only=$'# >>> profile.d loader (managed) >>>\n# Sources ~/.config/profile.d/*.sh at login. Managed by grz-workstation-tools\n# shell-bootstrap. Safe to remove this block.\nif [ -d "$HOME/.config/profile.d" ]; then\n  for profile_file in "$HOME"/.config/profile.d/*.sh; do\n    [ -r "$profile_file" ] && . "$profile_file"\n  done\nfi\n# <<< profile.d loader (managed) <<<'
 # With-bashrc variant: used only when ~/.profile is being freshly created (no
 # pre-existing file that would already source ~/.bashrc on its own), so Bash
 # login shells keep working. Same sentinel as the loop-only variant, so either
 # one satisfies profile_detect above.
-profile_block_with_bashrc=$'# >>> profile.d loader (managed) >>>\n# Sources ~/.bashrc for Bash login shells (this file is being freshly created,\n# so unlike a pre-existing ~/.profile it would otherwise never do this) and\n# ~/.config/profile.d/*.sh at login. Managed by grz-workstation-tools / mint\n# shell-bootstrap. Safe to remove this block.\nif [ -n "$BASH_VERSION" ]; then\n  if [ -f "$HOME/.bashrc" ]; then\n    . "$HOME/.bashrc"\n  fi\nfi\nif [ -d "$HOME/.config/profile.d" ]; then\n  for profile_file in "$HOME"/.config/profile.d/*.sh; do\n    [ -r "$profile_file" ] && . "$profile_file"\n  done\nfi\n# <<< profile.d loader (managed) <<<'
+profile_block_with_bashrc=$'# >>> profile.d loader (managed) >>>\n# Sources ~/.bashrc for Bash login shells (this file is being freshly created,\n# so unlike a pre-existing ~/.profile it would otherwise never do this) and\n# ~/.config/profile.d/*.sh at login. Managed by grz-workstation-tools\n# shell-bootstrap. Safe to remove this block.\nif [ -n "$BASH_VERSION" ]; then\n  if [ -f "$HOME/.bashrc" ]; then\n    . "$HOME/.bashrc"\n  fi\nfi\nif [ -d "$HOME/.config/profile.d" ]; then\n  for profile_file in "$HOME"/.config/profile.d/*.sh; do\n    [ -r "$profile_file" ] && . "$profile_file"\n  done\nfi\n# <<< profile.d loader (managed) <<<'
 profile_legacy_target='^(.*)/packages/[^/]+/install/\.profile$'
 
 # ensure_loader <file> <detect> <block> <label> <legacy_target>

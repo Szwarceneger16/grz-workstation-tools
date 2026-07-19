@@ -10,7 +10,7 @@ ignore_all_file="$repo_root/manifests/ignore-all-install.txt"
 # --- Per-repo runner config (env-var prefix). NOT part of the synced canonical engine. ---
 runner_conf="$repo_root/runner.conf"
 [[ -r "$runner_conf" ]] && source "$runner_conf"
-: "${RUNNER_ENV_PREFIX:?runner.conf must define RUNNER_ENV_PREFIX (e.g. GRZ or MINT)}"
+: "${RUNNER_ENV_PREFIX:?runner.conf must define RUNNER_ENV_PREFIX (e.g. GRZ)}"
 env_prefix="$RUNNER_ENV_PREFIX"
 
 _stow_target_var="${env_prefix}_STOW_TARGET"

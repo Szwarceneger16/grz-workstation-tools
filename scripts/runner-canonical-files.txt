@@ -1,5 +1,5 @@
 # Canonical engine file set — the "one source of truth" shared verbatim between
-# grz-workstation-tools (canon) and its consumers (e.g. private-consumer).
+# the canonical engine repo and any downstream consumer repos that pull it.
 #
 # These files MUST stay byte-identical across repos. `scripts/sync-runner pull`
 # copies exactly this set from the canon into a consumer; `sync-runner check`

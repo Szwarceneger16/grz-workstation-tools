@@ -3,8 +3,8 @@ emulate -L zsh
 set -euo pipefail
 
 # Keeps the canonical engine file set (scripts/runner-canonical-files.txt) in
-# sync between the canon (grz-workstation-tools) and its consumers (e.g.
-# private-consumer). Direction is always consumer-pulls-canon: this
+# sync between the canonical engine repo and any downstream consumer repos that
+# pull it. Direction is always consumer-pulls-canon: this
 # never writes to the canon and is never run by the canon against a consumer.
 #
 #   sync-runner pull [<ref>]  fetch canon from RUNNER_CANONICAL_REMOTE (read-only,

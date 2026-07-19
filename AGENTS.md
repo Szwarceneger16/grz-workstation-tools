@@ -4,8 +4,7 @@
 
 All committed and published Git artifacts MUST be written in English: commit
 messages, pull-request titles, and pull-request descriptions. This applies to
-every repository that shares this management layer (this repo and
-`private-consumer`). Interactive replies to the user may stay in the
+every repository that shares this management layer. Interactive replies to the user may stay in the
 user's language — only the Git artifacts are required to be English.
 
 ## Repository purpose
@@ -168,7 +167,7 @@ must live in the package root (never under `install/`). Hooks receive `GRZ_REPO_
 Because the repo never owns `~/.zshrc` / `~/.profile`, `zsh-tools`'s `install.hook.sh` appends
 a marked loader block to them (via `scripts/ensure-rcd-loaders`) so `~/.config/zsh/rc.d/*.zsh`
 and `~/.config/profile.d/*.sh` are sourced — idempotently, without rewriting the user's config.
-The block/sentinels are byte-identical to the private-consumer counterpart so both repos
+The block/sentinels are byte-identical across any repo that shares this bootstrap, so they
 converge on one loop. `verify.hook.sh` checks the same, read-only.
 
 ## Shell script rules
