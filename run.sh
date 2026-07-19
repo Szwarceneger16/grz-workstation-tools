@@ -646,10 +646,47 @@ activation_bases_for_unit() {
   esac
 }
 
+# Returns 0 when a live `systemd --user` manager is reachable, 1 otherwise.
+# `systemctl --user is-system-running` prints a status word (running, degraded,
+# starting, ...) to stdout whenever it can reach a user manager, regardless of
+# its own exit code; only empty output or the literal "offline" status mean no
+# manager is reachable at all (no D-Bus user session in an SSH/cron/sudo
+# context). This is the single no-user-bus signal that downgrades an otherwise
+# fatal user unit activation/deactivation failure to a clean skip; every other
+# non-zero systemctl status stays fatal.
+user_manager_reachable() {
+  local status
+  status="$(systemctl --user is-system-running 2>/dev/null)" || true
+  case "$status" in
+    ""|offline) return 1 ;;
+  esac
+  return 0
+}
+
+# Create a user unit's [Install] enablement symlinks. `enable` only manipulates
+# those symlinks, so it must run even with no live user manager (an SSH/cron/
+# no-lingering session where is-system-running is offline) to leave the unit
+# enabled for the next login; there we use systemd's documented offline mode
+# (SYSTEMD_OFFLINE=1), because a plain `systemctl --user enable` fails to connect
+# to the bus and creates nothing. When the manager is live, a plain enable also
+# refreshes its in-memory enablement state. reload/start/restart genuinely need
+# the bus and stay gated by the caller.
+enable_user_unit() {
+  local unit="$1" package="$2" online="$3"
+  if (( online )); then
+    systemctl --user enable "$unit" ||
+      die "failed to enable user $unit for $package"
+  else
+    SYSTEMD_OFFLINE=1 systemctl --user enable "$unit" ||
+      die "failed to enable user $unit for $package (offline)"
+  fi
+}
+
 activate_user_units() {
   local package="$1"
   local unit unit_file unit_dir dest_name base instance_path
   local verify_failures=0
+  local online=1
   typeset -A activation_bases
 
   load_user_units_metadata "$package"
@@ -693,9 +730,20 @@ activate_user_units() {
   (( verify_failures == 0 )) ||
     die "cannot activate $package: $verify_failures user unit stow-link verification failure(s)"
 
-  print -- "Reloading user systemd manager for $package"
-  systemctl --user daemon-reload ||
-    die "failed to reload user systemd manager for $package"
+  # An offline user manager (e.g. SSH/cron/sudo without lingering) does not skip
+  # activation wholesale: `enable` still runs offline (see enable_user_unit) so
+  # units are enabled for the next login. Only the bus-dependent steps
+  # (daemon-reload, start, restart) are skipped here; when the manager is live,
+  # every failure below is fatal.
+  user_manager_reachable || online=0
+
+  if (( online )); then
+    print -- "Reloading user systemd manager for $package"
+    systemctl --user daemon-reload ||
+      die "failed to reload user systemd manager for $package"
+  else
+    print -u2 -- "warn - no live user systemd manager for $package; enabling [Install] units offline for the next login, skipping reload/start/restart"
+  fi
 
   for unit in "${user_units[@]}"; do
     case "$unit" in
@@ -705,12 +753,13 @@ activate_user_units() {
         unit_file="$(resolve_unit_file_path "$unit_dir" "$unit")"
         if unit_has_install_section "$unit_file"; then
           print -- "Enabling (user) $unit"
-          systemctl --user enable "$unit" ||
-            die "failed to enable user $unit for $package"
+          enable_user_unit "$unit" "$package" "$online"
         fi
-        print -- "Restarting (user) $unit"
-        systemctl --user restart "$unit" ||
-          die "failed to restart user $unit for $package"
+        if (( online )); then
+          print -- "Restarting (user) $unit"
+          systemctl --user restart "$unit" ||
+            die "failed to restart user $unit for $package"
+        fi
         ;;
       *.path|*.socket)
         # Trigger units: start, and enable only when installable. Unlike
@@ -719,12 +768,13 @@ activate_user_units() {
         unit_file="$(resolve_unit_file_path "$unit_dir" "$unit")"
         if unit_has_install_section "$unit_file"; then
           print -- "Enabling (user) $unit"
-          systemctl --user enable "$unit" ||
-            die "failed to enable user $unit for $package"
+          enable_user_unit "$unit" "$package" "$online"
         fi
-        print -- "Starting (user) $unit"
-        systemctl --user start "$unit" ||
-          die "failed to start user $unit for $package"
+        if (( online )); then
+          print -- "Starting (user) $unit"
+          systemctl --user start "$unit" ||
+            die "failed to start user $unit for $package"
+        fi
         ;;
       *.service)
         if [[ -n "${activation_bases[${unit%.service}]+x}" ]]; then
@@ -735,12 +785,13 @@ activate_user_units() {
           # it is a hard systemctl error and would abort start-only services.
           if unit_has_install_section "$unit_file"; then
             print -- "Enabling (user) $unit"
-            systemctl --user enable "$unit" ||
-              die "failed to enable user $unit for $package"
+            enable_user_unit "$unit" "$package" "$online"
           fi
-          print -- "Starting (user) $unit"
-          systemctl --user start "$unit" ||
-            die "failed to start user $unit for $package"
+          if (( online )); then
+            print -- "Starting (user) $unit"
+            systemctl --user start "$unit" ||
+              die "failed to start user $unit for $package"
+          fi
         fi
         ;;
       *.target|*.mount)
@@ -748,11 +799,17 @@ activate_user_units() {
           print -- "Skipping $unit (managed by a timer unit)"
         else
           unit_file="$(resolve_unit_file_path "$unit_dir" "$unit")"
+          # Split the old `enable --now` into enable (offline-capable) + start
+          # (bus-only), so the [Install] symlink is created even offline.
           if unit_has_install_section "$unit_file"; then
-            print -- "Enabling and starting (user) $unit"
-            systemctl --user enable --now "$unit" ||
-              die "failed to enable/start user $unit for $package"
-          else
+            print -- "Enabling (user) $unit"
+            enable_user_unit "$unit" "$package" "$online"
+            if (( online )); then
+              print -- "Starting (user) $unit"
+              systemctl --user start "$unit" ||
+                die "failed to start user $unit for $package"
+            fi
+          elif (( online )); then
             print -- "Starting (user) $unit"
             systemctl --user start "$unit" ||
               die "failed to start user $unit for $package"
@@ -802,6 +859,16 @@ deactivate_user_units() {
 
   command -v systemctl >/dev/null 2>&1 ||
     die "systemctl is required to deactivate user units for $package"
+
+  # An unreachable user bus in *this* session does not prove the units are
+  # inactive: with systemd lingering or a concurrent login session a user manager
+  # may still be running them elsewhere. deactivate_user_units runs right before
+  # parse_uninstall removes the stow links, so continuing here could strand live
+  # units after their files are gone. AGENTS.md makes user-unit deactivation
+  # failures fatal for exactly this reason: abort the uninstall instead.
+  if ! user_manager_reachable; then
+    die "cannot deactivate user units for $package: no reachable user systemd manager in this session (a lingering or other-session manager may still be running them); refusing to remove files while units may be active"
+  fi
 
   unit_dir="$repo_root/packages/$package/install/.config/systemd/user"
   activation_bases=()
@@ -946,22 +1013,16 @@ verify_user_live_units() {
     return 0
   }
 
-  # systemctl --user prints a status word (running, degraded, starting, ...)
-  # to stdout whenever it can reach a user manager, regardless of its own
-  # exit code; only empty output or the literal "offline" status mean no
-  # manager is reachable at all (e.g. no D-Bus user session in a CI
-  # container, cron, or sudo session), in which case systemd-analyze --user
-  # verify would hard-fail on a RuntimeDirectory lookup rather than perform a
-  # static verification. Other non-"running" states (degraded, maintenance,
-  # starting, stopping) still have a live manager and should still be verified.
-  local user_manager_status
-  user_manager_status="$(systemctl --user is-system-running 2>/dev/null)" || true
-  case "$user_manager_status" in
-    ""|offline)
-      print -- "warn - skipping systemd-analyze --user verify for $package because no live user systemd manager is reachable"
-      return 0
-      ;;
-  esac
+  # No live user manager (empty/"offline" is-system-running status: no D-Bus
+  # user session in a CI container, cron, or sudo session) means
+  # systemd-analyze --user verify would hard-fail on a RuntimeDirectory lookup
+  # rather than perform a static verification, so skip it. Non-"running" states
+  # (degraded, maintenance, starting, stopping) still have a live manager and
+  # are still verified. See user_manager_reachable for the exact signal.
+  if ! user_manager_reachable; then
+    print -- "warn - skipping systemd-analyze --user verify for $package because no live user systemd manager is reachable"
+    return 0
+  fi
 
   print -- "Verifying live user systemd units for $package"
   vprint "+ systemd-analyze --user verify ${unit_paths[*]}"
@@ -1111,8 +1172,13 @@ verify_system_config_paths() {
       failures=$(( failures + 1 ))
       continue
     fi
-    if (( (8#$mode & 8#077) != 0 )); then
-      print -u2 -- "not ok - config path must be root-only, for example mode 0600: $dest"
+    # Mask set-id/sticky bits too (8#7077, not just 8#077), matching
+    # require_configs_present in scripts/system-copy-select, which now refuses to
+    # activate a secret config carrying setuid/setgid/sticky bits. Without the
+    # 7000 bits here, verify would report OK for exactly the insecure mode (e.g.
+    # 4600 after a manual chmod) that activation rejects.
+    if (( (8#$mode & 8#7077) != 0 )); then
+      print -u2 -- "not ok - config path must be root-only with no set-id/sticky bits, for example mode 0600: $dest"
       failures=$(( failures + 1 ))
       continue
     fi
@@ -1206,7 +1272,15 @@ verify_system_package() {
 
   for source in "${sources[@]}"; do
     rel_path="${source#$install_dir/}"
-    is_install_meta_file "$rel_path" && continue
+    # Skip only *undeclared* meta files (git/stow hygiene a package may carry);
+    # a meta-named file that IS declared in the manifest (e.g. an intentionally
+    # installed /etc/skel/.gitignore) must still be verified for presence, owner,
+    # and mode — mirroring collect_package_files in scripts/system-copy-select,
+    # which now installs it. Skipping it here would let verify report OK while the
+    # declared file is missing or wrong.
+    if [[ -z "${target_modes[$rel_path]-}" ]] && is_install_meta_file "$rel_path"; then
+      continue
+    fi
     if [[ -z "${target_modes[$rel_path]-}" ]]; then
       print -u2 -- "not ok - missing manifest entry for system file: $package $rel_path"
       failures=$(( failures + 1 ))
@@ -1384,7 +1458,12 @@ test_system_package() {
 
   for source in "${sources[@]}"; do
     rel_path="${source#$install_dir/}"
-    is_install_meta_file "$rel_path" && continue
+    # Skip only *undeclared* meta files; a declared meta-named file must still be
+    # checked for its manifest entry (parity with verify_system_package and with
+    # collect_package_files in scripts/system-copy-select).
+    if [[ -z "${target_modes[$rel_path]-}" ]] && is_install_meta_file "$rel_path"; then
+      continue
+    fi
     if [[ -z "${target_modes[$rel_path]-}" ]]; then
       print -u2 -- "not ok - missing manifest entry for repo system file: $package $rel_path"
       failures=$(( failures + 1 ))
@@ -1586,6 +1665,7 @@ select_install_hook_packages() {
 # express (e.g. appending a loader block to ~/.zshrc without owning the file).
 # Receives the same env as verify.hook.sh.
 run_install_hooks() {
+  local verbose="${1:-0}"
   local package hook
 
   (( ${#hook_packages[@]} > 0 )) || return 0
@@ -1593,7 +1673,7 @@ run_install_hooks() {
   for package in "${hook_packages[@]}"; do
     hook="$repo_root/packages/$package/install.hook.sh"
     [[ -x "$hook" ]] || die "install hook is not executable: $hook"
-    env "${env_prefix}_REPO_ROOT=$repo_root" "${env_prefix}_PACKAGE=$package" "STOW_TARGET=$target" "$hook" ||
+    env "${env_prefix}_REPO_ROOT=$repo_root" "${env_prefix}_PACKAGE=$package" "STOW_TARGET=$target" "${env_prefix}_VERBOSE=$verbose" "$hook" ||
       die "$package install hook failed"
   done
 }
@@ -1708,7 +1788,7 @@ parse_install() {
   run_check_repo_for_packages "${hook_packages[@]}"
 
   run_stow_action install "$selector" "$verbose"
-  run_install_hooks
+  run_install_hooks "$verbose"
   run_system_action install "$selector" "$verbose"
 
   if (( do_verify )); then

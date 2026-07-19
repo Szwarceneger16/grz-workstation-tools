@@ -130,8 +130,19 @@ select_packages() {
 
 is_meta_file() {
   local rel_path="$1"
+  # Files Stow ignores and never links (mirror scripts/check-repo is_meta_file and
+  # is_install_meta_file in run.sh): git metadata and stow markers a package may
+  # carry without being installed. Skipped here so a system package carrying such
+  # a file with no manifest entry is not rejected during collection (which would
+  # otherwise diverge from check-repo, which already treats these as meta).
   case "$rel_path" in
-    .gitkeep|*/.gitkeep)
+    .gitkeep|*/.gitkeep|.stow-local-ignore|*/.stow-local-ignore)
+      return 0
+      ;;
+    .gitignore|*/.gitignore|.gitattributes|*/.gitattributes|.gitmodules|*/.gitmodules)
+      return 0
+      ;;
+    .git/*|*/.git/*)
       return 0
       ;;
   esac
@@ -237,7 +248,16 @@ collect_package_files() {
 
   for source in "$install_dir"/**/*(DN.); do
     rel_path="${source#$install_dir/}"
-    is_meta_file "$rel_path" && continue
+    # A manifest-declared file is always collected, even when its basename matches
+    # a meta pattern (e.g. an intentionally-installed /etc/skel/.gitignore).
+    # is_meta_file only lets a package carry *undeclared* git/stow hygiene files
+    # (a repo .gitignore, .stow-local-ignore, ...) without tripping the
+    # "missing manifest entry" guard below; skipping a *declared* meta file here
+    # would silently drop it from install/uninstall and diverge the live system
+    # from system-install.manifest.
+    if [[ -z "${target_modes[$rel_path]-}" ]] && is_meta_file "$rel_path"; then
+      continue
+    fi
     if is_protected_rel_path "$rel_path"; then
       die "refusing protected system path in repo package: $package $rel_path"
     fi
@@ -690,8 +710,8 @@ pre_validate_config_manifest() {
       die "system-config.manifest entry must be root-owned: $package $rel_path (got $owner)"
     nm="$(normalize_mode "$mode")" ||
       die "invalid mode in system-config.manifest: $package $rel_path: $mode"
-    (( (8#$nm & 8#077) == 0 )) ||
-      die "system-config.manifest entry must be root-only mode: $package $rel_path (mode $mode)"
+    (( (8#$nm & 8#7077) == 0 )) ||
+      die "system-config.manifest entry must be root-only mode with no set-id/sticky bits: $package $rel_path (mode $mode)"
   done < "$manifest"
 }
 
@@ -717,8 +737,8 @@ process_package_configs() {
       existing_mode="$(sudo -n stat -c '%a' -- "$dest")" || die "cannot stat config mode: $dest"
       [[ "$existing_uid" == "0" ]] ||
         die "existing config is not root-owned: $dest (fix: sudo chown root:root $dest && sudo chmod 600 $dest)"
-      (( (8#$existing_mode & 8#077) == 0 )) ||
-        die "existing config has insecure permissions: $dest (fix: sudo chmod 600 $dest)"
+      (( (8#$existing_mode & 8#7077) == 0 )) ||
+        die "existing config has insecure permissions (group/world or set-id/sticky bits): $dest (fix: sudo chmod 600 $dest)"
       print -- "Detected existing config (left as-is): $dest"
       continue
     fi
@@ -726,8 +746,8 @@ process_package_configs() {
     [[ "$owner" == "root" || "$owner" == "0" ]] ||
       die "refusing to install secret config with non-root owner: $dest (manifest owner: $owner; system-config.manifest entries must be root-owned)"
 
-    (( (8#$mode & 8#077) == 0 )) ||
-      die "refusing to install secret config with group/world-readable mode: $dest (mode $mode; fix the manifest entry to use 0600 or 0400)"
+    (( (8#$mode & 8#7077) == 0 )) ||
+      die "refusing to install secret config with group/world-readable or set-id/sticky mode: $dest (mode $mode; fix the manifest entry to use 0600 or 0400)"
 
     print -- "Package '$package' needs a root-only config at: $dest ($owner:$group mode $mode)"
     src="$(prompt_path "Path to source config for $dest (enter path, empty = sudoedit, 'skip' = defer to later)")"
@@ -774,7 +794,7 @@ require_configs_present() {
     uid="$(sudo -n stat -c '%u' -- "$dest")" || die "cannot stat config owner: $dest"
     mode="$(sudo -n stat -c '%a' -- "$dest")" || die "cannot stat config mode: $dest"
     [[ "$uid" == "0" ]] || die "config must be owned by root: $dest"
-    (( (8#$mode & 8#077) == 0 )) || die "config must be root-only, for example mode 0600: $dest"
+    (( (8#$mode & 8#7077) == 0 )) || die "config must be root-only with no set-id/sticky bits, for example mode 0600: $dest"
   done
 }
 

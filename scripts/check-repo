@@ -120,6 +120,14 @@ load_4col_manifest() {
       err "invalid manifest path (absolute or traversal) at $manifest:$line_no: $rel_path"
       continue
     fi
+    # Reject non-canonical paths: a redundant separator (//) or ./ segment
+    # normalizes away at install time, so the raw string would slip past the
+    # protected-path check (which matches the literal spelling) while the real
+    # destination lands on a protected path. Keep the manifest spelling canonical.
+    if [[ "$rel_path" == *//* || "$rel_path" == */./* || "$rel_path" == ./* || "$rel_path" == */. ]]; then
+      err "invalid manifest path (redundant separator or ./ segment) at $manifest:$line_no: $rel_path"
+      continue
+    fi
     if ! [[ "$mode" =~ '^[0-7]{3,4}$' ]]; then
       err "invalid mode '$mode' at $manifest:$line_no"
       continue
