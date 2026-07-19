@@ -1,9 +1,11 @@
 #compdef gwadd
 
 _gwadd() {
-  autoload -Uz _comp_all_branches
+  autoload -Uz _comp_all_branches _comp_origin_branches
   _arguments -S \
     '(-h --help)'{-h,--help}'[pokaż help]' \
+    '-b[wymuś utworzenie nowego brancha]' \
+    '-t[branch bazowy z origin]:base branch:_comp_origin_branches' \
     '1:branch:_comp_all_branches'
 }
 
