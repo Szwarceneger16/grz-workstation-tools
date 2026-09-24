@@ -1,0 +1,18 @@
+# Security-sensitive runner release surface.
+/.github/workflows/** @Szwarceneger16
+/.github/CODEOWNERS @Szwarceneger16
+/runner.conf @Szwarceneger16
+/runner.release @Szwarceneger16
+/runner.lock @Szwarceneger16
+/runner.docs.lock @Szwarceneger16
+/run.sh @Szwarceneger16
+/bootstrap/** @Szwarceneger16
+/githooks/** @Szwarceneger16
+/scripts/** @Szwarceneger16
+/tests/** @Szwarceneger16
+/docs/runner-sync.md @Szwarceneger16
+/docs/runner-release-process.md @Szwarceneger16
+/scripts/sync-runner @Szwarceneger16
+/scripts/propose-runner-release @Szwarceneger16
+/scripts/runner-canonical-files.txt @Szwarceneger16
+/scripts/runner-canonical-docs.txt @Szwarceneger16

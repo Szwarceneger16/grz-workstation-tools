@@ -1,0 +1,4 @@
+# Maximum public documentation export. Consumers select their own subset.
+# One normalized repository-relative regular-file path per line.
+docs/runner-release-process.md
+docs/runner-sync.md

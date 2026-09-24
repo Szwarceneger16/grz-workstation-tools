@@ -1,144 +1,242 @@
-#!/usr/bin/env zsh
-emulate -L zsh
-set -euo pipefail
+#!/usr/bin/env python3
+"""Validate or refresh the repository's declared runner snapshot.
 
-# Keeps the canonical engine file set (scripts/runner-canonical-files.txt) in
-# sync between the canonical engine repo and any downstream consumer repos that
-# pull it. Direction is always consumer-pulls-canon: this
-# never writes to the canon and is never run by the canon against a consumer.
-#
-#   sync-runner pull [<ref>]  fetch canon from RUNNER_CANONICAL_REMOTE (read-only,
-#                             anonymous), overlay the canonical files onto THIS
-#                             repo, then relock. Does not touch runner.conf,
-#                             .rcd-loader-repo-id, manifests content or packages.
-#   sync-runner lock          (re)write runner.lock from local canonical files
-#                             (run in the canon after editing the engine).
-#   sync-runner check         verify local canonical files against runner.lock
-#                             (run in CI; fails on any drift or set change).
+This helper never contacts another repository. A source repository may use the
+explicitly write-enabled ``lock`` command; consumers receive updates only
+through their own reviewed synchronization workflow.
+"""
 
-script_name="${0:t}"
-repo_root="${0:A:h:h}"
-canon_list="$repo_root/scripts/runner-canonical-files.txt"
-lock_file="$repo_root/runner.lock"
+from __future__ import annotations
 
-runner_conf="$repo_root/runner.conf"
-[[ -r "$runner_conf" ]] && source "$runner_conf"
+import hashlib
+import os
+from pathlib import Path, PurePosixPath
+import re
+import stat
+import sys
+import tempfile
+from typing import Iterable, NoReturn
 
-tmp=""  # clone scratch dir; global so the EXIT trap can clean it up
 
-die() { print -u2 -- "$script_name: $*"; exit 1; }
+ROOT = Path(__file__).resolve().parent.parent
+CONFIG = ROOT / "runner.conf"
+CANON_CODE = "scripts/runner-canonical-files.txt"
+CANON_DOCS = "scripts/runner-canonical-docs.txt"
+SELECTED_CODE = "scripts/runner-sync-files.txt"
+SELECTED_DOCS = "scripts/runner-sync-docs.txt"
+LOCK_CODE = "runner.lock"
+LOCK_DOCS = "runner.docs.lock"
+ALLOWED_CONFIG = {"RUNNER_ENV_PREFIX", "RUNNER_SYNC_ROLE", "RUNNER_CANONICAL_REMOTE"}
+LOCK_RE = re.compile(r"^([0-9a-f]{64})  ([^\0\r\n]+)$")
+SAFE_PATH_RE = re.compile(r"(?:[A-Za-z0-9._@+-]+/)*[A-Za-z0-9._@+-]+")
 
-usage() {
-  print -u2 -- "usage: $script_name pull [<ref>]   # sync canonical engine from RUNNER_CANONICAL_REMOTE"
-  print -u2 -- "       $script_name lock           # (re)write runner.lock from local canonical files"
-  print -u2 -- "       $script_name check          # verify local canonical files against runner.lock"
-}
 
-# Populates the global array canon_files from a canonical-list file.
-read_canon_list() {
-  local list="$1" line
-  canon_files=()
-  [[ -f "$list" ]] || die "canonical list not found: $list"
-  while IFS= read -r line || [[ -n "$line" ]]; do
-    [[ -z "$line" || "$line" == \#* ]] && continue
-    canon_files+=("$line")
-  done < "$list"
-  (( ${#canon_files[@]} > 0 )) || die "no canonical files listed in $list"
-}
+class RunnerSyncError(RuntimeError):
+    pass
 
-cmd_lock() {
-  local -a canon_files
-  read_canon_list "$canon_list"
-  local f
-  for f in "${canon_files[@]}"; do
-    [[ -f "$repo_root/$f" ]] || die "canonical file missing: $f"
-  done
-  ( cd "$repo_root" && sha256sum -- "${canon_files[@]}" ) | sort -k2 > "$lock_file"
-  print -- "wrote ${lock_file:t} (${#canon_files[@]} files)"
-}
 
-cmd_check() {
-  local -a canon_files
-  read_canon_list "$canon_list"
-  [[ -f "$lock_file" ]] || die "no runner.lock — run '$script_name lock' (canon) or '$script_name pull' (consumer)"
+def fail(message: str) -> NoReturn:
+    raise RunnerSyncError(message)
 
-  local f
-  for f in "${canon_files[@]}"; do
-    [[ -f "$repo_root/$f" ]] || die "canonical file missing: $f"
-  done
 
-  # The lock must describe exactly the canonical set (catches an added/removed
-  # canonical file that a pure content check would miss).
-  local locked expected
-  locked="$(awk 'NF{print $2}' "$lock_file" | sort)"
-  expected="$(printf '%s\n' "${canon_files[@]}" | sort)"
-  [[ "$locked" == "$expected" ]] ||
-    die "runner.lock file set differs from ${canon_list:t} (canonical set changed — relock in the canon and re-sync)"
+def parse_config() -> dict[str, str]:
+    if not CONFIG.is_file() or CONFIG.is_symlink():
+        fail("runner.conf must be a regular file")
+    result: dict[str, str] = {}
+    for number, raw in enumerate(CONFIG.read_text(encoding="utf-8").splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            fail(f"runner.conf:{number}: expected KEY=value")
+        key, value = line.split("=", 1)
+        if key not in ALLOWED_CONFIG or key in result:
+            fail(f"runner.conf:{number}: unsupported or duplicate key: {key}")
+        if not re.fullmatch(r"[A-Za-z0-9_./:@+%-]+", value):
+            fail(f"runner.conf:{number}: unsafe value for {key}")
+        result[key] = value
+    role = result.get("RUNNER_SYNC_ROLE")
+    if role not in {"source", "consumer"}:
+        fail("runner.conf must set RUNNER_SYNC_ROLE=source or consumer")
+    expected = os.environ.get("RUNNER_SYNC_EXPECTED_ROLE")
+    if expected and role != expected:
+        fail(f"repository role is {role!r}, CI expected {expected!r}")
+    return result
 
-  ( cd "$repo_root" && sha256sum -c --quiet -- "$lock_file" ) ||
-    die "canonical engine drifted from runner.lock — do not hand-edit the vendored engine; edit it in the canon and run '$script_name pull'"
-  print -- "ok - canonical engine matches runner.lock (${#canon_files[@]} files)"
-}
 
-cmd_pull() {
-  local ref="${1:-main}"
-  : "${RUNNER_CANONICAL_REMOTE:?runner.conf must set RUNNER_CANONICAL_REMOTE for pull}"
-  command -v git >/dev/null 2>&1 || die "git is required for pull"
+def safe_path(value: str, origin: str, number: int) -> str:
+    if not value or value != value.strip() or not SAFE_PATH_RE.fullmatch(value):
+        fail(f"{origin}:{number}: malformed path")
+    candidate = PurePosixPath(value)
+    if candidate.is_absolute() or any(part in {"", ".", ".."} for part in value.split("/")):
+        fail(f"{origin}:{number}: path must be normalized and repository-relative: {value}")
+    normalized = candidate.as_posix()
+    if normalized == ".git" or normalized.startswith(".git/"):
+        fail(f"{origin}:{number}: .git paths are forbidden")
+    return normalized
 
-  tmp="$(mktemp -d)" || die "mktemp failed"
-  trap '[[ -n "${tmp:-}" ]] && rm -rf "$tmp"' EXIT
 
-  print -- "fetching canon $RUNNER_CANONICAL_REMOTE @ $ref (read-only, anonymous)"
-  git clone --quiet -- "$RUNNER_CANONICAL_REMOTE" "$tmp/canon" || die "git clone failed"
-  ( cd "$tmp/canon" && git checkout --quiet "$ref" ) || die "ref not found in canon: $ref"
-  local sha; sha="$(cd "$tmp/canon" && git rev-parse HEAD)"
+def regular_path(relative: str) -> Path:
+    target = ROOT
+    parts = PurePosixPath(relative).parts
+    for index, part in enumerate(parts):
+        target = target / part
+        mode = target.lstat().st_mode
+        if index < len(parts) - 1:
+            if not stat.S_ISDIR(mode):
+                fail(f"non-directory or symlink ancestor: {relative}")
+        elif not stat.S_ISREG(mode):
+            fail(f"path must be a regular file: {relative}")
+    return target
 
-  # The previously-synced set (from our current lock) is the authoritative record
-  # of files this tool manages here; capture it before the overlay so files the
-  # canon has since dropped from its list can be deleted below. Without this,
-  # cmd_lock would relock to the new (smaller) set and 'check' would still pass
-  # while a stale engine artifact lingered in the consumer.
-  local -a prev_files
-  prev_files=()
-  [[ -f "$lock_file" ]] && prev_files=("${(@f)$(awk 'NF{print $2}' "$lock_file")}")
 
-  # The canon's own list is authoritative (so a newly added canonical file is
-  # picked up here, not silently missed).
-  local -a canon_files
-  read_canon_list "$tmp/canon/scripts/runner-canonical-files.txt"
+def read_manifest(relative: str, *, require_files: bool = True) -> list[str]:
+    path = regular_path(relative)
+    if not path.is_file() or path.is_symlink():
+        fail(f"manifest must be a regular file: {relative}")
+    entries: list[str] = []
+    seen: set[str] = set()
+    for number, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        if not raw or raw.startswith("#"):
+            continue
+        entry = safe_path(raw, relative, number)
+        if entry in seen:
+            fail(f"{relative}:{number}: duplicate path: {entry}")
+        seen.add(entry)
+        entries.append(entry)
+    if not entries:
+        fail(f"manifest is empty: {relative}")
+    if entries != sorted(entries):
+        fail(f"manifest must be sorted bytewise: {relative}")
+    if require_files:
+        for entry in entries:
+            target = regular_path(entry)
+            try:
+                mode = target.lstat().st_mode
+            except FileNotFoundError:
+                fail(f"manifest entry is missing: {entry}")
+            if not stat.S_ISREG(mode):
+                fail(f"manifest entry is not a regular file: {entry}")
+    return entries
 
-  local f srcf destf
-  for f in "${canon_files[@]}"; do
-    srcf="$tmp/canon/$f"
-    [[ -f "$srcf" ]] || die "canon is missing a listed canonical file: $f"
-    destf="$repo_root/$f"
-    mkdir -p "${destf:h}"
-    cp -- "$srcf" "$destf"
-    chmod "--reference=$srcf" -- "$destf"
-  done
-  print -- "synced ${#canon_files[@]} canonical files from ${RUNNER_CANONICAL_REMOTE} @ ${sha}"
 
-  # Remove files that were canonical in the previous sync but are no longer in
-  # the canon's list, so a rename/removal in the canon leaves no stale copy here.
-  local pf
-  for pf in "${prev_files[@]}"; do
-    [[ -n "$pf" ]] || continue
-    (( ${canon_files[(Ie)$pf]} )) && continue
-    if [[ -e "$repo_root/$pf" ]]; then
-      print -- "removing no-longer-canonical file: $pf"
-      rm -f -- "$repo_root/$pf"
-    fi
-  done
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
-  cmd_lock
-  print -- "next: run './scripts/check-repo' and './run.sh verify all' to validate the synced engine"
-}
 
-(( $# > 0 )) || { usage; exit 64; }
-case "$1" in
-  lock)  shift; cmd_lock ;;
-  check) shift; cmd_check ;;
-  pull)  shift; cmd_pull "${1:-}" ;;
-  -h|--help) usage ;;
-  *) usage; exit 64 ;;
-esac
+def read_lock(relative: str) -> dict[str, str]:
+    path = regular_path(relative)
+    if not path.is_file() or path.is_symlink():
+        fail(f"lock must be a regular file: {relative}")
+    result: dict[str, str] = {}
+    previous = ""
+    for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        match = LOCK_RE.fullmatch(line)
+        if not match:
+            fail(f"{relative}:{number}: invalid lock record")
+        digest, raw_path = match.groups()
+        entry = safe_path(raw_path, relative, number)
+        if entry in result:
+            fail(f"{relative}:{number}: duplicate path: {entry}")
+        if previous and entry <= previous:
+            fail(f"{relative}:{number}: records must be sorted by path")
+        previous = entry
+        result[entry] = digest
+    return result
+
+
+def validate_lock(manifest: Iterable[str], lock_relative: str) -> None:
+    expected = list(manifest)
+    locked = read_lock(lock_relative)
+    if list(locked) != expected:
+        fail(f"{lock_relative} path set differs from its manifest")
+    for entry in expected:
+        actual = sha256(ROOT / entry)
+        if actual != locked[entry]:
+            fail(f"{lock_relative}: content hash mismatch: {entry}")
+
+
+def write_lock(manifest: Iterable[str], lock_relative: str) -> None:
+    entries = list(manifest)
+    payload = "".join(f"{sha256(ROOT / entry)}  {entry}\n" for entry in entries)
+    destination = ROOT / lock_relative
+    if destination.exists() or destination.is_symlink():
+        regular_path(lock_relative)
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{destination.name}.", dir=ROOT)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+        os.chmod(temporary, 0o644)
+        os.replace(temporary, destination)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def manifests_for_role(role: str) -> tuple[list[str], list[str]]:
+    canonical_code = read_manifest(CANON_CODE, require_files=role == "source")
+    canonical_docs = read_manifest(CANON_DOCS, require_files=role == "source")
+    if CANON_CODE not in canonical_code or CANON_DOCS not in canonical_code:
+        fail(f"{CANON_CODE} must export both canonical manifests")
+    overlap = set(canonical_code) & set(canonical_docs)
+    if overlap:
+        fail(f"code and documentation manifests overlap: {sorted(overlap)[0]}")
+    if role == "source":
+        return canonical_code, canonical_docs
+
+    selected_code = read_manifest(SELECTED_CODE)
+    selected_docs = read_manifest(SELECTED_DOCS)
+    unknown_code = sorted(set(selected_code) - set(canonical_code))
+    unknown_docs = sorted(set(selected_docs) - set(canonical_docs))
+    if unknown_code:
+        fail(f"consumer selected code outside the public export: {unknown_code[0]}")
+    if unknown_docs:
+        fail(f"consumer selected documentation outside the public export: {unknown_docs[0]}")
+    return selected_code, selected_docs
+
+
+def command_check() -> None:
+    config = parse_config()
+    code, docs = manifests_for_role(config["RUNNER_SYNC_ROLE"])
+    validate_lock(code, LOCK_CODE)
+    validate_lock(docs, LOCK_DOCS)
+    print(f"ok - runner snapshot matches code ({len(code)}) and docs ({len(docs)}) locks")
+
+
+def command_lock() -> None:
+    config = parse_config()
+    if config["RUNNER_SYNC_ROLE"] != "source":
+        fail("lock is source-only; consumers receive proposed locks through their sync workflow")
+    if os.environ.get("RUNNER_SYNC_WRITE") != "1":
+        fail("lock requires explicit RUNNER_SYNC_WRITE=1")
+    code, docs = manifests_for_role("source")
+    write_lock(code, LOCK_CODE)
+    write_lock(docs, LOCK_DOCS)
+    print(f"wrote {LOCK_CODE} ({len(code)} files) and {LOCK_DOCS} ({len(docs)} files)")
+
+
+def usage() -> None:
+    print("usage: sync-runner check | lock", file=sys.stderr)
+
+
+def main() -> int:
+    if len(sys.argv) != 2 or sys.argv[1] not in {"check", "lock"}:
+        usage()
+        return 64
+    try:
+        if sys.argv[1] == "check":
+            command_check()
+        else:
+            command_lock()
+    except (OSError, UnicodeError, RunnerSyncError) as error:
+        print(f"sync-runner: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

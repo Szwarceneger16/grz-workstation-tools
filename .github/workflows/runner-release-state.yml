@@ -1,0 +1,42 @@
+name: Runner release state dispatcher
+
+# workflow_run reads this definition from main. Its artifacts/code are ignored.
+on:
+  workflow_run:
+    workflows: [check-repo, Runner release verification]
+    types: [completed]
+  push:
+    branches: [main]
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: read
+  checks: write
+
+concurrency:
+  group: runner-release-state
+  cancel-in-progress: false
+
+jobs:
+  release-state:
+    if: github.ref == 'refs/heads/main' && vars.RUNNER_AUTOMATION_ENABLED == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out the protected default branch only
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Re-evaluate open PRs using trusted code and current main
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUNNER_COMMIT_ALLOWED_SIGNER_B64: ${{ vars.RUNNER_COMMIT_ALLOWED_SIGNER_B64 }}
+          RUNNER_COMMIT_SIGNING_FINGERPRINT: ${{ vars.RUNNER_COMMIT_SIGNING_FINGERPRINT }}
+          RUNNER_RELEASE_ALLOWED_SIGNER_B64: ${{ vars.RUNNER_RELEASE_ALLOWED_SIGNER_B64 }}
+          RUNNER_RELEASE_SIGNING_FINGERPRINT: ${{ vars.RUNNER_RELEASE_SIGNING_FINGERPRINT }}
+        run: python3 scripts/report-runner-release-state

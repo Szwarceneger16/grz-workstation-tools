@@ -1,0 +1,79 @@
+#!/usr/bin/env python3
+"""Publish fresh-base checks; never check out or execute PR contents."""
+
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import tempfile
+
+ROOT = Path(__file__).resolve().parent.parent
+REPO = os.environ["GITHUB_REPOSITORY"]
+
+
+def api(endpoint, payload=None):
+    command = ["gh", "api", f"repos/{REPO}/{endpoint}"]
+    if payload is not None:
+        method = "PATCH" if endpoint.startswith("check-runs/") else "POST"
+        command += ["--method", method, "--input", "-"]
+    result = subprocess.run(command, input=json.dumps(payload) if payload is not None else None,
+                            text=True, stdout=subprocess.PIPE, check=True)
+    return json.loads(result.stdout)
+
+
+def git(*args, check=True):
+    return subprocess.run(["git", *args], cwd=ROOT, text=True, check=check,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+
+def main():
+    git("fetch", "--no-tags", "origin", "+refs/heads/main:refs/remotes/origin/main")
+    git("fetch", "origin", "refs/tags/runner-v*:refs/tags/runner-v*")
+    base = git("rev-parse", "origin/main").stdout.strip()
+    if git("rev-parse", "HEAD").stdout.strip() != base:
+        raise SystemExit("main advanced; rerun with current trusted helper")
+    page = 1
+    while True:
+        pulls = api(f"pulls?state=open&base=main&per_page=100&page={page}")
+        if not pulls:
+            break
+        for pull in pulls:
+            number, head = pull["number"], pull["head"]["sha"]
+            if not isinstance(number, int) or not re.fullmatch(r"[0-9a-f]{40}", head):
+                raise SystemExit("invalid PR identity returned by API")
+            check = api("check-runs", {"name": "Runner release state", "head_sha": head,
+                                      "status": "in_progress"})
+            conclusion, message = "failure", "Update this branch to current main and rerun."
+            try:
+                git("fetch", "--no-tags", "origin", f"refs/pull/{number}/head")
+                if git("rev-parse", "FETCH_HEAD").stdout.strip() != head:
+                    raise ValueError("PR head changed while fetching; rerun")
+                if git("merge-base", "--is-ancestor", base, head, check=False).returncode == 0:
+                    with tempfile.TemporaryDirectory() as directory:
+                        result = subprocess.run(
+                            ["python3", str(ROOT / "scripts/propose-runner-release"), "release-state",
+                             "--main-ref", base, "--base-ref", base, "--head-ref", head,
+                             "--json-out", f"{directory}/state.json"], cwd=ROOT, capture_output=True)
+                        if result.returncode:
+                            raise ValueError("Release state validation failed.")
+                        if git("diff", "--quiet", base, head, "--", "runner.release", check=False).returncode:
+                            result = subprocess.run(["python3", str(ROOT / "scripts/propose-runner-release"),
+                                                     "validate-release", "--ref", head],
+                                                    cwd=ROOT, capture_output=True)
+                            if result.returncode:
+                                raise ValueError("Release metadata validation failed.")
+                    conclusion, message = "success", "Fresh base; shared-change release gate passed."
+                if api("git/ref/heads/main")["object"]["sha"] != base:
+                    raise ValueError("main advanced during validation; rerun")
+                if api(f"pulls/{number}")["head"]["sha"] != head:
+                    raise ValueError("PR advanced during validation; rerun")
+            except (ValueError, subprocess.CalledProcessError) as error:
+                conclusion, message = "failure", str(error)
+            api(f"check-runs/{check['id']}", {"status": "completed", "conclusion": conclusion,
+                "output": {"title": "Trusted release-state check", "summary": f"{message}\n\nBase: {base}"}})
+        page += 1
+
+
+if __name__ == "__main__":
+    main()

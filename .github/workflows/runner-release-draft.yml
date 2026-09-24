@@ -1,0 +1,185 @@
+name: Runner release draft
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GH_REPO: ${{ github.repository }}
+  RUNNER_COMMIT_ALLOWED_SIGNER_B64: ${{ vars.RUNNER_COMMIT_ALLOWED_SIGNER_B64 }}
+  RUNNER_COMMIT_SIGNING_FINGERPRINT: ${{ vars.RUNNER_COMMIT_SIGNING_FINGERPRINT }}
+  RUNNER_RELEASE_ALLOWED_SIGNER_B64: ${{ vars.RUNNER_RELEASE_ALLOWED_SIGNER_B64 }}
+  RUNNER_RELEASE_SIGNING_FINGERPRINT: ${{ vars.RUNNER_RELEASE_SIGNING_FINGERPRINT }}
+
+concurrency:
+  group: runner-release-draft
+  cancel-in-progress: false
+
+jobs:
+  inspect-release-delta:
+    if: github.ref == 'refs/heads/main' && vars.RUNNER_AUTOMATION_ENABLED == 'true'
+    name: Inspect release delta
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      needs_release: ${{ steps.inspect.outputs.needs_release }}
+      pending_release: ${{ steps.inspect.outputs.pending_release }}
+    steps:
+      - name: Check out public main
+        # Pinned to SHA for supply-chain safety. Tag: v6
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Fetch release tags
+        run: git fetch --force origin 'refs/tags/runner-v*:refs/tags/runner-v*'
+
+      - name: Inspect manifests, locks, and shared tree delta
+        id: inspect
+        run: |
+          set -euo pipefail
+          ./scripts/propose-runner-release inspect \
+            --head-ref HEAD \
+            --json-out "$RUNNER_TEMP/release-inspection.json" \
+            --github-output "$GITHUB_OUTPUT"
+
+  update-release-draft:
+    name: Update aggregate draft release PR
+    needs: inspect-release-delta
+    if: needs.inspect-release-delta.outputs.needs_release == 'true' && needs.inspect-release-delta.outputs.pending_release != 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Check out public main
+        # Pinned to SHA for supply-chain safety. Tag: v6
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Fetch release tags
+        run: git fetch --force origin 'refs/tags/runner-v*:refs/tags/runner-v*'
+
+      - name: Create or advance the aggregate branch
+        id: branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_BRANCH: automation/runner-release-next
+          RUNNER_RELEASE_REPO_ROOT: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          cp scripts/propose-runner-release "$RUNNER_TEMP/propose-runner-release"
+          chmod 0500 "$RUNNER_TEMP/propose-runner-release"
+          owner="${GITHUB_REPOSITORY%%/*}"
+          existing_pr="$(gh api \
+            "repos/${GITHUB_REPOSITORY}/pulls?state=open&head=${owner}:${RELEASE_BRANCH}" \
+            --jq '.[0] // empty')"
+          if [[ -n "$existing_pr" ]] && [[ "$(jq -r '.draft' <<<"$existing_pr")" != "true" ]]; then
+            echo "The aggregate release PR is ready for review; refusing to mutate it."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if git ls-remote --exit-code --heads origin "$RELEASE_BRANCH" >/dev/null 2>&1; then
+            git fetch --no-tags origin \
+              "+refs/heads/${RELEASE_BRANCH}:refs/remotes/origin/${RELEASE_BRANCH}"
+            unexpected="$(git diff --name-only "origin/main...origin/$RELEASE_BRANCH" | grep -vx 'runner.release' || true)"
+            if [[ -n "$unexpected" ]]; then
+              echo "Unexpected changes exist on the release branch." >&2
+              exit 1
+            fi
+            # A squash-merged previous train need not be an ancestor of main.
+            # Only an open draft owns a manual version; a completed train is
+            # merged forward and receives the next release version below.
+            if [[ -n "$existing_pr" ]] && ! git merge-base --is-ancestor "origin/$RELEASE_BRANCH" origin/main; then
+              "$RUNNER_TEMP/propose-runner-release" validate-release --ref "origin/$RELEASE_BRANCH" > "$RUNNER_TEMP/draft.json"
+              "$RUNNER_TEMP/propose-runner-release" inspect --head-ref origin/main --json-out "$RUNNER_TEMP/main.json"
+              if jq -e -s '
+                .[0]["code-manifest-sha256"] == .[1].code_manifest_sha256 and
+                .[0]["docs-manifest-sha256"] == .[1].docs_manifest_sha256 and
+                .[0]["code-tree-sha256"] == .[1].code_tree_sha256 and
+                .[0]["docs-tree-sha256"] == .[1].docs_tree_sha256
+              ' "$RUNNER_TEMP/draft.json" "$RUNNER_TEMP/main.json" >/dev/null; then
+                echo "skip=true" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+            fi
+            git switch --create "$RELEASE_BRANCH" --track "origin/$RELEASE_BRANCH"
+            unexpected="$(git diff --name-only origin/main...HEAD | grep -vx 'runner.release' || true)"
+            if [[ -n "$unexpected" ]]; then
+              echo "Unexpected manual changes exist on ${RELEASE_BRANCH}:" >&2
+              printf '%s\n' "$unexpected" >&2
+              exit 1
+            fi
+            git merge --no-edit origin/main
+          else
+            git switch --create "$RELEASE_BRANCH" origin/main
+          fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - name: Regenerate release metadata
+        if: steps.branch.outputs.skip != 'true'
+        env:
+          RUNNER_RELEASE_REPO_ROOT: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/propose-runner-release" update \
+            --head-ref origin/main \
+            --body-out "$RUNNER_TEMP/runner-release-body.md"
+
+      - name: Commit and push metadata without rewriting history
+        if: steps.branch.outputs.skip != 'true'
+        env:
+          RELEASE_BRANCH: automation/runner-release-next
+        run: |
+          set -euo pipefail
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -- runner.release
+          if ! git diff --cached --quiet; then
+            version="$(awk '$1 == "version" { print $2 }' runner.release)"
+            git commit -m "chore(runner): prepare runner-v${version}"
+          fi
+          git push origin "HEAD:${RELEASE_BRANCH}"
+
+      - name: Create or update one draft pull request
+        if: steps.branch.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_BRANCH: automation/runner-release-next
+        run: |
+          set -euo pipefail
+          owner="${GITHUB_REPOSITORY%%/*}"
+          version="$(awk '$1 == "version" { print $2 }' runner.release)"
+          title="chore(runner): prepare runner-v${version}"
+          pr_number="$(gh api \
+            "repos/${GITHUB_REPOSITORY}/pulls?state=open&head=${owner}:${RELEASE_BRANCH}" \
+            --jq '.[0].number // empty')"
+          body="$(cat "$RUNNER_TEMP/runner-release-body.md")"
+          if [[ -z "$pr_number" ]]; then
+            gh api "repos/${GITHUB_REPOSITORY}/pulls" \
+              --method POST \
+              -f title="$title" \
+              -f head="$RELEASE_BRANCH" \
+              -f base=main \
+              -F draft=true \
+              -f body="$body" >/dev/null
+          else
+            gh api "repos/${GITHUB_REPOSITORY}/pulls/${pr_number}" \
+              --method PATCH \
+              -f title="$title" \
+              -f body="$body" >/dev/null
+          fi
