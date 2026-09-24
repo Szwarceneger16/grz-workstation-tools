@@ -1,0 +1,95 @@
+name: Runner release signing request
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - runner.release
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: read
+
+env:
+  GH_REPO: ${{ github.repository }}
+  RUNNER_COMMIT_ALLOWED_SIGNER_B64: ${{ vars.RUNNER_COMMIT_ALLOWED_SIGNER_B64 }}
+  RUNNER_COMMIT_SIGNING_FINGERPRINT: ${{ vars.RUNNER_COMMIT_SIGNING_FINGERPRINT }}
+  RUNNER_RELEASE_ALLOWED_SIGNER_B64: ${{ vars.RUNNER_RELEASE_ALLOWED_SIGNER_B64 }}
+  RUNNER_RELEASE_SIGNING_FINGERPRINT: ${{ vars.RUNNER_RELEASE_SIGNING_FINGERPRINT }}
+
+jobs:
+  request-signature:
+    if: vars.RUNNER_AUTOMATION_ENABLED == 'true'
+    name: Request owner signature
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out the frozen snapshot
+        # Pinned to SHA for supply-chain safety. Tag: v6
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Fetch release tags and validate metadata
+        id: state
+        run: |
+          set -euo pipefail
+          git fetch --force origin 'refs/tags/runner-v*:refs/tags/runner-v*'
+          ./scripts/propose-runner-release inspect --head-ref HEAD --json-out "$RUNNER_TEMP/state.json" --github-output "$GITHUB_OUTPUT"
+          if [[ "$(jq -r '.pending_release' "$RUNNER_TEMP/state.json")" == "true" ]]; then
+            ./scripts/propose-runner-release validate-release --ref HEAD
+          fi
+
+      - name: Create or update one signing issue
+        if: steps.state.outputs.pending_release == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          version="$(awk '$1 == "version" { print $2 }' runner.release)"
+          previous="$(awk '$1 == "previous-tag" { print $2 }' runner.release)"
+          code_hash="$(awk '$1 == "code-tree-sha256" { print $2 }' runner.release)"
+          docs_hash="$(awk '$1 == "docs-tree-sha256" { print $2 }' runner.release)"
+          tag="runner-v${version}"
+          title="Sign ${tag}"
+          compare_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/${RELEASE_SHA}"
+          if [[ "$previous" != "none" ]]; then
+            compare_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/compare/${previous}...${RELEASE_SHA}"
+          fi
+          release_pr_url="$(gh api \
+            -H 'Accept: application/vnd.github+json' \
+            "repos/${GITHUB_REPOSITORY}/commits/${RELEASE_SHA}/pulls" \
+            --jq '.[0].html_url // empty')"
+          body="$(printf '%s\n' \
+            "<!-- runner-signing-request-v1 -->" \
+            "## Frozen runner release" \
+            "" \
+            "- Version: \`${version}\`" \
+            "- Frozen parent: \`${RELEASE_SHA}\`" \
+            "- Previous tag: \`${previous}\`" \
+            "- Code tree SHA-256: \`${code_hash}\`" \
+            "- Documentation tree SHA-256: \`${docs_hash}\`" \
+            "- Compare: ${compare_url}" \
+            "- Release PR: ${release_pr_url:-not reported by the API}" \
+            "" \
+            "## Manual owner checklist" \
+            "" \
+            "- [ ] Fetch and inspect the exact frozen parent." \
+            "- [ ] Create a signed empty release-attestation commit as its direct child." \
+            "- [ ] Verify the commit signature and identical parent/child trees." \
+            "- [ ] Create the separately signed annotated \`${tag}\` tag." \
+            "- [ ] Verify the tag locally." \
+            "- [ ] Push the tag only after separate approval." \
+            "" \
+            "GitHub Actions cannot and must not create either owner signature.")"
+          number="$(gh issue list --state open --author 'github-actions[bot]' --search "${title} in:title" --json number,title,body \
+            --jq ".[] | select(.title == \"${title}\" and (.body | startswith(\"<!-- runner-signing-request-v1 -->\"))) | .number" | head -n1)"
+          if [[ -z "$number" ]]; then
+            gh issue create --title "$title" --body "$body" --assignee "$GITHUB_REPOSITORY_OWNER" >/dev/null
+          else
+            gh issue edit "$number" --body "$body" --add-assignee "$GITHUB_REPOSITORY_OWNER" >/dev/null
+          fi

@@ -1,25 +1,25 @@
 # Canonical engine file set — the "one source of truth" shared verbatim between
 # the canonical engine repo and any downstream consumer repos that pull it.
 #
-# These files MUST stay byte-identical across repos. `scripts/sync-runner pull`
-# copies exactly this set from the canon into a consumer; `sync-runner check`
-# (run in CI) fails if any local copy drifts from runner.lock.
+# These files form the maximum public code export. Consumers choose an explicit
+# subset and receive it only through their own reviewed synchronization flow.
 #
 # NOT listed here (deliberately per-repo, never synced): runner.conf,
 # .rcd-loader-repo-id, manifests/* CONTENT, packages/*, AGENTS.md, README.md,
-# docs/*, .github/workflows/* (each repo adds its own CI steps), runner.lock.
+# .github/workflows/* (each repo adds its own CI steps), and lock files.
 #
 # One repo-root-relative path per line. Lines starting with # are comments.
-run.sh
-scripts/check-repo
-scripts/system-copy-select
-scripts/stow-select
-scripts/ensure-rcd-loaders
-scripts/list-packages
-scripts/audit-public-safety
-scripts/sync-runner
-scripts/runner-canonical-files.txt
-githooks/pre-push
 bootstrap/minimal-zshrc.example
 bootstrap/profile.snippet.sh
 bootstrap/zshrc.snippet.zsh
+githooks/pre-push
+run.sh
+scripts/audit-public-safety
+scripts/check-repo
+scripts/ensure-rcd-loaders
+scripts/list-packages
+scripts/runner-canonical-docs.txt
+scripts/runner-canonical-files.txt
+scripts/stow-select
+scripts/sync-runner
+scripts/system-copy-select
