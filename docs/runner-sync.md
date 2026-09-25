@@ -1,7 +1,7 @@
 # Runner synchronization contract
 
-This repository publishes a neutral, versioned runner contract. It does not
-know which repositories consume that contract and never dispatches to them.
+The canonical source publishes a neutral, versioned runner contract. It does
+not know which repositories consume that contract and never dispatches to them.
 Consumers poll signed releases, apply their own selection policy, and decide
 whether to accept a proposed update.
 
@@ -26,23 +26,46 @@ accepted release and are not a substitute for signature verification.
 
 ## Repository roles
 
-`runner.conf` declares `RUNNER_SYNC_ROLE=source` here. CI also sets
-`RUNNER_SYNC_EXPECTED_ROLE=source`; changing only the file therefore fails the
-required check. CODEOWNERS and branch protection must cover both the role and
+This contract applies to both repository roles. `runner.conf` declares the
+role of the current checkout: `RUNNER_SYNC_ROLE=source` in the canonical source,
+or `RUNNER_SYNC_ROLE=consumer` in a consuming repository. CI independently pins
+`RUNNER_SYNC_EXPECTED_ROLE` to the appropriate role; changing only the config
+therefore fails the required check. Do not change the role to make an example
+command pass. CODEOWNERS and branch protection must cover both the role and
 the workflow. The role remains policy metadata, not a cryptographic trust root.
 Neither CODEOWNERS nor a default read-only token prevents an authorized writer
 from submitting a different workflow definition. Restrict that authority before
 enabling automation; see the release process deployment prerequisites.
 
-The supported local commands are:
+### Source checkout
 
-```text
+Use these commands only where `runner.conf` declares `RUNNER_SYNC_ROLE=source`:
+
+```sh
 RUNNER_SYNC_EXPECTED_ROLE=source RUNNER_SYNC_WRITE=0 ./scripts/sync-runner check
 RUNNER_SYNC_EXPECTED_ROLE=source RUNNER_SYNC_WRITE=1 ./scripts/sync-runner lock
 ```
 
-`check` is read-only. `lock` is source-only and requires an explicit write
-guard. There is intentionally no network-enabled `pull` command: release
+`check` is read-only. `lock` regenerates the canonical code/docs locks after
+intentional export changes; it is source-only and requires the explicit write
+guard. These locks still do not constitute a signed release.
+
+### Consumer checkout
+
+Where `runner.conf` declares `RUNNER_SYNC_ROLE=consumer`, use:
+
+```sh
+RUNNER_SYNC_EXPECTED_ROLE=consumer RUNNER_SYNC_WRITE=0 ./scripts/sync-runner check
+```
+
+This read-only check validates the selected code/docs sets declared in
+`scripts/runner-sync-files.txt` and `scripts/runner-sync-docs.txt` against the
+checkout's locks. Consumers cannot run `lock`, even with `RUNNER_SYNC_WRITE=1`;
+proposed locks come from their trusted synchronization workflow and become the
+accepted baseline only after review and merge to the default branch. Do not
+regenerate consumer locks locally to conceal drift.
+
+There is intentionally no network-enabled `pull` command: release
 selection, signature verification, candidate testing, and write proposals
 belong to each consumer's trusted automation.
 
@@ -83,7 +106,7 @@ selected files for local existence. Unselected exports need not be present.
 Keep monitor notices separate from acceptance: preserve a candidate's approval,
 failure, or draft-PR state and compare tag/commit identity, not only its name.
 
-Release-signing public keys may be published here for convenience, but a
+Release-signing public keys may be published by the source for convenience, but a
 consumer must use trust roots configured by its own administrator. It must not
 silently trust verification material fetched from the same origin as the
 candidate.

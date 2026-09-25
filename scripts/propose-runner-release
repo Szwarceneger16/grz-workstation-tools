@@ -85,7 +85,9 @@ def version_from_tag(tag: str) -> tuple[int, int, int]:
 def release_tags(exclude: str | None = None) -> list[str]:
     tags = []
     for tag in git_text("tag", "--list", "runner-v*").splitlines():
-        if tag and tag != exclude and TAG_RE.fullmatch(tag):
+        # Every protected-namespace tag is significant, including malformed ones.
+        version_from_tag(tag)
+        if tag != exclude:
             tags.append(tag)
     return sorted(tags, key=version_from_tag)
 
@@ -272,6 +274,14 @@ def release_payload(values: dict[str, str]) -> str:
     return "".join(f"{key} {values[key]}\n" for key in RELEASE_KEYS)
 
 
+def has_shared_delta(previous: str | None, snap: dict[str, object]) -> bool:
+    if previous is None or previous == "none":
+        return True
+    previous_snapshot = snapshot(previous)
+    return any(snap[key.replace("-", "_")] != previous_snapshot[key.replace("-", "_")]
+               for key in RELEASE_KEYS[2:])
+
+
 def validate_release(ref: str, *, current_tag: str | None = None, previous: str = "__latest__") -> dict[str, str]:
     tree_entry(ref, RELEASE_FILE)
     payload = show_bytes(ref, RELEASE_FILE)
@@ -288,6 +298,8 @@ def validate_release(ref: str, *, current_tag: str | None = None, previous: str 
         fail(f"previous-tag must be {expected_previous}")
     if previous != "none" and semver(release["version"]) <= version_from_tag(previous):
         fail("release version must be greater than the previous release")
+    if not has_shared_delta(previous, snap):
+        fail("release requires a canonical code or documentation delta from previous-tag")
     expected_tag = f"runner-v{release['version']}"
     if current_tag is None and ref_exists(f"refs/tags/{expected_tag}"):
         fail(f"release tag already exists: {expected_tag}")
@@ -332,27 +344,39 @@ def current_pending_release(ref: str) -> tuple[bool, dict[str, str] | None]:
         except ReleaseError:
             # A present but invalid/unverifiable tag never unlocks shared merges.
             return True, release
-    # Pending metadata must still describe the shared snapshot at main.
-    snap = snapshot(ref)
-    for key in RELEASE_KEYS[2:]:
-        if release[key] != snap[key.replace("-", "_")]:
-            fail(f"pending {RELEASE_FILE} no longer matches {ref}")
+    # Pending metadata must describe a new, valid shared snapshot, not just a
+    # higher version with the previous release's unchanged content.
+    validate_release(ref)
     return True, release
+
+
+def frozen_release_parent(main_ref: str, metadata_ref: str) -> str:
+    tree_entry(metadata_ref, RELEASE_FILE)
+    payload = show_bytes(metadata_ref, RELEASE_FILE)
+    commits = git_text("rev-list", "--first-parent", main_ref, "--", RELEASE_FILE).splitlines()
+    matching = [commit for commit in commits if show_bytes(commit, RELEASE_FILE, optional=True) == payload]
+    if len(matching) != 1:
+        fail("cannot identify one exact frozen metadata commit on main")
+    return matching[0]
 
 
 def inspect(head: str) -> dict[str, object]:
     snap = snapshot(head)
     previous = latest_tag()
     pending, pending_release = current_pending_release(head)
+    release_parent = frozen_release_parent(head, head) if pending else ""
+    if release_parent:
+        validate_release(release_parent)
     changed = changed_shared_paths(previous, head)
     previous_version = version_from_tag(previous) if previous else (0, 0, 0)
     suggested = (0, 1, 0) if previous is None else (previous_version[0], previous_version[1], previous_version[2] + 1)
     result = dict(snap)
     result.update(
         {
-            "needs_release": bool(changed) and not pending,
+            "needs_release": has_shared_delta(previous, snap) and not pending,
             "pending_release": pending,
             "pending_version": pending_release["version"] if pending_release else "",
+            "release_parent": release_parent,
             "previous_tag": previous or "none",
             "suggested_version": ".".join(str(part) for part in suggested),
             "changed_paths": changed,
@@ -376,7 +400,7 @@ def write_output(path: str | None, values: dict[str, object]) -> None:
     if not path:
         return
     with Path(path).open("a", encoding="utf-8") as handle:
-        for key in ("needs_release", "pending_release", "previous_tag", "suggested_version", "main_sha"):
+        for key in ("needs_release", "pending_release", "previous_tag", "suggested_version", "main_sha", "release_parent"):
             if key in values:
                 value = values[key]
                 if isinstance(value, bool):
@@ -533,9 +557,7 @@ def verify_tag(args: argparse.Namespace, *, previous: str) -> dict[str, str]:
         fail("release-attestation commit must have the same tree as its parent")
     if run_git("merge-base", "--is-ancestor", parent, args.main_ref, check=False).returncode:
         fail("release parent is not reachable from public main")
-    frozen_commits = git_text("rev-list", "--first-parent", args.main_ref, "--", RELEASE_FILE).splitlines()
-    matching = [commit for commit in frozen_commits if show_bytes(commit, RELEASE_FILE, optional=True) == show_bytes(parent, RELEASE_FILE)]
-    if matching != [parent]:
+    if frozen_release_parent(args.main_ref, parent) != parent:
         fail("release parent is not the exact frozen metadata commit on main")
     release = validate_release(parent, current_tag=tag, previous=previous)
     message = tag_message(tag)
@@ -583,6 +605,8 @@ def command_verify_tag(args: argparse.Namespace) -> None:
 def command_release_state(args: argparse.Namespace) -> None:
     # Candidate CI is PR-controlled. Recompute locks with this trusted helper.
     snapshot(args.head_ref)
+    if show_bytes(args.base_ref, RELEASE_FILE, optional=True) != show_bytes(args.head_ref, RELEASE_FILE, optional=True):
+        validate_release(args.head_ref)
     pending, release = current_pending_release(args.main_ref)
     changed = changed_shared_paths(args.base_ref, args.head_ref)
     data = {

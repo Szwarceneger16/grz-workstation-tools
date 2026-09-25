@@ -12,6 +12,7 @@
 /tests/** @Szwarceneger16
 /docs/runner-sync.md @Szwarceneger16
 /docs/runner-release-process.md @Szwarceneger16
+/docs/runner-release-ci.md @Szwarceneger16
 /scripts/sync-runner @Szwarceneger16
 /scripts/propose-runner-release @Szwarceneger16
 /scripts/runner-canonical-files.txt @Szwarceneger16
