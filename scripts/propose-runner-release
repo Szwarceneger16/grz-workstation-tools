@@ -44,6 +44,14 @@ class ReleaseError(RuntimeError):
     pass
 
 
+class ReleaseTagVerificationError(ReleaseError):
+    """Verification failed for one well-formed tag, not the namespace or trust setup."""
+
+    def __init__(self, tag: str, error: ReleaseError):
+        super().__init__(str(error))
+        self.tag = tag
+
+
 def fail(message: str) -> NoReturn:
     raise ReleaseError(message)
 
@@ -129,7 +137,10 @@ def verified_releases() -> dict[str, dict[str, str]]:
             previous = "none"
             for tag in tags:
                 args = argparse.Namespace(**vars(trust), tag=tag, expected_commit=None)
-                results[tag] = verify_tag(args, previous=previous)
+                try:
+                    results[tag] = verify_tag(args, previous=previous)
+                except ReleaseError as error:
+                    raise ReleaseTagVerificationError(tag, error) from error
                 previous = tag
     VERIFIED = results
     return results
@@ -340,13 +351,16 @@ def current_pending_release(ref: str) -> tuple[bool, dict[str, str] | None]:
     if ref_exists(f"refs/tags/{expected_tag}"):
         try:
             verified = verified_releases()
-            frozen = verified[expected_tag]["release_parent"]
-            if show_bytes(frozen, RELEASE_FILE) != payload:
-                fail("tag metadata differs from main's frozen snapshot")
-            return False, release
-        except ReleaseError:
-            # A present but invalid/unverifiable tag never unlocks shared merges.
+        except ReleaseTagVerificationError as error:
+            if error.tag != expected_tag or release_tags()[-1] != expected_tag:
+                raise
+            # Only failure of this pending tag permits unrelated PRs. Namespace,
+            # trust setup, and other release failures must fail the entire gate.
             return True, release
+        frozen = verified[expected_tag]["release_parent"]
+        if show_bytes(frozen, RELEASE_FILE) != payload:
+            fail("tag metadata differs from main's frozen snapshot")
+        return False, release
     # Pending metadata must describe a new, valid shared snapshot, not just a
     # higher version with the previous release's unchanged content.
     validate_release(ref)

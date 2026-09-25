@@ -56,6 +56,12 @@ This validation also runs before reporting a clean release state during
 bootstrap, when `runner.release` does not exist yet. Missing metadata does not
 allow malformed, lightweight, or unsigned release tags to bypass the gate.
 
+With existing metadata, only a verification failure belonging to that exact
+expected release tag can be represented as pending (blocking shared changes but
+allowing unrelated PRs). Malformed namespace entries, failures of other releases,
+missing verification trust, and frozen-metadata mismatches fail the entire state
+check. They are not ordinary pending-signature states.
+
 ## Signing requests for batched pushes
 
 The signing parent is the unique first-parent commit on main that introduced the

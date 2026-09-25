@@ -130,6 +130,11 @@ class RunnerReleaseTests(unittest.TestCase):
 
     def test_pending_release_blocks_shared_change_but_not_unrelated_change(self) -> None:
         parent, _ = self.prepare_release()
+        self.trust_environment = {}
+        for role in ("commit", "release"):
+            _, fingerprint, allowed = self.generate_key(role)
+            self.trust_environment[f"RUNNER_{role.upper()}_ALLOWED_SIGNER_B64"] = base64.b64encode(allowed.read_bytes()).decode()
+            self.trust_environment[f"RUNNER_{role.upper()}_SIGNING_FINGERPRINT"] = fingerprint
         # An unverified tag never unlocks shared changes, regardless of issues.
         self.git("tag", "runner-v0.1.0", parent)
         self.write("README.md", "unrelated\n")
@@ -295,6 +300,75 @@ class RunnerReleaseTests(unittest.TestCase):
         )
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("invalid runner release tag", result.stderr)
+
+    def release_state_result(self, base, head):
+        output = self.root / "gate-state.json"
+        output.unlink(missing_ok=True)
+        result = self.helper("release-state", "--main-ref", base, "--base-ref", base,
+                             "--head-ref", head, "--json-out", str(output), check=False)
+        return result, output
+
+    def test_existing_metadata_does_not_mask_malformed_namespace_for_any_pr(self):
+        base = self.signed_release()
+        self.write("README.md", "unrelated change\n")
+        unrelated = self.commit("unrelated change")
+        self.write("code.txt", "shared change\n")
+        self.write_locks()
+        shared = self.commit("shared change")
+        for tag in ("runner-vfoo", "runner-v1.0", "runner-v01.2.3", "runner-v1.0.0-rc1"):
+            self.git("tag", tag)
+            for head in (base, unrelated, shared):
+                with self.subTest(tag=tag, head=head):
+                    result, output = self.release_state_result(base, head)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("invalid runner release tag", result.stderr)
+                    self.assertFalse(output.exists())
+            self.git("tag", "-d", tag)
+
+    def test_other_invalid_release_and_missing_trust_are_not_pending_states(self):
+        base = self.signed_release()
+        self.write("README.md", "unrelated change\n")
+        head = self.commit("unrelated change")
+        for tag in ("runner-v0.0.1", "runner-v9.0.0"):
+            with self.subTest(tag=tag):
+                self.git("tag", tag)
+                result, output = self.release_state_result(base, head)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("annotated", result.stderr)
+                self.assertFalse(output.exists())
+                self.git("tag", "-d", tag)
+        self.trust_environment["RUNNER_RELEASE_ALLOWED_SIGNER_B64"] = ""
+        result, output = self.release_state_result(base, head)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("verification keys are required", result.stderr)
+        self.assertFalse(output.exists())
+
+    def test_missing_expected_tag_cannot_mask_malformed_namespace(self):
+        base, _ = self.prepare_release()
+        self.git("tag", "runner-vfoo")
+        result, output = self.release_state_result(base, base)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("invalid runner release tag", result.stderr)
+        self.assertFalse(output.exists())
+
+    def test_bad_pending_tag_cannot_hide_later_unverified_releases(self):
+        base = self.signed_release()
+        self.git("tag", "-d", "runner-v0.1.0")
+        self.git("-c", "tag.gpgSign=false", "tag", "runner-v0.1.0", base)
+        self.git("-c", "tag.gpgSign=false", "tag", "runner-v9.0.0", base)
+        result, output = self.release_state_result(base, base)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(output.exists())
+
+    def test_verified_namespace_still_allows_unrelated_and_shared_prs(self):
+        base = self.signed_release()
+        for path in ("README.md", "code.txt"):
+            self.write(path, "new contents\n")
+            self.write_locks()
+            head = self.commit("candidate change")
+            result, output = self.release_state_result(base, head)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(json.loads(output.read_text())["pending_release"])
 
     def test_tags_outside_runner_namespace_do_not_trigger_release_validation(self):
         self.git("tag", "unrelated-vfoo")

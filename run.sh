@@ -1791,9 +1791,10 @@ parse_install() {
   run_system_action install "$selector" "$verbose"
 
   if (( do_verify )); then
-    run_verify "$selector" install
+    run_verify "$selector" install "$verbose"
   fi
   if (( do_test )); then
+    verify_verbose="$verbose"
     run_test "$selector"
   fi
 }

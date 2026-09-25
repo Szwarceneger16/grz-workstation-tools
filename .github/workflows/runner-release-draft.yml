@@ -86,9 +86,9 @@ jobs:
           owner="${GITHUB_REPOSITORY%%/*}"
           existing_pr="$(gh api \
             "repos/${GITHUB_REPOSITORY}/pulls?state=open&base=main&head=${owner}:${RELEASE_BRANCH}" \
-            | jq -cr --arg repo "$GITHUB_REPOSITORY" --arg branch "$RELEASE_BRANCH" '
-              if type != "array" then error("invalid release PR response")
-              elif length == 0 then empty
+            | jq -csr --arg repo "$GITHUB_REPOSITORY" --arg branch "$RELEASE_BRANCH" '
+              if length != 1 or (.[0] | type) != "array" then error("invalid release PR response") else .[0] end |
+              if length == 0 then empty
               elif length == 1 and .[0].state == "open"
                 and .[0].base.ref == "main" and .[0].base.repo.full_name == $repo
                 and .[0].head.ref == $branch and .[0].head.repo.full_name == $repo
@@ -178,9 +178,9 @@ jobs:
           title="chore(runner): prepare runner-v${version}"
           existing_pr="$(gh api \
             "repos/${GITHUB_REPOSITORY}/pulls?state=open&base=main&head=${owner}:${RELEASE_BRANCH}" \
-            | jq -cr --arg repo "$GITHUB_REPOSITORY" --arg branch "$RELEASE_BRANCH" '
-              if type != "array" then error("invalid release PR response")
-              elif length == 0 then empty
+            | jq -csr --arg repo "$GITHUB_REPOSITORY" --arg branch "$RELEASE_BRANCH" '
+              if length != 1 or (.[0] | type) != "array" then error("invalid release PR response") else .[0] end |
+              if length == 0 then empty
               elif length == 1 and .[0].state == "open"
                 and .[0].base.ref == "main" and .[0].base.repo.full_name == $repo
                 and .[0].head.ref == $branch and .[0].head.repo.full_name == $repo

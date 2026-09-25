@@ -113,7 +113,7 @@ class RunnerWorkflowTests(unittest.TestCase):
                 update, _ = self.run_dispatch(**options)
                 self.assertEqual(update["conclusion"], "failure")
 
-    def release_pr_lookups(self, response):
+    def release_pr_lookups(self, response, *, raw=False):
         workflow = (ROOT / ".github/workflows/runner-release-draft.yml").read_text()
         # Execute both real lookup expressions, without checkout, branch writes,
         # or any GitHub credentials. The fake API requires the base filter.
@@ -130,7 +130,7 @@ gh() {
                                  timeout=10, env={"PATH": os.environ["PATH"],
                                      "GITHUB_REPOSITORY": "test/fixture", "owner": "test",
                                      "RELEASE_BRANCH": "automation/runner-release-next",
-                                     "API_RESPONSE": json.dumps(response)})
+                                     "API_RESPONSE": response if raw else json.dumps(response)})
 
     def test_release_pr_lookups_accept_only_one_exact_main_pr(self):
         for response in ([], [self.release_pr(draft=True)], [self.release_pr(draft=False)]):
@@ -160,3 +160,9 @@ gh() {
                 for result in self.release_pr_lookups(response):
                     self.assertNotEqual(result.returncode, 0)
                     self.assertEqual(result.stdout, "")
+
+    def test_release_pr_lookups_reject_empty_or_multiple_json_documents(self):
+        for response in ("", "[]\n[]", "invalid JSON"):
+            for result in self.release_pr_lookups(response, raw=True):
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, "")
