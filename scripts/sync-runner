@@ -55,6 +55,8 @@ def parse_config() -> dict[str, str]:
         if not re.fullmatch(r"[A-Za-z0-9_./:@+%-]+", value):
             fail(f"runner.conf:{number}: unsafe value for {key}")
         result[key] = value
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", result.get("RUNNER_ENV_PREFIX", "")):
+        fail("runner.conf must set RUNNER_ENV_PREFIX to a shell identifier")
     role = result.get("RUNNER_SYNC_ROLE")
     if role not in {"source", "consumer"}:
         fail("runner.conf must set RUNNER_SYNC_ROLE=source or consumer")

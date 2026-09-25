@@ -66,8 +66,11 @@ typeset -a home_raw home_hits=()
 home_raw=(${(f)"$(scan "$home_pattern" . ":!$self")"})
 home_raw=(${home_raw:#})
 for f in "${home_raw[@]}"; do
-  git grep --cached -IhE -e "$home_pattern" -- "$f" 2>/dev/null \
-    | grep -qvE '/home/runner([^A-Za-z0-9._-]|$)' \
+  # Filter individual matches, not whole lines: a safe runner path must not
+  # conceal another home path on the same line. Consume the complete stream
+  # (no grep -q) so pipefail cannot turn an upstream SIGPIPE into a false pass.
+  git grep --cached -IhoE -e "$home_pattern" -- "$f" 2>/dev/null \
+    | grep -vFx '/home/runner' >/dev/null \
     && home_hits+=("$f") || true
 done
 (( ${#home_hits} )) && report 'home-path' "${home_hits[@]}"

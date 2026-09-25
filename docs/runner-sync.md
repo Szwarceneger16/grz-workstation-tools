@@ -28,7 +28,9 @@ accepted release and are not a substitute for signature verification.
 
 This contract applies to both repository roles. `runner.conf` declares the
 role of the current checkout: `RUNNER_SYNC_ROLE=source` in the canonical source,
-or `RUNNER_SYNC_ROLE=consumer` in a consuming repository. CI independently pins
+or `RUNNER_SYNC_ROLE=consumer` in a consuming repository. `RUNNER_ENV_PREFIX`
+is required and must be a shell identifier (`[A-Za-z_][A-Za-z0-9_]*`), not a
+path, URL, or hyphenated name. CI independently pins
 `RUNNER_SYNC_EXPECTED_ROLE` to the appropriate role; changing only the config
 therefore fails the required check. Do not change the role to make an example
 command pass. CODEOWNERS and branch protection must cover both the role and
