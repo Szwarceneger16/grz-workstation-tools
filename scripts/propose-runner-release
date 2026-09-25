@@ -331,6 +331,9 @@ def changed_shared_paths(base: str | None, head: str) -> list[str]:
 def current_pending_release(ref: str) -> tuple[bool, dict[str, str] | None]:
     payload = show_bytes(ref, RELEASE_FILE, optional=True)
     if payload is None:
+        # Bootstrap has no metadata yet, but protected tags are still a trust
+        # boundary. Never report a clean state for a poisoned tag namespace.
+        verified_releases()
         return False, None
     release = parse_release(payload, f"{ref}:{RELEASE_FILE}")
     expected_tag = f"runner-v{release['version']}"

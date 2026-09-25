@@ -71,7 +71,7 @@ class RunnerDocumentationTests(unittest.TestCase):
             result = self.execute(root, self.commands("source")[1])
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(self.execute(root, self.commands("source")[0]).returncode, 0)
-            (root / "runner.conf").write_text("RUNNER_SYNC_ROLE=consumer\n")
+            (root / "runner.conf").write_text("RUNNER_ENV_PREFIX=FIXTURE\nRUNNER_SYNC_ROLE=consumer\n")
             before = (root / "runner.lock").read_bytes()
             result = self.execute(root, ["RUNNER_SYNC_EXPECTED_ROLE=consumer", "RUNNER_SYNC_WRITE=1", "./scripts/sync-runner", "lock"])
             self.assertNotEqual(result.returncode, 0)

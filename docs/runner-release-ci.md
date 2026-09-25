@@ -18,6 +18,11 @@ before dispatch and never checks out or executes the release candidate. Unexpect
 changes, stale refs, or API errors fail closed. The job also runs after successful
 idempotent publication retries, even if no new metadata commit was needed.
 
+Both draft-publication PR lookups also filter by `base=main` and validate the
+returned base/head repository, branch, draft state, and PR number. A same-head
+PR targeting another branch is not adopted, edited, or used as a ready-state
+gate. Ambiguous or malformed API responses fail closed.
+
 The dispatch uses the fixed `automation/runner-release-next` branch and passes
 its exact validated SHA as `expected_head_sha`. Before checkout, the read-only
 `Repo consistency` job requires that ref and `github.sha` to match. Consequently
@@ -46,6 +51,10 @@ format. Invalid names are errors, not ignored tags. No trusted baseline or succe
 report is produced while the namespace contains a malformed tag. Tags outside
 that namespace are unaffected. Resolving an invalid protected tag requires an
 explicit owner decision; these workflows do not delete or rewrite tags.
+
+This validation also runs before reporting a clean release state during
+bootstrap, when `runner.release` does not exist yet. Missing metadata does not
+allow malformed, lightweight, or unsigned release tags to bypass the gate.
 
 ## Signing requests for batched pushes
 

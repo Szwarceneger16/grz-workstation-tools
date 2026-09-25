@@ -229,6 +229,46 @@ class RunnerReleaseTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse((self.root / "state.json").exists())
 
+    def test_bootstrap_release_state_checks_tags_without_metadata(self):
+        base = self.git("rev-parse", "HEAD").stdout.strip()
+        self.write("code.txt", "runner v2\n")
+        self.write_locks()
+        head = self.commit("shared change before first release")
+        self.assertFalse((self.root / "runner.release").exists())
+        output = self.root / "state.json"
+        args = ("release-state", "--main-ref", base, "--base-ref", base,
+                "--head-ref", head, "--json-out", str(output))
+        self.helper(*args)
+        state = json.loads(output.read_text())
+        self.assertFalse(state["pending_release"])
+        self.assertTrue(state["shared_change"])
+        output.unlink()
+
+        # Use disposable trust roots so structurally invalid tags cannot fail
+        # merely because the verification environment has not been configured.
+        self.trust_environment = {}
+        for role in ("commit", "release"):
+            _, fingerprint, allowed = self.generate_key(role)
+            self.trust_environment[f"RUNNER_{role.upper()}_ALLOWED_SIGNER_B64"] = (
+                base64.b64encode(allowed.read_bytes()).decode())
+            self.trust_environment[f"RUNNER_{role.upper()}_SIGNING_FINGERPRINT"] = fingerprint
+        for tag, annotated, error in (
+            ("runner-vfoo", False, "invalid runner release tag"),
+            ("runner-v1.0", False, "invalid runner release tag"),
+            ("runner-v1.0.0", False, "annotated"),
+            ("runner-v1.0.0", True, "signature"),
+        ):
+            with self.subTest(tag=tag, annotated=annotated):
+                if annotated:
+                    self.git("tag", "-a", tag, base, "-m", "unsigned release")
+                else:
+                    self.git("tag", tag, base)
+                result = self.helper(*args, check=False)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(error, result.stderr)
+                self.assertFalse(output.exists())
+                self.git("tag", "-d", tag)
+
     def test_malformed_protected_tags_fail_inspection_before_trust_loading(self):
         for tag in ("runner-v1.0", "runner-vfoo", "runner-v01.2.3", "runner-v1.2.3-rc1"):
             with self.subTest(tag=tag):

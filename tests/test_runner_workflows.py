@@ -6,6 +6,7 @@ from pathlib import Path
 import re
 import runpy
 import subprocess
+import textwrap
 import unittest
 from unittest import mock
 
@@ -60,7 +61,7 @@ class RunnerWorkflowTests(unittest.TestCase):
         self.assertIn("jq -e -s", text)
         self.assertIn("RUNNER_RELEASE_REPO_ROOT", text)
 
-    def run_dispatch(self, *, stale=False, fetch_race=False, main_race=False):
+    def run_dispatch(self, *, stale=False, fetch_race=False, main_race=False, validation_failure=False):
         base, head = "a" * 40, "b" * 40
         calls, updates = [], []
         with mock.patch.dict(os.environ, {"GITHUB_REPOSITORY": "test/fixture"}):
@@ -95,7 +96,7 @@ class RunnerWorkflowTests(unittest.TestCase):
                 return subprocess.CompletedProcess(argv, 0, "", "")
             self.assertEqual(argv[0], "python3")
             self.assertEqual(Path(argv[1]).parent, ROOT / "scripts")
-            return subprocess.CompletedProcess(argv, 0, b"", b"")
+            return subprocess.CompletedProcess(argv, int(validation_failure), b"", b"")
         with mock.patch("subprocess.run", side_effect=execute):
             scope["main"]()
         self.assertEqual(len(updates), 1)
@@ -106,7 +107,56 @@ class RunnerWorkflowTests(unittest.TestCase):
         self.assertEqual(update["conclusion"], "success")
 
     def test_dispatch_rejects_stale_head_and_midcheck_races(self):
-        for options in ({"stale": True}, {"fetch_race": True}, {"main_race": True}):
+        for options in ({"stale": True}, {"fetch_race": True}, {"main_race": True},
+                        {"validation_failure": True}):
             with self.subTest(options=options):
                 update, _ = self.run_dispatch(**options)
                 self.assertEqual(update["conclusion"], "failure")
+
+    def release_pr_lookups(self, response):
+        workflow = (ROOT / ".github/workflows/runner-release-draft.yml").read_text()
+        # Execute both real lookup expressions, without checkout, branch writes,
+        # or any GitHub credentials. The fake API requires the base filter.
+        lookups = re.findall(r'(?ms)^          existing_pr="\$\(gh api .*?end\x27\)"', workflow)
+        self.assertEqual(len(lookups), 2)
+        for lookup in lookups:
+            script = """set -euo pipefail
+gh() {
+  [[ "$1" == api && "$2" == 'repos/test/fixture/pulls?state=open&base=main&head=test:automation/runner-release-next' ]] || return 97
+  printf '%s' "$API_RESPONSE"
+}
+""" + textwrap.dedent(lookup) + '\nprintf "%s" "$existing_pr"\n'
+            yield subprocess.run(["bash", "-c", script], text=True, capture_output=True,
+                                 timeout=10, env={"PATH": os.environ["PATH"],
+                                     "GITHUB_REPOSITORY": "test/fixture", "owner": "test",
+                                     "RELEASE_BRANCH": "automation/runner-release-next",
+                                     "API_RESPONSE": json.dumps(response)})
+
+    def test_release_pr_lookups_accept_only_one_exact_main_pr(self):
+        for response in ([], [self.release_pr(draft=True)], [self.release_pr(draft=False)]):
+            for result in self.release_pr_lookups(response):
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads(result.stdout) if result.stdout else None,
+                                 response[0] if response else None)
+
+    @staticmethod
+    def release_pr(*, draft=True):
+        return {"number": 7, "state": "open", "draft": draft,
+                "base": {"ref": "main", "repo": {"full_name": "test/fixture"}},
+                "head": {"ref": "automation/runner-release-next",
+                         "repo": {"full_name": "test/fixture"}}}
+
+    def test_release_pr_lookups_reject_wrong_base_identity_and_ambiguity(self):
+        invalid = [{"message": "API failure"}, [None], [self.release_pr(), self.release_pr()]]
+        for field, value in (("base", {"ref": "staging", "repo": {"full_name": "test/fixture"}}),
+                             ("base", {"ref": "main", "repo": {"full_name": "other/fixture"}}),
+                             ("head", {"ref": "other", "repo": {"full_name": "test/fixture"}}),
+                             ("head", {"ref": "automation/runner-release-next", "repo": {"full_name": "other/fixture"}}),
+                             ("state", "closed"), ("draft", "true"), ("number", "7"),
+                             ("number", 0), ("number", 1.5)):
+            invalid.append([{**self.release_pr(), field: value}])
+        for response in invalid:
+            with self.subTest(response=response):
+                for result in self.release_pr_lookups(response):
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertEqual(result.stdout, "")
