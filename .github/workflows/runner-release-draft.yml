@@ -183,3 +183,27 @@ jobs:
               -f title="$title" \
               -f body="$body" >/dev/null
           fi
+
+  dispatch-release-checks:
+    name: Dispatch checks for the exact published release head
+    needs: update-release-draft
+    # Run on idempotent retries too: publication may have succeeded before a
+    # previous dispatch failed. No candidate code runs with this token.
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: write
+    steps:
+      - name: Check out the trusted dispatcher from public main
+        # Pinned to SHA for supply-chain safety. Tag: v6
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate the metadata-only branch and dispatch read-only CI
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/dispatch-runner-release-checks

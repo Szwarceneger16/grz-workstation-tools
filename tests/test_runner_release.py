@@ -229,6 +229,161 @@ class RunnerReleaseTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse((self.root / "state.json").exists())
 
+    def test_malformed_protected_tags_fail_inspection_before_trust_loading(self):
+        for tag in ("runner-v1.0", "runner-vfoo", "runner-v01.2.3", "runner-v1.2.3-rc1"):
+            with self.subTest(tag=tag):
+                self.git("tag", tag)
+                result = self.helper("inspect", "--json-out", str(self.root / "state.json"), check=False)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("invalid runner release tag", result.stderr)
+                self.assertFalse((self.root / "state.json").exists())
+                self.git("tag", "-d", tag)
+
+    def test_malformed_tag_cannot_hide_next_to_a_verified_release(self):
+        self.signed_release()
+        self.git("tag", "runner-vfoo")
+        result = self.helper("inspect", "--json-out", str(self.root / "state.json"), check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("invalid runner release tag", result.stderr)
+        result = self.helper(
+            "verify-tag", "--tag", "runner-v0.1.0", "--main-ref", "main",
+            "--commit-allowed-signers", str(self.root / "commit-key.allowed_signers"),
+            "--commit-fingerprint", self.trust_environment["RUNNER_COMMIT_SIGNING_FINGERPRINT"],
+            "--release-allowed-signers", str(self.root / "release-key.allowed_signers"),
+            "--release-fingerprint", self.trust_environment["RUNNER_RELEASE_SIGNING_FINGERPRINT"],
+            "--json-out", str(self.root / "verified.json"), check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("invalid runner release tag", result.stderr)
+
+    def test_tags_outside_runner_namespace_do_not_trigger_release_validation(self):
+        self.git("tag", "unrelated-vfoo")
+        self.assertTrue(self.inspect()["needs_release"])
+
+    def propose_noop_release(self):
+        base = self.signed_release()
+        release = self.root / "runner.release"
+        release.write_text(release.read_text().replace("version 0.1.0", "version 0.1.1")
+                           .replace("previous-tag none", "previous-tag runner-v0.1.0"))
+        return base
+
+    def test_metadata_only_release_fails_validation_state_and_pending_inspection(self):
+        base = self.propose_noop_release()
+        head = self.commit("attempt metadata-only release")
+        for args in (
+            ("validate-release", "--ref", head),
+            ("release-state", "--main-ref", base, "--base-ref", base, "--head-ref", head,
+             "--json-out", str(self.root / "state.json")),
+            ("inspect", "--head-ref", head, "--json-out", str(self.root / "state.json")),
+        ):
+            with self.subTest(command=args[0]):
+                result = self.helper(*args, check=False)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("canonical code or documentation delta", result.stderr)
+
+    def test_lock_serialization_change_does_not_allow_a_noop_release(self):
+        self.propose_noop_release()
+        lock = self.root / "runner.lock"
+        lock.write_text(lock.read_text().rstrip("\n"))
+        self.commit("metadata and lock serialization only")
+        result = self.helper("validate-release", check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("canonical code or documentation delta", result.stderr)
+
+    def test_lock_serialization_alone_does_not_open_an_invalid_release_draft(self):
+        self.signed_release()
+        lock = self.root / "runner.lock"
+        lock.write_text(lock.read_text().rstrip("\n"))
+        self.commit("lock serialization only")
+        self.assertFalse(self.inspect()["needs_release"])
+
+    def test_noop_release_is_rejected_even_with_both_valid_signatures(self):
+        self.propose_noop_release()
+        parent = self.commit("freeze metadata-only release")
+        release = dict(line.split(" ", 1) for line in (self.root / "runner.release").read_text().splitlines())
+        self.git("switch", "--detach", parent)
+        self.git("commit", "--allow-empty", "-S", "-m", "attest metadata-only release")
+        message = "\n".join(["runner-release-v1", "version 0.1.1", f"release-parent {parent}",
+                             f"code-tree-sha256 {release['code-tree-sha256']}",
+                             f"docs-tree-sha256 {release['docs-tree-sha256']}"])
+        self.git("-c", f"user.signingkey={Path(self.temporary.name) / 'release-key'}",
+                 "tag", "-s", "runner-v0.1.1", "-m", message)
+        self.git("switch", "main")
+        result = self.helper("inspect", "--json-out", str(self.root / "state.json"), check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("canonical code or documentation delta", result.stderr)
+
+    def test_genuinely_changed_snapshots_remain_releasable(self):
+        self.signed_release()
+        for kind in ("code", "docs", "manifest", "mode", "removal"):
+            with self.subTest(kind=kind):
+                self.git("switch", "-c", f"candidate-{kind}", "main")
+                if kind == "code":
+                    self.write("code.txt", "changed code\n")
+                elif kind == "docs":
+                    self.write("docs/contract.md", "changed contract\n")
+                elif kind == "manifest":
+                    manifest = self.root / "scripts/runner-canonical-docs.txt"
+                    manifest.write_text("# Export contract\n" + manifest.read_text())
+                elif kind == "mode":
+                    os.chmod(self.root / "code.txt", 0o755)
+                else:
+                    (self.root / "code.txt").unlink()
+                    manifest = self.root / "scripts/runner-canonical-files.txt"
+                    manifest.write_text(manifest.read_text().replace("code.txt\n", ""))
+                self.write_locks()
+                self.commit(f"shared {kind} delta")
+                self.helper("update", "--head-ref", "HEAD", "--body-out", str(Path(self.temporary.name) / "body.md"))
+                self.commit("prepare changed release")
+                self.helper("validate-release", "--ref", "HEAD")
+                self.git("switch", "main")
+
+    def test_signing_parent_is_frozen_commit_not_batched_push_tip(self):
+        frozen, _ = self.prepare_release()
+        for number in (1, 2):
+            self.write("README.md", f"unrelated commit {number}\n")
+            self.commit(f"unrelated commit {number}")
+        output = Path(self.temporary.name) / "github-output"
+        state = Path(self.temporary.name) / "state.json"
+        self.helper("inspect", "--head-ref", "HEAD", "--json-out", str(state), "--github-output", str(output))
+        data = json.loads(state.read_text())
+        self.assertTrue(data["pending_release"])
+        self.assertEqual(data["release_parent"], frozen)
+        self.assertNotEqual(data["main_sha"], frozen)
+        self.assertIn(f"release_parent={frozen}\n", output.read_text())
+
+    def test_signing_parent_is_first_parent_merge_not_draft_commit(self):
+        self.git("switch", "-c", "release-draft")
+        draft, _ = self.prepare_release()
+        self.git("switch", "main")
+        self.git("merge", "--no-ff", "--no-edit", "release-draft")
+        frozen = self.git("rev-parse", "HEAD").stdout.strip()
+        self.write("README.md", "later unrelated commit\n")
+        self.commit("later unrelated commit")
+        self.assertNotEqual(draft, frozen)
+        self.assertEqual(self.inspect()["release_parent"], frozen)
+
+    def test_valid_signed_frozen_parent_remains_valid_after_unrelated_main_commits(self):
+        self.signed_release()
+        self.write("README.md", "later unrelated commit\n")
+        self.commit("later unrelated commit")
+        data = self.inspect()
+        self.assertFalse(data["pending_release"])
+        self.assertFalse(data["needs_release"])
+        self.assertEqual(data["previous_tag"], "runner-v0.1.0")
+
+    def test_reintroduced_identical_metadata_has_no_unambiguous_frozen_parent(self):
+        self.prepare_release()
+        release = self.root / "runner.release"
+        payload = release.read_text()
+        release.unlink()
+        self.commit("remove metadata")
+        release.write_text(payload)
+        self.commit("restore identical metadata")
+        result = self.helper("inspect", "--json-out", str(self.root / "state.json"), check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("one exact frozen metadata commit", result.stderr)
+
     def test_trusted_state_check_recomputes_candidate_locks(self):
         base = self.git("rev-parse", "HEAD").stdout.strip()
         self.write("code.txt", "drift without lock update")
