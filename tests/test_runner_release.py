@@ -575,6 +575,39 @@ class RunnerReleaseTests(unittest.TestCase):
         self.commit("feat: shared (#456)")
         self.assertEqual(self.inspect()["merged_prs"], [456])
 
+    def test_merge_commit_and_squash_subjects_include_only_shared_prs(self):
+        for number, relative in ((11, "code.txt"), (22, "README.md"), (33, "docs/contract.md")):
+            self.git("switch", "-c", f"feature-{number}")
+            self.write(relative, f"change {number}\n")
+            self.write_locks()
+            self.commit("feature change")
+            self.git("switch", "main")
+            self.git("merge", "--no-ff", "--no-gpg-sign", f"feature-{number}",
+                     "-m", f"Merge pull request #{number} from example/feature-{number}")
+        self.write("code.txt", "squashed change\n")
+        self.write_locks()
+        self.commit("feat: shared (#44)")
+        self.assertEqual(self.inspect()["merged_prs"], [11, 33, 44])
+
+    def test_shared_changes_cannot_freeze_release_in_the_same_pr(self):
+        base = self.git("rev-parse", "HEAD").stdout.strip()
+        self.write("code.txt", "new shared version\n")
+        self.write_locks()
+        shared = self.commit("ordinary shared change")
+        self.helper("update", "--head-ref", shared, "--body-out", str(Path(self.temporary.name) / "body.md"))
+        head = self.commit("freeze alongside shared changes")
+        result, _ = self.release_state_result(base, head)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("separately from shared changes", result.stderr)
+        # Once the ordinary shared PR is accepted, the metadata-only PR passes.
+        result, _ = self.release_state_result(shared, head)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.write("README.md", "unrelated addition\n")
+        mixed = self.commit("unrelated change inside release PR")
+        result, _ = self.release_state_result(shared, mixed)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("only runner.release", result.stderr)
+
     def test_invalid_manual_version_fails_instead_of_resetting_to_default(self):
         body = Path(self.temporary.name) / "body.md"
         self.helper("update", "--head-ref", "main", "--body-out", str(body))

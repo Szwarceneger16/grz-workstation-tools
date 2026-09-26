@@ -28,6 +28,21 @@ files, symlinks, and overlapping code/documentation entries are rejected.
 The locks prove internal source consistency only. They do not establish an
 accepted release and are not a substitute for signature verification.
 
+## Repository-local confidentiality checks
+
+`scripts/audit-public-safety` is repository-maintenance tooling, not part of
+the shared installation runner. It is excluded from the canonical export,
+consumer selections, and runner locks. Each repository maintains and reviews
+its own scanner, CI integration, and optional exception policy independently.
+Updating the runner must not replace or remove this local scanner.
+
+The scanner checks repository content for possible confidential data; it does
+not validate installation behavior or prove that code is harmless. Its scope
+is the repository being checked, not just the shared runner files. Neither
+scan results nor `manifests/public-safety-allowlist.json` are synchronized.
+`scripts/check-repo` remains shared: it validates the package declarations and
+installation contract rather than replacing confidentiality checks.
+
 ## Repository roles
 
 This contract applies to both repository roles. `runner.conf` declares the

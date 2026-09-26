@@ -416,7 +416,15 @@ def merged_pr_references(base: str | None, head: str) -> list[int]:
         watched.update(manifest_paths_optional(ref, CANON_CODE))
         watched.update(manifest_paths_optional(ref, CANON_DOCS))
     subjects = git_text("log", "--first-parent", "--format=%s", revision, "--", *sorted(watched)).splitlines()
-    return sorted({int(number) for subject in subjects for number in re.findall(r"\(#([1-9][0-9]*)\)", subject)})
+    numbers: set[int] = set()
+    for subject in subjects:
+        # GitHub's merge-commit and squash-merge subjects both identify PRs.
+        merge = re.match(r"^Merge pull request #([1-9][0-9]*) from \S+", subject)
+        squash = re.search(r"\(#([1-9][0-9]*)\)$", subject)
+        match = merge or squash
+        if match:
+            numbers.add(int(match.group(1)))
+    return sorted(numbers)
 
 
 def write_output(path: str | None, values: dict[str, object]) -> None:
@@ -631,9 +639,15 @@ def command_release_state(args: argparse.Namespace) -> None:
     pending, release = current_pending_release(args.main_ref)
     if pending and entry_signature(args.main_ref, RELEASE_FILE) != entry_signature(args.head_ref, RELEASE_FILE):
         fail("pending runner.release is immutable until its release tag is verified")
-    if show_bytes(args.base_ref, RELEASE_FILE, optional=True) != show_bytes(args.head_ref, RELEASE_FILE, optional=True):
-        validate_release(args.head_ref)
     changed = changed_shared_paths(args.base_ref, args.head_ref)
+    metadata_changed = entry_signature(args.base_ref, RELEASE_FILE) != entry_signature(args.head_ref, RELEASE_FILE)
+    if metadata_changed and changed:
+        fail("runner.release must be reviewed separately from shared changes")
+    if metadata_changed:
+        validate_release(args.head_ref)
+        paths = git_text("diff", "--no-renames", "--name-only", args.base_ref, args.head_ref).splitlines()
+        if paths != [RELEASE_FILE]:
+            fail("release proposal must change only runner.release")
     data = {
         "pending_release": pending,
         "pending_version": release["version"] if release else "",
