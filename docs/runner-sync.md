@@ -16,9 +16,13 @@ There is no wildcard export of `scripts/**` or `docs/**`. A consumer may select
 any subset, but it must reject a selected path that is absent from the
 corresponding public allow-list.
 
-`runner.lock` and `runner.docs.lock` contain SHA-256 records for the exact code
-and documentation sets. Every manifest entry must be a normalized,
-repository-relative regular file. Absolute paths, `..`, duplicates, missing
+`runner.lock` and `runner.docs.lock` contain records in the strict format
+`<100644|100755> <SHA-256>  <path>` for the exact code and documentation sets.
+Both content and Git executable mode are bound; a chmod-only change requires
+a reviewed lock update. Legacy content-only records are rejected, not silently
+upgraded. Local checks work without `.git` and use the owner executable bit,
+matching Git's regular-file mode representation. Every manifest entry must be
+a normalized, repository-relative regular file. Absolute paths, `..`, duplicates, missing
 files, symlinks, and overlapping code/documentation entries are rejected.
 
 The locks prove internal source consistency only. They do not establish an
@@ -103,6 +107,14 @@ verification metadata) across the verify/write job boundary. Before any local
 mutation, reject symlinks/non-regular files at every target and ancestor,
 including locks and stale paths, and use fresh atomic temporary files.
 
+Immediately before a proposal push, the trusted job re-queries the exact PR
+and the branch's open PR list. It refuses ready, closed, merged, retargeted,
+replaced or ambiguous proposals, changed heads, and API failures. If a PR
+appears while a new branch is being prepared, rerun rather than adopt it.
+This check narrows the ready/push race; GitHub offers no atomic transaction
+combining PR draft state and a Git push. Required checks and dismissal of stale
+approvals must still bind the revision reviewed and merged by the owner.
+
 Canonical manifests declare the maximum export; a consumer validates only its
 selected files for local existence. Unselected exports need not be present.
 Keep monitor notices separate from acceptance: preserve a candidate's approval,
@@ -112,3 +124,12 @@ Release-signing public keys may be published by the source for convenience, but 
 consumer must use trust roots configured by its own administrator. It must not
 silently trust verification material fetched from the same origin as the
 candidate.
+
+## Legacy shell loader identities
+
+The shared loader recognizes current and historical public repository markers.
+Consumers may keep additional historical marker values, one per line, in the
+repository-local `.rcd-loader-legacy-repo-ids` (comments start with `#`). This
+plain-data allow-list is never synchronized or exported. Protect it like local
+installation policy. Only dangling links with the legacy package path shape
+and an explicitly recognized marker are replaced; foreign links are refused.

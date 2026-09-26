@@ -35,6 +35,46 @@ class RunnerReleaseTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
+    def test_snapshot_rejects_symlink_locks_even_with_valid_record_bytes(self):
+        for relative in ("runner.lock", "runner.docs.lock"):
+            with self.subTest(relative=relative):
+                path = self.root / relative
+                payload = path.read_text()
+                path.unlink()
+                path.symlink_to(payload)
+                self.commit("malicious symlink lock")
+                result = self.helper("inspect", "--json-out", str(self.root / "inspection.json"), check=False)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("regular file", result.stderr)
+                self.assertIn(relative, result.stderr)
+                path.unlink()
+                path.write_text(payload)
+
+    def test_snapshot_rejects_mode_drift_without_lock_update(self):
+        (self.root / "code.txt").chmod(0o755)
+        self.commit("mode drift")
+        result = self.helper("inspect", "--json-out", str(self.root / "inspection.json"), check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("mode mismatch", result.stderr)
+
+    def test_pending_metadata_is_immutable_in_bytes_mode_and_presence(self):
+        base, _ = self.prepare_release()
+        path = self.root / "runner.release"
+        payload = path.read_text()
+        for mutation in ("version", "mode", "delete", "symlink"):
+            with self.subTest(mutation=mutation):
+                if path.exists() or path.is_symlink():
+                    path.unlink()
+                if mutation == "symlink":
+                    path.symlink_to(payload)
+                elif mutation != "delete":
+                    path.write_text(payload.replace("version 0.1.0", "version 0.2.0") if mutation == "version" else payload)
+                    path.chmod(0o755 if mutation == "mode" else 0o644)
+                head = self.commit("mutate frozen metadata")
+                result, _ = self.release_state_result(base, head)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertRegex(result.stderr, "immutable|regular file")
+
     def write(self, relative: str, content: str) -> None:
         destination = self.root / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -51,7 +91,8 @@ class RunnerReleaseTests(unittest.TestCase):
             records = []
             for relative in self.manifest(manifest):
                 digest = hashlib.sha256((self.root / relative).read_bytes()).hexdigest()
-                records.append(f"{digest}  {relative}\n")
+                mode = "100755" if (self.root / relative).stat().st_mode & 0o100 else "100644"
+                records.append(f"{mode} {digest}  {relative}\n")
             self.write(lock, "".join(records))
 
     def git(self, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
