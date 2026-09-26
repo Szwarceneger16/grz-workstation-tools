@@ -26,7 +26,7 @@ RELEASE_FILE = "runner.release"
 TAG_RE = re.compile(r"runner-v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)")
 SHA_RE = re.compile(r"[0-9a-f]{40}")
 HASH_RE = re.compile(r"[0-9a-f]{64}")
-LOCK_RE = re.compile(r"([0-9a-f]{64})  ([^\0\r\n]+)")
+LOCK_RE = re.compile(r"(100644|100755) ([0-9a-f]{64})  ([^\0\r\n]+)")
 SAFE_PATH_RE = re.compile(r"(?:[A-Za-z0-9._@+-]+/)*[A-Za-z0-9._@+-]+")
 RELEASE_KEYS = (
     "version",
@@ -184,6 +184,7 @@ def tree_entry(ref: str, path: str, *, optional: bool = False) -> tuple[str, str
 
 
 def parse_manifest(ref: str, path: str) -> tuple[bytes, list[str]]:
+    tree_entry(ref, path)
     payload = show_bytes(ref, path)
     assert payload is not None
     entries: list[str] = []
@@ -203,21 +204,22 @@ def parse_manifest(ref: str, path: str) -> tuple[bytes, list[str]]:
     return payload, entries
 
 
-def parse_lock(ref: str, path: str) -> dict[str, str]:
+def parse_lock(ref: str, path: str) -> dict[str, tuple[str, str]]:
+    tree_entry(ref, path)
     payload = show_bytes(ref, path)
     assert payload is not None
-    result: dict[str, str] = {}
+    result: dict[str, tuple[str, str]] = {}
     previous = ""
     for number, line in enumerate(payload.decode("utf-8", "strict").splitlines(), 1):
         match = LOCK_RE.fullmatch(line)
         if not match:
             fail(f"{path}:{number}: invalid lock record")
-        digest, raw_path = match.groups()
+        mode, digest, raw_path = match.groups()
         entry = safe_path(raw_path, path, number)
         if entry in result or (previous and entry <= previous):
             fail(f"{path}:{number}: duplicate or unsorted path: {entry}")
         previous = entry
-        result[entry] = digest
+        result[entry] = (mode, digest)
     return result
 
 
@@ -249,7 +251,10 @@ def snapshot(ref: str) -> dict[str, object]:
         for path in paths:
             payload = show_bytes(ref, path)
             assert payload is not None
-            if hashlib.sha256(payload).hexdigest() != locked[path]:
+            mode, digest = locked[path]
+            if tree_entry(ref, path)[0] != mode:
+                fail(f"{lock_path}: file mode mismatch: {path}")
+            if hashlib.sha256(payload).hexdigest() != digest:
                 fail(f"{lock_path}: content hash mismatch: {path}")
     return {
         "main_sha": git_text("rev-parse", f"{ref}^{{commit}}"),
@@ -340,6 +345,7 @@ def changed_shared_paths(base: str | None, head: str) -> list[str]:
 
 
 def current_pending_release(ref: str) -> tuple[bool, dict[str, str] | None]:
+    tree_entry(ref, RELEASE_FILE, optional=True)
     payload = show_bytes(ref, RELEASE_FILE, optional=True)
     if payload is None:
         # Bootstrap has no metadata yet, but protected tags are still a trust
@@ -622,9 +628,11 @@ def command_verify_tag(args: argparse.Namespace) -> None:
 def command_release_state(args: argparse.Namespace) -> None:
     # Candidate CI is PR-controlled. Recompute locks with this trusted helper.
     snapshot(args.head_ref)
+    pending, release = current_pending_release(args.main_ref)
+    if pending and entry_signature(args.main_ref, RELEASE_FILE) != entry_signature(args.head_ref, RELEASE_FILE):
+        fail("pending runner.release is immutable until its release tag is verified")
     if show_bytes(args.base_ref, RELEASE_FILE, optional=True) != show_bytes(args.head_ref, RELEASE_FILE, optional=True):
         validate_release(args.head_ref)
-    pending, release = current_pending_release(args.main_ref)
     changed = changed_shared_paths(args.base_ref, args.head_ref)
     data = {
         "pending_release": pending,

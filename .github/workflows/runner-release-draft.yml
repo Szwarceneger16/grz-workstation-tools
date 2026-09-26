@@ -82,6 +82,7 @@ jobs:
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
           cp scripts/propose-runner-release "$RUNNER_TEMP/propose-runner-release"
+          cp scripts/check-runner-draft "$RUNNER_TEMP/check-runner-draft"
           chmod 0500 "$RUNNER_TEMP/propose-runner-release"
           owner="${GITHUB_REPOSITORY%%/*}"
           existing_pr="$(gh api \
@@ -139,7 +140,11 @@ jobs:
           else
             git switch --create "$RELEASE_BRANCH" origin/main
           fi
-          echo "skip=false" >> "$GITHUB_OUTPUT"
+          {
+            echo "skip=false"
+            echo "pr_number=$(jq -r '.number // empty' <<<"$existing_pr")"
+            echo "pr_head=$(jq -r '.head.sha // empty' <<<"$existing_pr")"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Regenerate release metadata
         if: steps.branch.outputs.skip != 'true'
@@ -154,6 +159,9 @@ jobs:
       - name: Commit and push metadata without rewriting history
         if: steps.branch.outputs.skip != 'true'
         env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_PR: ${{ steps.branch.outputs.pr_number }}
+          EXPECTED_HEAD: ${{ steps.branch.outputs.pr_head }}
           RELEASE_BRANCH: automation/runner-release-next
         run: |
           set -euo pipefail
@@ -164,6 +172,8 @@ jobs:
             version="$(awk '$1 == "version" { print $2 }' runner.release)"
             git commit -m "chore(runner): prepare runner-v${version}"
           fi
+          python3 "$RUNNER_TEMP/check-runner-draft" --repository "$GITHUB_REPOSITORY" \
+            --branch "$RELEASE_BRANCH" --expected-pr "$EXPECTED_PR" --expected-head "$EXPECTED_HEAD"
           git push origin "HEAD:${RELEASE_BRANCH}"
 
       - name: Create or update one draft pull request
@@ -200,7 +210,7 @@ jobs:
               -f base=main \
               -F draft=true \
               -f body="$body" >/dev/null
-          else
+          elif [[ "$(jq -r '.draft' <<<"$existing_pr")" == "true" ]]; then
             gh api "repos/${GITHUB_REPOSITORY}/pulls/${pr_number}" \
               --method PATCH \
               -f title="$title" \

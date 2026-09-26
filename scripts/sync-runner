@@ -27,7 +27,7 @@ SELECTED_DOCS = "scripts/runner-sync-docs.txt"
 LOCK_CODE = "runner.lock"
 LOCK_DOCS = "runner.docs.lock"
 ALLOWED_CONFIG = {"RUNNER_ENV_PREFIX", "RUNNER_SYNC_ROLE", "RUNNER_CANONICAL_REMOTE"}
-LOCK_RE = re.compile(r"^([0-9a-f]{64})  ([^\0\r\n]+)$")
+LOCK_RE = re.compile(r"^(100644|100755) ([0-9a-f]{64})  ([^\0\r\n]+)$")
 SAFE_PATH_RE = re.compile(r"(?:[A-Za-z0-9._@+-]+/)*[A-Za-z0-9._@+-]+")
 
 
@@ -130,24 +130,31 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def read_lock(relative: str) -> dict[str, str]:
+def file_mode(path: Path) -> str:
+    mode = path.lstat().st_mode
+    if not stat.S_ISREG(mode) or mode & 0o7000:
+        fail(f"lock entry must be a regular file without special mode bits: {path.name}")
+    return "100755" if mode & stat.S_IXUSR else "100644"
+
+
+def read_lock(relative: str) -> dict[str, tuple[str, str]]:
     path = regular_path(relative)
     if not path.is_file() or path.is_symlink():
         fail(f"lock must be a regular file: {relative}")
-    result: dict[str, str] = {}
+    result: dict[str, tuple[str, str]] = {}
     previous = ""
     for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
         match = LOCK_RE.fullmatch(line)
         if not match:
             fail(f"{relative}:{number}: invalid lock record")
-        digest, raw_path = match.groups()
+        mode, digest, raw_path = match.groups()
         entry = safe_path(raw_path, relative, number)
         if entry in result:
             fail(f"{relative}:{number}: duplicate path: {entry}")
         if previous and entry <= previous:
             fail(f"{relative}:{number}: records must be sorted by path")
         previous = entry
-        result[entry] = digest
+        result[entry] = (mode, digest)
     return result
 
 
@@ -158,13 +165,16 @@ def validate_lock(manifest: Iterable[str], lock_relative: str) -> None:
         fail(f"{lock_relative} path set differs from its manifest")
     for entry in expected:
         actual = sha256(ROOT / entry)
-        if actual != locked[entry]:
+        mode, digest = locked[entry]
+        if file_mode(regular_path(entry)) != mode:
+            fail(f"{lock_relative}: file mode mismatch: {entry}")
+        if actual != digest:
             fail(f"{lock_relative}: content hash mismatch: {entry}")
 
 
 def write_lock(manifest: Iterable[str], lock_relative: str) -> None:
     entries = list(manifest)
-    payload = "".join(f"{sha256(ROOT / entry)}  {entry}\n" for entry in entries)
+    payload = "".join(f"{file_mode(regular_path(entry))} {sha256(ROOT / entry)}  {entry}\n" for entry in entries)
     destination = ROOT / lock_relative
     if destination.exists() or destination.is_symlink():
         regular_path(lock_relative)

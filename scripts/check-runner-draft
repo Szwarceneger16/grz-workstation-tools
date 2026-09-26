@@ -1,0 +1,60 @@
+#!/usr/bin/env python3
+"""Read-only, trusted-main pre-push guard for an automation draft branch."""
+import argparse
+import json
+import re
+import subprocess
+import sys
+
+
+def check(args):
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", args.repository):
+        raise ValueError("invalid repository")
+    if not re.fullmatch(r"automation/runner-(?:release-next|sync/runner-v[0-9]+\.[0-9]+\.[0-9]+)", args.branch):
+        raise ValueError("invalid automation branch")
+    owner = args.repository.split("/", 1)[0]
+    endpoint = f"repos/{args.repository}/pulls?state=open&head={owner}:{args.branch}"
+    result = subprocess.run(["gh", "api", "--paginate", "--slurp", endpoint],
+                            check=True, capture_output=True, text=True)
+    pages = json.loads(result.stdout)
+    if not isinstance(pages, list) or not pages or any(not isinstance(page, list) for page in pages):
+        raise ValueError("invalid PR list response")
+    prs = [pr for page in pages for pr in page]
+    if not args.expected_pr:
+        if prs:
+            raise ValueError("a PR appeared during preparation; rerun before publishing")
+        return
+    if not re.fullmatch(r"[1-9][0-9]*", args.expected_pr) or not re.fullmatch(r"[0-9a-f]{40}", args.expected_head):
+        raise ValueError("invalid expected PR identity")
+    # Read the exact PR as well: a closed or retargeted PR must not be treated
+    # as permission to recreate or mutate the branch.
+    result = subprocess.run(["gh", "api", f"repos/{args.repository}/pulls/{args.expected_pr}"],
+                            check=True, capture_output=True, text=True)
+    pr = json.loads(result.stdout)
+    if (len(prs) != 1 or type(prs[0].get("number")) is not int
+            or prs[0]["number"] != int(args.expected_pr)
+            or type(pr.get("number")) is not int or pr["number"] != int(args.expected_pr)
+            or pr.get("state") != "open" or pr.get("draft") is not True
+            or pr.get("merged_at") is not None
+            or pr["base"]["ref"] != "main" or pr["base"]["repo"]["full_name"] != args.repository
+            or pr["head"]["ref"] != args.branch or pr["head"]["repo"]["full_name"] != args.repository
+            or pr["head"]["sha"] != args.expected_head):
+        raise ValueError("draft PR identity, state or head changed; refusing publication")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--repository", required=True)
+    parser.add_argument("--branch", required=True)
+    parser.add_argument("--expected-pr", default="")
+    parser.add_argument("--expected-head", default="")
+    try:
+        check(parser.parse_args())
+    except (ValueError, KeyError, TypeError, AttributeError, subprocess.CalledProcessError, OSError):
+        print("runner draft guard: PR state or identity could not be verified; refusing publication", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

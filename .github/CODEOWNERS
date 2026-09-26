@@ -17,3 +17,5 @@
 /scripts/propose-runner-release @Szwarceneger16
 /scripts/runner-canonical-files.txt @Szwarceneger16
 /scripts/runner-canonical-docs.txt @Szwarceneger16
+/scripts/check-runner-draft @Szwarceneger16
+/.rcd-loader-legacy-repo-ids @Szwarceneger16

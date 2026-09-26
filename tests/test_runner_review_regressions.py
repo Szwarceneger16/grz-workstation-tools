@@ -29,7 +29,7 @@ class RunnerDocumentationTests(unittest.TestCase):
             (root / "scripts" / canonical).write_text("\n".join(paths) + "\n")
             (root / "scripts" / selected).write_text("\n".join(paths) + "\n")
         for paths, lock in ((code, "runner.lock"), (docs, "runner.docs.lock")):
-            (root / lock).write_text("".join(f"{hashlib.sha256((root / path).read_bytes()).hexdigest()}  {path}\n" for path in paths))
+            (root / lock).write_text("".join(f"{100755 if (root / path).stat().st_mode & 0o100 else 100644} {hashlib.sha256((root / path).read_bytes()).hexdigest()}  {path}\n" for path in paths))
 
     def commands(self, role):
         document = (ROOT / "docs/runner-sync.md").read_text()

@@ -55,7 +55,10 @@ when unrelated commits have advanced main. Git identity is set before merges.
 Merging the release PR freezes the shared snapshot but does not create a tag.
 The signing-request workflow opens one owner issue, and the required `Runner
 release state` check blocks new shared changes until the expected tag is
-verified. Unrelated pull requests remain eligible to merge.
+verified. The pending `runner.release` itself is immutable too: version, bytes,
+mode, removal and replacement are blocked until verification. There is no
+implicit cancellation by editing metadata. Unrelated pull requests remain
+eligible to merge.
 
 ## Manual signing ceremony
 
