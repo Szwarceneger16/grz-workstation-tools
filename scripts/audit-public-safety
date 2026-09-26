@@ -2,99 +2,79 @@
 emulate -L zsh
 set -euo pipefail
 
-# Public-safety scanner.
-#
-# Fails if anything that will ACTUALLY be published looks like personal data or a
-# credential. Scope = tracked files (what `git` would publish); untracked and
-# git-ignored files (e.g. .claude/settings*.json) are intentionally not scanned.
-#
-# Per AGENTS.md this reports only the file path + category, never the matched value
-# (so it is safe to run in CI logs).
-#
-# Two tiers keep it precise:
-#   Tier A  whole tracked tree   high-signal leaks that never appear in real docs
-#                                (credential formats, absolute personal home paths)
-#   Tier B  packages/*/install   generic secret-ish words, only in shipped runtime
-#                                code (these words legitimately appear in README /
-#                                AGENTS.md / CI as documentation, so are not failed
-#                                there)
+# Repository-local public policy. Read indexed bytes, not the worktree, filters
+# or grep's text/binary classification. Report paths/categories, never values.
+# No external policy, consumer information or blanket scanner-file exclusion.
+exec python3 -I - "${0:A:h:h}" <<'PY'
+import json
+import re
+import subprocess
+import sys
 
-repo_root="${0:A:h:h}"
-cd "$repo_root" || { print -u2 -- 'audit-public-safety: cannot cd to repo root'; exit 2; }
 
-command -v git >/dev/null 2>&1 || { print -u2 -- 'audit-public-safety: git is required'; exit 2; }
-git rev-parse --is-inside-work-tree >/dev/null 2>&1 ||
-  { print -u2 -- 'audit-public-safety: not inside a git work tree'; exit 2; }
+def git(*args):
+    result = subprocess.run(["git", "--no-replace-objects", *args], cwd=sys.argv[1],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if result.returncode:
+        raise ValueError("cannot read index objects")
+    return result.stdout
 
-self="${${0:A}#$repo_root/}"   # this script's repo-relative path (excluded from scans)
-findings=0
 
-report() {
-  local category="$1"; shift
-  local f
-  for f in "$@"; do
-    [[ -n "$f" ]] || continue
-    print -u2 -- "audit-public-safety: POSSIBLE LEAK [$category]: $f"
-    findings=$(( findings + 1 ))
-  done
-}
+credential = re.compile(rb"-----BEGIN ([A-Z]+ )?PRIVATE KEY-----|ghp_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{30,}|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{10,}|AIza[0-9A-Za-z_-]{35}")
+home = re.compile(rb"(?:/home/|/Users/)[A-Za-z0-9._-]+")
+# Detect opaque authentication values independently of vendor token formats.
+# Require a value, so empty header names and grep alternations in safety docs
+# are not credentials. Do not exempt variable references, docs or templates.
+auth_value = re.compile(
+    rb"\b(?:http[_-])?(?:proxy[_-])?authorization[\"']?\s*[:=]\s*[\"']?\s*[^\s\"'|`]"
+    rb"|\bbearer[ \t]+[^\s\"'|`]", re.I)
+words = re.compile(
+    rb"password|passwd[\"']?\s*[:=]|secret|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret"
+    rb"|\b(?:[a-z_][a-z0-9_-]*)?token[\"']?\s*(?::|=(?!=))", re.I)
 
-# List indexed files (staged / committed) matching an ERE under the given pathspecs.
-# `-l` prints file names only (never the matched text); exit 1 (no match) is fine.
-# Optional single-letter flags (e.g. -i for case-insensitive) may be passed before the pattern.
-scan() {
-  local -a flags=()
-  while [[ "${1-}" == -[a-zA-Z] ]]; do flags+=("$1"); shift; done
-  local pattern="$1"; shift
-  git grep --cached -lIE "${flags[@]}" -e "$pattern" -- "$@" 2>/dev/null || true
-}
 
-# ---- Tier A -----------------------------------------------------------------
+def dotenv_path(path):
+    # Only the exact template basename is exempt from the path rule. A template
+    # directory or a different suffix must not conceal a dotenv file. Content
+    # checks still apply, including high-signal credentials inside templates.
+    parts = path.split("/")
+    return any((part.casefold() == ".env" or part.casefold().startswith(".env."))
+               and not (index == len(parts) - 1 and part == ".env.example")
+               for index, part in enumerate(parts))
 
-# Concrete credential formats: private keys and provider tokens. Never legitimate.
-cred_pattern='-----BEGIN ([A-Z]+ )?PRIVATE KEY-----|ghp_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{30,}|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{10,}|AIza[0-9A-Za-z_-]{35}'
-typeset -a cred_hits
-cred_hits=(${(f)"$(scan "$cred_pattern" . ":!$self")"})
-cred_hits=(${cred_hits:#})
-(( ${#cred_hits} )) && report 'credential' "${cred_hits[@]}"
-
-# Absolute personal home paths (deanonymizing). /home/runner is the GitHub
-# Actions runner home — a known-safe placeholder; files whose only home-path
-# hits are /home/runner are not flagged.
-home_pattern='(/home/|/Users/)[A-Za-z0-9._-]+'
-typeset -a home_raw home_hits=()
-home_raw=(${(f)"$(scan "$home_pattern" . ":!$self")"})
-home_raw=(${home_raw:#})
-for f in "${home_raw[@]}"; do
-  git grep --cached -IhE -e "$home_pattern" -- "$f" 2>/dev/null \
-    | grep -qvE '/home/runner([^A-Za-z0-9._-]|$)' \
-    && home_hits+=("$f") || true
-done
-(( ${#home_hits} )) && report 'home-path' "${home_hits[@]}"
-
-# ---- Tier B -----------------------------------------------------------------
-
-typeset -a install_dirs
-install_dirs=(packages/*/install(N/))
-if (( ${#install_dirs} )); then
-  # Generic secret-ish words in shipped runtime code. `passwd` is matched only
-  # as a value assignment (`passwd=`, `passwd :`, quoted keys like `"passwd":`)
-  # so the Unix passwd database and user-resolution idioms (`getent passwd`,
-  # `/etc/passwd`, a `passwd_entry` variable) do not trip the scan, while a
-  # real `db_passwd=...` or `"db_passwd": "..."` still does.
-  word_pattern="password|passwd[\"']?[[:space:]]*[:=]|secret|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret"
-  typeset -a word_hits
-  word_hits=(${(f)"$(scan -i "$word_pattern" "${install_dirs[@]}")"})
-  word_hits=(${word_hits:#*.example})
-  word_hits=(${word_hits:#})
-  (( ${#word_hits} )) && report 'secret-word' "${word_hits[@]}"
-fi
-
-# ---- Result -----------------------------------------------------------------
-
-if (( findings > 0 )); then
-  print -u2 -- "audit-public-safety: FAILED with $findings finding(s)"
-  exit 1
-fi
-
-print -- 'audit-public-safety: ok'
+try:
+    findings = 0
+    for record in git("ls-files", "--stage", "-z").split(b"\0"):
+        if not record:
+            continue
+        metadata, raw_path = record.split(b"\t", 1)
+        mode, oid, stage = metadata.split()
+        if stage != b"0" or mode not in {b"100644", b"100755", b"120000"}:
+            raise ValueError("unmerged or unsupported index entry")
+        path = raw_path.decode("utf-8", "strict")
+        # Includes binary bytes and symlink target text; never follow the link.
+        payload = git("cat-file", "blob", oid.decode("ascii"))
+        categories = []
+        if dotenv_path(path):
+            categories.append("dotenv-path")
+        if credential.search(payload) or auth_value.search(payload):
+            categories.append("credential")
+        if any(match.group() != b"/home/runner" for match in home.finditer(payload)):
+            categories.append("home-path")
+        parts = path.split("/")
+        if (len(parts) >= 4 and parts[0] == "packages" and parts[2] in {"install", "system-install"}
+                and not path.endswith(".example") and words.search(payload)):
+            categories.append("secret-word")
+        for category in categories:
+            label = path if re.fullmatch(r"[A-Za-z0-9._/@+-]+", path) else json.dumps(path, ensure_ascii=True)
+            print(f"audit-public-safety: POSSIBLE LEAK [{category}]: {label}", file=sys.stderr)
+            findings += 1
+    if findings:
+        print(f"audit-public-safety: FAILED with {findings} finding(s)", file=sys.stderr)
+        sys.exit(1)
+    print("audit-public-safety: ok")
+except (OSError, UnicodeError, ValueError):
+    # Git errors may contain candidate data. Never include raw exception text.
+    print("audit-public-safety: ERROR: indexed content could not be validated", file=sys.stderr)
+    sys.exit(2)
+PY

@@ -3,6 +3,12 @@ name: check-repo
 on:
   push:
   pull_request:
+  workflow_dispatch:
+    inputs:
+      expected_head_sha:
+        description: Exact aggregate release PR head approved by the trusted dispatcher
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -11,14 +17,32 @@ jobs:
   check-repo:
     name: Repo consistency
     runs-on: ubuntu-24.04
+    env:
+      RUNNER_SYNC_EXPECTED_ROLE: source
+      RUNNER_SYNC_WRITE: "0"
     steps:
-      - uses: actions/checkout@v4
+      - name: Bind explicit dispatch to the exact release head
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          EXPECTED_HEAD_SHA: ${{ inputs.expected_head_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REF" == 'refs/heads/automation/runner-release-next' ]]
+          [[ "$EXPECTED_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$GITHUB_SHA" == "$EXPECTED_HEAD_SHA" ]]
+
+      - name: Check out the exact revision
+        # Pinned to SHA for supply-chain safety. Tag: v6
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          persist-credentials: false
 
       - name: Install zsh
         run: sudo apt-get update && sudo apt-get install -y zsh
 
       - name: Syntax check shell entrypoints
         run: |
+          set -euo pipefail
           zsh -n run.sh
           zsh -n scripts/check-repo
           zsh -n scripts/system-copy-select
@@ -26,13 +50,16 @@ jobs:
           zsh -n scripts/list-packages
           zsh -n scripts/ensure-rcd-loaders
           zsh -n scripts/audit-public-safety
-          zsh -n scripts/sync-runner
+          python3 -m py_compile scripts/sync-runner scripts/propose-runner-release scripts/dispatch-runner-release-checks
 
-      - name: Run check-repo
+      - name: Run repository checks
         run: ./scripts/check-repo
 
-      - name: Runner engine drift check
+      - name: Verify exported code and documentation locks
         run: ./scripts/sync-runner check
 
-      - name: Audit public safety (secret/path leak scan)
+      - name: Run release-train regression tests
+        run: python3 -m unittest discover -s tests -p 'test_runner_*.py' -v
+
+      - name: Audit public safety
         run: ./scripts/audit-public-safety

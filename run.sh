@@ -651,13 +651,12 @@ activation_bases_for_unit() {
 # starting, ...) to stdout whenever it can reach a user manager, regardless of
 # its own exit code; only empty output or the literal "offline" status mean no
 # manager is reachable at all (no D-Bus user session in an SSH/cron/sudo
-# context). This is the single no-user-bus signal that downgrades an otherwise
-# fatal user unit activation/deactivation failure to a clean skip; every other
-# non-zero systemctl status stays fatal.
+# context). Activation can then enable units offline and skip reload/start;
+# deactivation must abort before unlinking files that may still be in use.
 user_manager_reachable() {
-  local status
-  status="$(systemctl --user is-system-running 2>/dev/null)" || true
-  case "$status" in
+  local manager_state
+  manager_state="$(systemctl --user is-system-running 2>/dev/null)" || true
+  case "$manager_state" in
     ""|offline) return 1 ;;
   esac
   return 0
@@ -1792,9 +1791,10 @@ parse_install() {
   run_system_action install "$selector" "$verbose"
 
   if (( do_verify )); then
-    run_verify "$selector" install
+    run_verify "$selector" install "$verbose"
   fi
   if (( do_test )); then
+    verify_verbose="$verbose"
     run_test "$selector"
   fi
 }

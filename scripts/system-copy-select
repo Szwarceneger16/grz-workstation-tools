@@ -762,12 +762,14 @@ process_package_configs() {
     fi
 
     if [[ -z "$src" ]]; then
+      { ! sudo -n test -e "$dest" && ! sudo -n test -L "$dest"; } ||
+        die "config destination appeared while awaiting input: $dest"
       print -- "Creating $dest in place with sudoedit (contents never copied)..."
       dest_parent="${dest:h}"
       sudo -n mkdir -p -- "$dest_parent" ||
         die "cannot create config parent directory: $dest_parent"
       sudo -e -- "$dest" || die "sudoedit cancelled or failed for $dest"
-      sudo -n test -f "$dest" || die "config was not saved: $dest"
+      { sudo -n test -f "$dest" && ! sudo -n test -L "$dest"; } || die "config was not saved as a regular non-symlink file: $dest"
       sudo -n chmod "$mode" "$dest" || die "cannot set mode on $dest"
       sudo -n chown "$owner:$group" "$dest" || die "cannot set owner on $dest"
       continue
@@ -775,8 +777,13 @@ process_package_configs() {
 
     [[ -f "$src" && ! -L "$src" ]] || die "config source must be a regular non-symlink file: $src"
     [[ -s "$src" ]] || die "config source is empty: $src"
+    { ! sudo -n test -e "$dest" && ! sudo -n test -L "$dest"; } ||
+      die "config destination appeared while awaiting input: $dest"
     print -- "Installing config to $dest (root-only; contents are not read by this script)"
-    sudo -n install -D -m "$mode" -o "$owner" -g "$group" -- "$src" "$dest"
+    sudo -n install -D -T -m "$mode" -o "$owner" -g "$group" -- "$src" "$dest" ||
+      die "cannot install config at its exact destination: $dest"
+    { sudo -n test -f "$dest" && ! sudo -n test -L "$dest"; } ||
+      die "installed config is not a regular non-symlink file: $dest"
   done
 }
 
