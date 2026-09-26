@@ -78,6 +78,38 @@ class RunnerDocumentationTests(unittest.TestCase):
             self.assertIn("source-only", result.stderr)
             self.assertEqual(before, (root / "runner.lock").read_bytes())
 
+    def test_empty_consumer_selections_require_empty_locks(self):
+        for empty_sets in (("files",), ("docs",), ("files", "docs")):
+            for payload in ("", "# intentionally select nothing\n\n"):
+                with self.subTest(empty_sets=empty_sets, comments=bool(payload)), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    self.fixture(root, "consumer")
+                    for name in empty_sets:
+                        (root / f"scripts/runner-sync-{name}.txt").write_text(payload)
+                    self.assertNotEqual(self.execute(root, self.commands("consumer")[0]).returncode, 0)
+                    for name in empty_sets:
+                        (root / ("runner.lock" if name == "files" else "runner.docs.lock")).write_text("")
+                    result = self.execute(root, self.commands("consumer")[0])
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    # Missing or symlink selections are not equivalent to empty files.
+                    path = root / f"scripts/runner-sync-{empty_sets[0]}.txt"
+                    path.unlink()
+                    self.assertNotEqual(self.execute(root, self.commands("consumer")[0]).returncode, 0)
+                    path.symlink_to(root / "runner.docs.lock")
+                    self.assertNotEqual(self.execute(root, self.commands("consumer")[0]).returncode, 0)
+
+    def test_empty_canonical_manifests_remain_invalid_for_both_roles(self):
+        for role in ("source", "consumer"):
+            for name in ("files", "docs"):
+                with self.subTest(role=role, name=name), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    self.fixture(root, role)
+                    (root / f"scripts/runner-canonical-{name}.txt").write_text("# empty\n")
+                    for command in self.commands(role):
+                        result = self.execute(root, command)
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertIn("manifest is empty", result.stderr)
+
     def test_source_example_cannot_silently_validate_a_consumer(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

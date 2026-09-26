@@ -2,6 +2,7 @@
 import os
 from pathlib import Path
 import shutil
+import shlex
 import subprocess
 import tempfile
 import unittest
@@ -50,22 +51,84 @@ class RunnerPrefixTests(unittest.TestCase):
 
 @unittest.skipUnless(shutil.which("zsh") and shutil.which("git"), "requires zsh and git")
 class PublicSafetyPathTests(unittest.TestCase):
-    def audit(self, content, unstaged=None):
+    def audit(self, content, unstaged=None, *, relative="fixture.txt", remove_package=False,
+              symlink=False, scanner_marker=None, fail_reads=False):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "scripts").mkdir()
             shutil.copy2(ROOT / "scripts/audit-public-safety", root / "scripts/audit-public-safety")
-            sample = root / "fixture.txt"
-            sample.write_text(content)
+            if scanner_marker is not None:
+                with (root / "scripts/audit-public-safety").open("a") as stream:
+                    stream.write("\n# " + scanner_marker + "\n")
+            sample = root / relative
+            sample.parent.mkdir(parents=True, exist_ok=True)
+            if symlink:
+                sample.symlink_to(content)
+            else:
+                sample.write_bytes(content if isinstance(content, bytes) else content.encode())
             env = {"PATH": os.environ["PATH"], "HOME": directory,
                    "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1"}
             subprocess.run(["git", "init", "-q", root], check=True, env=env, capture_output=True)
-            subprocess.run(["git", "add", "--", "scripts/audit-public-safety", "fixture.txt"],
+            subprocess.run(["git", "add", "--", "scripts/audit-public-safety", relative],
                            cwd=root, check=True, env=env, capture_output=True)
             if unstaged is not None:
                 sample.write_text(unstaged)
+            if remove_package:
+                shutil.rmtree(root / "packages")  # Disposable fixture, not repository content.
+            if fail_reads:
+                binary = root / "bin"
+                binary.mkdir()
+                wrapper = binary / "git"
+                wrapper.write_text("#!/bin/sh\nfor arg do\n"
+                                   "  test \"$arg\" != cat-file || exit 128\ndone\n"
+                                   "exec " + shlex.quote(shutil.which("git")) + " \"$@\"\n")
+                wrapper.chmod(0o755)
+                env["PATH"] = str(binary) + os.pathsep + env["PATH"]
             return subprocess.run(["zsh", "scripts/audit-public-safety"], cwd=root, env=env,
                                   text=True, capture_output=True, timeout=10)
+
+    def test_both_install_layers_are_scanned_from_the_index(self):
+        for layer in ("install", "system-install"):
+            for removed in (False, True):
+                with self.subTest(layer=layer, removed=removed):
+                    path = f"packages/new/{layer}/etc/service/config"
+                    result = self.audit("password=synthetic-value\n", relative=path, remove_package=removed)
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    self.assertIn("[secret-word]: " + path, result.stderr)
+                    self.assertNotIn("synthetic-value", result.stdout + result.stderr)
+
+    def test_templates_in_both_layers_only_exempt_generic_words(self):
+        for layer in ("install", "system-install"):
+            path = f"packages/new/{layer}/config.example"
+            self.assertEqual(self.audit("password=placeholder\n", relative=path).returncode, 0)
+            token = "gh" + "p_" + "A" * 36
+            result = self.audit(token, relative=path)
+            self.assertEqual(result.returncode, 1)
+            self.assertNotIn(token, result.stdout + result.stderr)
+
+    def test_binary_runtime_blobs_do_not_bypass_either_layer(self):
+        for layer in ("install", "system-install"):
+            result = self.audit(b"\0password=synthetic-value\n", relative=f"packages/new/{layer}/config")
+            self.assertEqual(result.returncode, 1)
+            self.assertNotIn("synthetic-value", result.stderr)
+
+    def test_scanner_itself_and_symlink_text_are_not_exempt(self):
+        marker = "gh" + "p_" + "B" * 36
+        for args in ({"scanner_marker": marker}, {"symlink": True}):
+            result = self.audit(marker if args.get("symlink") else "clean", **args)
+            self.assertEqual(result.returncode, 1)
+            self.assertNotIn(marker, result.stdout + result.stderr)
+
+    def test_object_read_error_is_fatal_not_a_clean_scan(self):
+        result = self.audit("clean", fail_reads=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertNotIn("audit-public-safety: ok", result.stdout)
+
+    def test_filenames_cannot_inject_log_commands(self):
+        name = "fixture\n::warning::injected"
+        result = self.audit("gh" + "p_" + "C" * 36, relative=name)
+        self.assertEqual(result.returncode, 1)
+        self.assertNotIn("\n::warning::", result.stderr + result.stdout)
 
     def test_runner_placeholder_is_the_only_exempt_home(self):
         allowed = "/" + "home/runner"

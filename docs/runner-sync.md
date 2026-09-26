@@ -16,6 +16,13 @@ There is no wildcard export of `scripts/**` or `docs/**`. A consumer may select
 any subset, but it must reject a selected path that is absent from the
 corresponding public allow-list.
 
+Either consumer selection manifest may be empty or contain only comments; an
+empty selection has an empty corresponding lock. Canonical source manifests
+must remain non-empty. Selecting no files does not disable signature, provenance,
+path-safety or proposal-scope checks. Consumers choose their own runtime tests:
+a documentation-only bundle has no runner CLI to execute. To execute the CLI,
+select it and its supporting canonical manifests and runtime dependencies.
+
 `runner.lock` and `runner.docs.lock` contain records in the strict format
 `<100644|100755> <SHA-256>  <path>` for the exact code and documentation sets.
 Both content and Git executable mode are bound; a chmod-only change requires
@@ -40,6 +47,9 @@ The scanner checks repository content for possible confidential data; it does
 not validate installation behavior or prove that code is harmless. Its scope
 is the repository being checked, not just the shared runner files. Neither
 scan results nor `manifests/public-safety-allowlist.json` are synchronized.
+Generic secret indicators cover both `packages/*/install/**` and
+`packages/*/system-install/**`, including newly indexed package trees. Template
+files ending in `.example` remain subject to high-signal credential checks.
 `scripts/check-repo` remains shared: it validates the package declarations and
 installation contract rather than replacing confidentiality checks.
 
