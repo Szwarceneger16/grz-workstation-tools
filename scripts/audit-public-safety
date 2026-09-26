@@ -22,6 +22,12 @@ def git(*args):
 
 credential = re.compile(rb"-----BEGIN ([A-Z]+ )?PRIVATE KEY-----|ghp_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{30,}|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{10,}|AIza[0-9A-Za-z_-]{35}")
 home = re.compile(rb"(?:/home/|/Users/)[A-Za-z0-9._-]+")
+# Detect opaque authentication values independently of vendor token formats.
+# Require a value, so empty header names and grep alternations in safety docs
+# are not credentials. Do not exempt variable references, docs or templates.
+auth_value = re.compile(
+    rb"\b(?:http[_-])?(?:proxy[_-])?authorization[\"']?\s*[:=]\s*[\"']?\s*[^\s\"'|`]"
+    rb"|\bbearer[ \t]+[^\s\"'|`]", re.I)
 words = re.compile(rb"password|passwd[\"']?\s*[:=]|secret|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret", re.I)
 
 try:
@@ -37,7 +43,7 @@ try:
         # Includes binary bytes and symlink target text; never follow the link.
         payload = git("cat-file", "blob", oid.decode("ascii"))
         categories = []
-        if credential.search(payload):
+        if credential.search(payload) or auth_value.search(payload):
             categories.append("credential")
         if any(match.group() != b"/home/runner" for match in home.finditer(payload)):
             categories.append("home-path")

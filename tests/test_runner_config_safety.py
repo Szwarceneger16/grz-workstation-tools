@@ -124,6 +124,40 @@ class PublicSafetyPathTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertNotIn("audit-public-safety: ok", result.stdout)
 
+    def test_opaque_authentication_headers_are_detected_repository_wide(self):
+        header, scheme, value = "Author" + "ization", "Bea" + "rer", "opaque-fixture-value"
+        payloads = (
+            header + ": " + scheme + " " + value,
+            "proxy-" + header.lower() + ":\tBasic " + value,
+            header.upper() + " = " + value,
+            '{"' + header + '": "Basic ' + value + '"}',
+            "'" + header + "':\n  '" + scheme.lower() + "\t" + value + "'",
+            "HTTP_PROXY_AUTHORIZATION='" + value + "'",
+            scheme.swapcase() + "\t" + value,
+        )
+        for path in ("fixture.txt", "docs/example.md", "config.example",
+                     "packages/new/install/config", "packages/new/system-install/config"):
+            for index, payload in enumerate(payloads):
+                with self.subTest(path=path, variant=index):
+                    result = self.audit(payload, relative=path)
+                    self.assertEqual(result.returncode, 1)
+                    self.assertIn("[credential]: " + path, result.stderr)
+                    self.assertNotIn(value, result.stdout + result.stderr)
+
+    def test_authentication_headers_in_binary_symlink_and_scanner_blobs(self):
+        payload = "Author" + "ization: Basic opaque-fixture-value"
+        for content, kwargs in ((b"\0" + payload.encode(), {}), (payload, {"symlink": True}),
+                                ("clean", {"scanner_marker": payload})):
+            result = self.audit(content, **kwargs)
+            self.assertEqual(result.returncode, 1)
+            self.assertNotIn("opaque-fixture-value", result.stdout + result.stderr)
+
+    def test_empty_authentication_indicators_in_search_documentation_are_not_values(self):
+        header, scheme = "Author" + "ization", "Bea" + "rer"
+        for payload in (header + ":", header + ': ""', header + ":|" + scheme + " '"):
+            result = self.audit(payload)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_filenames_cannot_inject_log_commands(self):
         name = "fixture\n::warning::injected"
         result = self.audit("gh" + "p_" + "C" * 36, relative=name)
