@@ -92,7 +92,7 @@ def regular_path(relative: str) -> Path:
     return target
 
 
-def read_manifest(relative: str, *, require_files: bool = True) -> list[str]:
+def read_manifest(relative: str, *, require_files: bool = True, allow_empty: bool = False) -> list[str]:
     path = regular_path(relative)
     if not path.is_file() or path.is_symlink():
         fail(f"manifest must be a regular file: {relative}")
@@ -106,7 +106,7 @@ def read_manifest(relative: str, *, require_files: bool = True) -> list[str]:
             fail(f"{relative}:{number}: duplicate path: {entry}")
         seen.add(entry)
         entries.append(entry)
-    if not entries:
+    if not entries and not allow_empty:
         fail(f"manifest is empty: {relative}")
     if entries != sorted(entries):
         fail(f"manifest must be sorted bytewise: {relative}")
@@ -200,8 +200,8 @@ def manifests_for_role(role: str) -> tuple[list[str], list[str]]:
     if role == "source":
         return canonical_code, canonical_docs
 
-    selected_code = read_manifest(SELECTED_CODE)
-    selected_docs = read_manifest(SELECTED_DOCS)
+    selected_code = read_manifest(SELECTED_CODE, allow_empty=True)
+    selected_docs = read_manifest(SELECTED_DOCS, allow_empty=True)
     unknown_code = sorted(set(selected_code) - set(canonical_code))
     unknown_docs = sorted(set(selected_docs) - set(canonical_docs))
     if unknown_code:

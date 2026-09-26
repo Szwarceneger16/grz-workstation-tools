@@ -1,11 +1,28 @@
 """Exercise real install/verify parsing and hook propagation without live actions."""
 import tempfile
+import shutil
+import runpy
 from pathlib import Path
 import unittest
+from unittest import mock
 
 import test_runner_review_regressions as fixtures
 
 
+class DependencyGuardTests(unittest.TestCase):
+    def test_missing_zsh_skips_install_tests_without_starting_processes(self):
+        with mock.patch("shutil.which", return_value=None):
+            scope = runpy.run_path(__file__)
+        suite = unittest.defaultTestLoader.loadTestsFromTestCase(scope["PostInstallVerificationTests"])
+        result = unittest.TestResult()
+        with mock.patch("subprocess.run", side_effect=AssertionError("must skip before execution")):
+            suite.run(result)
+        self.assertTrue(result.wasSuccessful(), result.errors)
+        self.assertEqual(len(result.skipped), result.testsRun)
+        self.assertGreater(result.testsRun, 0)
+
+
+@unittest.skipUnless(shutil.which("zsh"), "zsh is needed for isolated install/verify tests")
 class PostInstallVerificationTests(unittest.TestCase):
     def invoke(self, args, *, fail_hook=False):
         helper = fixtures.ExistingReviewFixTests()
