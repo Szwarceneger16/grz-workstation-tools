@@ -164,6 +164,55 @@ class PublicSafetyPathTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertNotIn("\n::warning::", result.stderr + result.stdout)
 
+    def test_generic_token_assignments_are_detected_in_both_install_layers(self):
+        for layer in ("install", "system-install"):
+            for key in ("token", "TOKEN", "api_token", "apiToken", "auth-token", "session_token"):
+                for form in (key + "=opaque-fixture", '"' + key + '": "opaque-fixture"',
+                             "'" + key + "' :\n  'opaque-fixture'"):
+                    with self.subTest(layer=layer, key=key):
+                        result = self.audit(form, relative=f"packages/demo/{layer}/config")
+                        self.assertEqual(result.returncode, 1)
+                        self.assertIn("[secret-word]", result.stderr)
+                        self.assertNotIn("opaque-fixture", result.stdout + result.stderr)
+
+    def test_token_assignment_detection_handles_binary_and_symlink_blobs(self):
+        for layer in ("install", "system-install"):
+            path = f"packages/demo/{layer}/config"
+            for content, kwargs in ((b"\0token=opaque-fixture", {}),
+                                    ("api_token=opaque-fixture", {"symlink": True})):
+                result = self.audit(content, relative=path, **kwargs)
+                self.assertEqual(result.returncode, 1)
+                self.assertNotIn("opaque-fixture", result.stdout + result.stderr)
+
+    def test_token_comparisons_and_noncredential_names_are_not_assignments(self):
+        for content in ('[[ "$token" == fixture ]]', 'if token == "fixture": pass',
+                        'token_count=1\ntokenizer=fixture\n'):
+            result = self.audit(content, relative="packages/demo/install/script")
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_dotenv_paths_are_rejected_independently_of_content(self):
+        paths = (".env", "nested/.env", "packages/demo/install/.env", ".env.local",
+                 ".env.production.local", ".env.bak", ".ENV", ".env.example.bak",
+                 ".env.production.example", ".env/config", ".env.example/config")
+        for path in paths:
+            with self.subTest(path=path):
+                result = self.audit("SESSION_ID=opaque-fixture\n", relative=path)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("[dotenv-path]", result.stderr)
+                self.assertNotIn("opaque-fixture", result.stdout + result.stderr)
+        self.assertEqual(self.audit("", relative=".env").returncode, 1)
+        self.assertEqual(self.audit("unread-target", relative="nested/.env", symlink=True).returncode, 1)
+
+    def test_dotenv_template_name_does_not_exempt_credential_content(self):
+        for path in (".env.example", "nested/.env.example"):
+            self.assertEqual(self.audit("SESSION_ID=\n", relative=path).returncode, 0)
+            marker = "gh" + "p_" + "A" * 36
+            for content in (marker, "Author" + "ization: Basic opaque-fixture"):
+                result = self.audit(content, relative=path)
+                self.assertEqual(result.returncode, 1)
+                self.assertNotIn(marker, result.stdout + result.stderr)
+        self.assertEqual(self.audit("clean", relative=".environment").returncode, 0)
+
     def test_runner_placeholder_is_the_only_exempt_home(self):
         allowed = "/" + "home/runner"
         self.assertEqual(self.audit(allowed + "/work " + allowed + "/cache\n").returncode, 0)

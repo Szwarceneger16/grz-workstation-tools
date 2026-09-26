@@ -28,7 +28,19 @@ home = re.compile(rb"(?:/home/|/Users/)[A-Za-z0-9._-]+")
 auth_value = re.compile(
     rb"\b(?:http[_-])?(?:proxy[_-])?authorization[\"']?\s*[:=]\s*[\"']?\s*[^\s\"'|`]"
     rb"|\bbearer[ \t]+[^\s\"'|`]", re.I)
-words = re.compile(rb"password|passwd[\"']?\s*[:=]|secret|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret", re.I)
+words = re.compile(
+    rb"password|passwd[\"']?\s*[:=]|secret|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret"
+    rb"|\b(?:[a-z_][a-z0-9_-]*)?token[\"']?\s*(?::|=(?!=))", re.I)
+
+
+def dotenv_path(path):
+    # Only the exact template basename is exempt from the path rule. A template
+    # directory or a different suffix must not conceal a dotenv file. Content
+    # checks still apply, including high-signal credentials inside templates.
+    parts = path.split("/")
+    return any((part.casefold() == ".env" or part.casefold().startswith(".env."))
+               and not (index == len(parts) - 1 and part == ".env.example")
+               for index, part in enumerate(parts))
 
 try:
     findings = 0
@@ -43,6 +55,8 @@ try:
         # Includes binary bytes and symlink target text; never follow the link.
         payload = git("cat-file", "blob", oid.decode("ascii"))
         categories = []
+        if dotenv_path(path):
+            categories.append("dotenv-path")
         if credential.search(payload) or auth_value.search(payload):
             categories.append("credential")
         if any(match.group() != b"/home/runner" for match in home.finditer(payload)):
