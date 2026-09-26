@@ -6,7 +6,8 @@
 #
 # NOT listed here (deliberately per-repo, never synced): runner.conf,
 # .rcd-loader-repo-id, manifests/* CONTENT, packages/*, AGENTS.md, README.md,
-# .github/workflows/* (each repo adds its own CI steps), and lock files.
+# .github/workflows/* (each repo adds its own CI steps), lock files, and
+# scripts/audit-public-safety (repository-local confidentiality checks).
 #
 # One repo-root-relative path per line. Lines starting with # are comments.
 bootstrap/minimal-zshrc.example
@@ -14,7 +15,6 @@ bootstrap/profile.snippet.sh
 bootstrap/zshrc.snippet.zsh
 githooks/pre-push
 run.sh
-scripts/audit-public-safety
 scripts/check-repo
 scripts/ensure-rcd-loaders
 scripts/list-packages
