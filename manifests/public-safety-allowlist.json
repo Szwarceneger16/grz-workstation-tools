@@ -26,7 +26,19 @@
   {
     "path": "tests/test_runner_config_safety.py",
     "category": "secret-word",
-    "sha256": "084000c2d05f360f2594750b62734db6fd6f9e9d4d1826c7ed6d3ea963514f4a",
+    "sha256": "c8e3f157a14594767c73413bb8fb3b9334d034f5ab4c511c6df75574809b0990",
     "reason": "Reviewed synthetic scanner regression fixtures and generated vendor-format markers, not usable credentials."
+  },
+  {
+    "path": "docs/runner-release-process.md",
+    "category": "secret-word",
+    "sha256": "2d23bfb17cb81923a06faaa31a085f1f2f92a429253ec03311d53a8223e2482a",
+    "reason": "Reviewed symbolic signing-key selection in release documentation, not key material."
+  },
+  {
+    "path": "tests/test_runner_release.py",
+    "category": "secret-word",
+    "sha256": "37dbf40428fd643ca2ab854db10d0467a917ae5515ae5442a16e20f0dfda7bb8",
+    "reason": "Reviewed f-string references to disposable signing-key paths generated for cryptographic regression tests."
   }
 ]

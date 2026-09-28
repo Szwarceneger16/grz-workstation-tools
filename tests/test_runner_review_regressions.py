@@ -186,6 +186,64 @@ print -- 'unexpected continuation to unlink'
         self.assertIn("failed to enumerate user instances", result.stderr)
         self.assertEqual(result.stdout, "")
 
+    def test_deactivation_preflights_all_units_before_first_mutation(self):
+        script = self.function("run.sh", "verify_user_unit_owned_for_deactivation")
+        script += "\n" + self.function("run.sh", "deactivate_user_units") + """
+repo_root=/fixture
+target=/fixture-target
+fixture_bad_unit="$1"
+fixture_failure="$2"
+load_user_units_metadata() { user_units=(early.timer early.path early.socket late.service late@one.service late@.service late.target late.mount); }
+stow_target_is_home() { return 0; }
+user_manager_reachable() { return 0; }
+activation_bases_for_unit() { return 0; }
+resolve_unit_file_path() {
+  if [[ "$2" == late@one.service ]]; then print -- "$1/late@.service";
+  else print -- "$1/$2"; fi
+}
+find_shadowing_user_unit_path() {
+  if [[ "$1" == "$fixture_bad_unit" && "$fixture_failure" == shadow ]]; then
+    print -- /fixture-shadow; return 0
+  fi
+  return 1
+}
+verify_stow_link() {
+  print -- "checked $unit"
+  [[ "$unit" != "$fixture_bad_unit" || "$fixture_failure" == shadow ]]
+}
+unit_has_install_section() { return 0; }
+is_template_unit_name() { [[ "$1" == *@.* ]]; }
+stop_user_template_instances() { print -- "mutation instances $2"; }
+systemctl() { print -- "mutation $*"; }
+die() { print -u2 -- "$*"; exit 65; }
+deactivate_user_units fixture
+print -- 'unlink allowed'
+"""
+        units = ("early.timer", "early.path", "early.socket", "late.service",
+                 "late@one.service", "late@.service", "late.target", "late.mount")
+        for unit in units:
+            with self.subTest(unit=unit):
+                result = self.zsh(script, unit, "foreign-or-missing-link")
+                self.assertEqual(result.returncode, 65, result.stderr)
+                self.assertNotIn("mutation", result.stdout)
+                self.assertNotIn("unlink allowed", result.stdout)
+        result = self.zsh(script, "late@one.service", "shadow")
+        self.assertEqual(result.returncode, 65, result.stderr)
+        self.assertIn("shadows template", result.stderr)
+        self.assertNotIn("mutation", result.stdout)
+        result = self.zsh(script, "none", "none")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        preflight = result.stdout.split("mutation", 1)[0]
+        for unit in units:
+            self.assertIn("checked " + unit + "\n", preflight)
+        mutations = [line for line in result.stdout.splitlines() if line.startswith("mutation")]
+        self.assertEqual(mutations, [
+            "mutation --user disable --now early.timer", "mutation --user disable --now early.path",
+            "mutation --user disable --now early.socket", "mutation --user disable --now late.mount",
+            "mutation --user disable --now late.target", "mutation instances late@.service",
+            "mutation --user disable --now late@one.service", "mutation --user disable --now late.service",
+        ])
+
     def test_user_template_enumeration_empty_success_instances_and_stop_failure(self):
         script = self.function("run.sh", "stop_user_template_instances") + """
 fixture_listing="$1"
@@ -203,6 +261,45 @@ print -- 'unlink allowed'
             result = self.zsh(script, listing, stop_rc)
             self.assertEqual(result.returncode, expected, result.stderr)
             self.assertEqual("unlink allowed" in result.stdout, expected == 0)
+
+    def test_later_missing_stale_or_foreign_link_does_not_stop_earlier_trigger(self):
+        script = "\n".join(self.function("run.sh", name) for name in (
+            "verify_stow_link", "verify_user_unit_owned_for_deactivation", "deactivate_user_units"))
+        script += """
+repo_root="$1"
+target="$2"
+load_user_units_metadata() { user_units=(early.timer late.service); }
+stow_target_is_home() { return 0; }
+user_manager_reachable() { return 0; }
+activation_bases_for_unit() { return 0; }
+resolve_unit_file_path() { print -- "$1/$2"; }
+unit_has_install_section() { return 0; }
+systemctl() { print -- 'unexpected mutation'; exit 99; }
+die() { print -u2 -- "$*"; exit 65; }
+deactivate_user_units fixture
+print -- 'unexpected unlink'
+"""
+        for bad_link in ("missing", "dangling", "foreign", "regular-file"):
+            with self.subTest(bad_link=bad_link), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                units = root / "repo/packages/fixture/install/.config/systemd/user"
+                live = root / "target/.config/systemd/user"
+                units.mkdir(parents=True)
+                live.mkdir(parents=True)
+                for name in ("early.timer", "late.service"):
+                    (units / name).write_text("[Install]\nWantedBy=default.target\n")
+                (live / "early.timer").symlink_to(units / "early.timer")
+                if bad_link == "dangling":
+                    (live / "late.service").symlink_to(root / "absent")
+                elif bad_link == "foreign":
+                    (root / "foreign.service").write_text("[Unit]\n")
+                    (live / "late.service").symlink_to(root / "foreign.service")
+                elif bad_link == "regular-file":
+                    (live / "late.service").write_text("[Unit]\n")
+                result = self.zsh(script, str(root / "repo"), str(root / "target"))
+                self.assertEqual(result.returncode, 65, result.stderr)
+                self.assertIn("live unit does not belong", result.stderr)
+                self.assertEqual(result.stdout, "")
 
     def test_system_template_enumeration_failure_warns_without_using_partial_output(self):
         script = self.function("scripts/system-copy-select", "stop_system_template_instances") + """

@@ -224,8 +224,27 @@ class PublicSafetyPathTests(unittest.TestCase):
                         self.assertIn("[credential]: " + path, result.stderr)
                         self.assertNotIn("opaque-fixture", result.stdout + result.stderr)
 
+    def test_non_api_key_assignments_are_detected_repository_wide(self):
+        names = ("SSH_PRIVATE_KEY", "encryption_key", "privateKey", "SSH_KEY",
+                 "signing-key", "decryptionKey", "master_key", "AES_KEY",
+                 "RSA_KEY", "ECDSA_KEY", "ED25519_KEY", "symmetric_key",
+                 "asymmetric_key", "accessKey", "client_key", "auth_key",
+                 "session_key", "secretKey", "PRIVATE_KEY_B64", "encryptionKeyHex",
+                 "signing_key_pem")
+        for path in ("scripts/deploy", ".github/workflows/deploy.yml", "docs/example.md",
+                     "config.example", ".env.example", "packages/demo/install/config"):
+            for name in names:
+                for content in (name + "=opaque-fixture", '"' + name + '": "opaque-fixture"',
+                                "'" + name + "':\n  'opaque-fixture'", name + "=${VALUE}"):
+                    with self.subTest(path=path, name=name):
+                        result = self.audit(content, relative=path)
+                        self.assertEqual(result.returncode, 1, result.stderr)
+                        self.assertIn("[secret-word]: " + path, result.stderr)
+                        self.assertNotIn("opaque-fixture", result.stdout + result.stderr)
+
     def test_repository_wide_indicators_cover_binary_symlinks_and_scanner_itself(self):
-        for payload in ("PASS" + "WORD=opaque-fixture", "Coo" + "kie: session=opaque-fixture"):
+        for payload in ("PASS" + "WORD=opaque-fixture", "Coo" + "kie: session=opaque-fixture",
+                        "SSH_PRIVATE_" + "KEY=opaque-fixture"):
             for content, kwargs in ((b"\0" + payload.encode(), {}), (payload, {"symlink": True}),
                                     ("clean", {"scanner_marker": payload})):
                 result = self.audit(content, **kwargs)
@@ -233,7 +252,8 @@ class PublicSafetyPathTests(unittest.TestCase):
                 self.assertNotIn("opaque-fixture", result.stdout + result.stderr)
 
     def test_empty_indicators_prose_and_comparisons_are_not_stored_values(self):
-        for name in ("PASSWORD", "secret", "api_key", "token", "Cookie", "Set-Cookie"):
+        for name in ("PASSWORD", "secret", "api_key", "token", "Cookie", "Set-Cookie",
+                     "SSH_PRIVATE_KEY", "encryptionKey"):
             for payload in (name, name + "=", name + ': ""', name + " == other",
                             name + "_count=1", name + ":|", name + "=''"):
                 with self.subTest(name=name, payload=payload):
@@ -241,7 +261,8 @@ class PublicSafetyPathTests(unittest.TestCase):
                     self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_reviewed_policy_is_bound_to_path_category_and_complete_blob(self):
-        for name, category in (("PASSWORD", "secret-word"), ("Cookie", "credential")):
+        for name, category in (("PASSWORD", "secret-word"), ("Cookie", "credential"),
+                               ("SSH_PRIVATE_KEY", "secret-word")):
             payload = name + "=${FIXTURE_INPUT}"
             entry = {"path": "fixture.txt", "category": category,
                      "sha256": hashlib.sha256(payload.encode()).hexdigest(),

@@ -872,6 +872,12 @@ deactivate_user_units() {
   fi
 
   unit_dir="$repo_root/packages/$package/install/.config/systemd/user"
+  # Reject any bad live link or template shadow before stopping even the first
+  # trigger. Keep the per-unit checks below as a second check immediately before
+  # mutation; preflight is not a lock against concurrent filesystem changes.
+  for unit in "${user_units[@]}"; do
+    verify_user_unit_owned_for_deactivation "$unit_dir" "$unit"
+  done
   activation_bases=()
   for unit in "${user_units[@]}"; do
     for base in "${(@f)$(activation_bases_for_unit "$unit_dir" "$unit")}"; do
