@@ -364,9 +364,15 @@ Hooks must:
 `check-repo` rejects unknown hook names and detects supported hooks containing
 direct textual `sudo` invocations covered by its pattern. This check is
 defense in depth only: it is not a shell semantic analyzer and does not prove
-that indirect command construction cannot reach `sudo` or another privilege
-boundary. The no-privilege hook rule is therefore also a mandatory review-time
-constraint.
+that indirect command construction cannot reach `sudo`, `doas`, `pkexec`,
+or another privilege boundary.
+
+Hooks are not sandboxed from privilege escalation by the runner. They execute
+as ordinary code from the accepted repository revision and may run near later
+sudo-backed system work. Consequently, the no-privilege rule is a mandatory
+code-review/trust requirement, not an enforcement guarantee supplied by
+`check-repo` or `run.sh`. A hook that attempts to acquire privilege violates
+the package contract even if the static heuristic does not detect it.
 
 Unknown `*.hook.sh` files are rejected.
 
