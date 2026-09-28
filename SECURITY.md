@@ -457,6 +457,10 @@ following are true:
 - CODEOWNERS/review requirements cover the security-sensitive surface;
 - administrator-managed public verification material is configured;
 - required checks are configured and tested;
+- every repository-external Action used inside the signed-release security
+  boundary is pinned to a reviewed immutable full commit SHA;
+- no release-boundary workflow relies on a mutable Action tag, branch, or other
+  movable ref;
 - `RUNNER_AUTOMATION_ENABLED` is explicitly enabled.
 
 Until then, no automation branch or `runner-v*` tag should be treated as a
@@ -523,8 +527,15 @@ write tokens.
 
 Fork pull requests must never receive repository secrets or privileged tokens.
 
-Third-party Actions used inside the enabled signed-release security boundary
-should be pinned to immutable commit SHAs.
+Every repository-external Action used inside the signed-release security
+boundary, including GitHub-maintained Actions such as `actions/checkout`, must
+be pinned to a reviewed immutable full commit SHA. Mutable Action version tags,
+branches, and other movable refs are not permitted in that boundary.
+
+This pinning requirement is part of the release-train activation gate. If any
+release-boundary workflow uses a mutable external Action ref,
+`RUNNER_AUTOMATION_ENABLED` must remain disabled until the dependency is pinned
+and reviewed.
 
 ## Candidate code and write-capable jobs
 
