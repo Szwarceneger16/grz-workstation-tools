@@ -240,7 +240,21 @@ Validation must reject:
 - unsupported ownership or mode values;
 - undeclared files;
 - missing files;
-- symbolic-link package sources.
+- symbolic-link `system-install` roots and symbolic-link manifest source leaves
+  covered by the current checks.
+
+On current `main`, those checks do not prove that every earlier package-source
+path component is a real directory. In particular, a selected package directory
+such as `packages/<name>` can itself be a symlink and still lead the later
+`system-install` and leaf-file checks to data outside the reviewed Git tree.
+
+Therefore privileged execution must not use a selected package whose package
+directory, `system-install` path, manifest path, or any existing source-path
+ancestor traverses a symlink outside the accepted checkout. Until
+`check-repo` validates the complete package-source path without following
+symlinks, the operator/reviewer must establish this provenance condition
+separately. A clean accepted Git revision alone does not prove that bytes
+reached through a symlinked package ancestor are part of that revision.
 
 Manifest path spellings matching
 `manifests/protected-system-paths.txt` are rejected.
@@ -457,6 +471,10 @@ following are true:
 - CODEOWNERS/review requirements cover the security-sensitive surface;
 - administrator-managed public verification material is configured;
 - required checks are configured and tested;
+- no candidate-defined workflow that can influence runner release authorization
+  receives repository secrets, signing material, or privileged write tokens;
+- every secret-bearing or write-capable release-boundary workflow executes its
+  security-sensitive definition from trusted `main`;
 - every repository-external Action used inside the signed-release security
   boundary is pinned to a reviewed immutable full commit SHA;
 - no release-boundary workflow relies on a mutable Action tag, branch, or other
@@ -522,10 +540,26 @@ later job requires them.
 
 Checkout credentials must not persist where unnecessary.
 
-Candidate code must not receive signing keys, repository secrets, or privileged
-write tokens.
+Inside the signed-release security boundary, candidate-controlled code and
+candidate-defined workflow logic must not receive signing keys, repository
+secrets, or privileged write tokens.
 
 Fork pull requests must never receive repository secrets or privileged tokens.
+
+The baseline repository configuration present when this policy is introduced
+contains a legacy same-repository PR review workflow
+(`.github/workflows/claude-review.yml`) whose `pull_request` execution can use
+candidate-defined workflow content together with a review credential and
+write-capable GitHub token. That legacy workflow does **not** satisfy the
+stronger trusted-definition property above and must not be cited as evidence
+that candidate PR workflows are secret-safe.
+
+The signed runner release boundary must remain independent of that legacy
+workflow. Before `RUNNER_AUTOMATION_ENABLED` is enabled, any workflow that can
+influence runner release authorization while receiving secrets or write-capable
+tokens must load its security-sensitive definition from trusted `main`, or be
+removed/disabled/reworked so candidate-controlled workflow changes cannot obtain
+those credentials.
 
 Every repository-external Action used inside the signed-release security
 boundary, including GitHub-maintained Actions such as `actions/checkout`, must
