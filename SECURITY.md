@@ -99,6 +99,39 @@ Unless independently validated, treat all of the following as untrusted:
 A workflow success produced by an untrusted revision is not itself proof that
 the revision is trustworthy.
 
+## Privileged execution trust requirement
+
+Repository code that can cross a privilege boundary must itself come from a
+trusted revision before it is executed.
+
+Privileged commands, including system install, uninstall, activation, or any
+path that may invoke `sudo`, must **not** be run from:
+
+- a pull-request checkout;
+- an automation branch;
+- an unreviewed commit;
+- a checkout with unreviewed local modifications;
+- any other candidate revision whose identity has not been independently
+  accepted.
+
+Before privileged execution, the operator must establish the exact repository
+revision independently of the code about to run. Until the signed runner
+release train is active, the accepted source for privileged repository code is
+a clean checkout of an explicitly accepted commit from protected `main`.
+After the signed release train is active, an independently verified signed
+release may also be accepted where the installation workflow is designed to
+consume it.
+
+This is an operational trust precondition. Current `run.sh`,
+`scripts/system-copy-select`, and their in-repository preflight do not prove
+Git provenance of their own checkout. A candidate revision can replace both the
+checker and the privileged installer. Therefore `scripts/check-repo` must
+never be treated as authorization to run candidate-controlled code with
+privilege.
+
+Static review and CI may inspect untrusted revisions, but live privileged
+execution from those revisions is prohibited.
+
 # Core repository invariants
 
 ## Package structure
@@ -141,12 +174,25 @@ The checks are expected to reject, among other things:
 - undeclared or missing system files;
 - malformed manifest rows;
 - unsafe or non-canonical manifest paths;
-- protected system paths;
-- undeclared systemd units;
+- lexically protected system paths;
+- undeclared supported systemd units under
+  `system-install/etc/systemd/system/`;
 - real secret configs committed instead of examples;
 - unsupported package hooks;
 - privileged use from user-layer hooks;
 - unsafe special permission bits unless explicitly allowed.
+
+On current `main`, system-unit declaration checks do not enumerate every
+systemd load directory. A unit-like file placed under another load directory,
+such as `usr/lib/systemd/system/` or `usr/local/lib/systemd/system/`, can be
+declared as an ordinary system file without being required in
+`system-units.manifest`.
+
+Those alternate systemd load directories are therefore outside the supported
+package contract and must not be used for package-supplied unit files unless
+the repository validation is first extended to cover them. The policy must not
+treat the current `check-repo` implementation as proof that every loadable
+systemd unit is declared.
 
 ## System paths
 
@@ -163,8 +209,21 @@ Validation must reject:
 - missing files;
 - symbolic-link package sources.
 
-Paths matching `manifests/protected-system-paths.txt` must never be managed by
-a package manifest.
+Manifest path spellings matching
+`manifests/protected-system-paths.txt` are rejected.
+
+On current `main`, this is a lexical manifest-path boundary, not a fully
+resolved filesystem boundary. The installer does not prove that every existing
+ancestor of the destination is a real directory rather than a symlink. A
+stable ancestor symlink could therefore redirect a lexically unprotected
+destination into a protected tree.
+
+Accordingly, privileged destinations and all existing destination ancestors
+must not traverse symlinks into protected or otherwise unintended locations.
+Until the installer validates each existing ancestor without following
+symlinks, the operator must establish that condition before privileged
+execution. A lexical protected-path match alone must not be described as proof
+of the resolved destination.
 
 The protected-path policy exists to prevent packages from taking ownership of
 sensitive certificate, credential, or externally administered system state.
@@ -183,9 +242,10 @@ does **not** claim race-resistant protection against concurrent replacement of
 a privileged destination or one of its path components.
 
 Privileged package destinations must not be placed below directories writable
-by an untrusted local user. Concurrent mutation by another privileged process
-during an install/uninstall operation is also outside the current atomicity
-guarantee.
+by an untrusted local user, and existing destination ancestors must not be
+symlinks that redirect the operation outside the intended tree. Concurrent
+mutation by another privileged process during an install/uninstall operation is
+also outside the current atomicity guarantee.
 
 In particular, current uninstall logic validates managed files for type and
 content drift before a later removal pass. That protects against state already
@@ -228,7 +288,18 @@ A `system-config.manifest` destination must:
 The installer may copy a user-selected config source to the declared
 destination, but it must not print secret contents.
 
-The source must be a regular non-symlink file.
+The selected source is checked as a regular non-symlink file before the
+privileged copy. On current `main`, that validation is not bound to the later
+`sudo install` open of the source object. A source below a directory writable
+by an untrusted local user can therefore be replaced after validation and
+before the privileged copy.
+
+Config sources and all source ancestors must consequently be trusted against
+unprivileged replacement for the duration of the operation, and the same source
+must not be concurrently mutated. A hardened implementation must bind
+validation and copy to the same file identity (or provide an equivalent
+race-resistant primitive) before claiming that arbitrary user-supplied source
+paths are safely consumed across the privilege boundary.
 
 The installer checks for an existing destination before asking for a config
 source and normally leaves an already-present config untouched. On current
@@ -270,18 +341,35 @@ Unknown `*.hook.sh` files are rejected.
 
 # Confidentiality and public-repository scanning
 
-`scripts/audit-public-safety` is the repository-local confidentiality gate.
+`scripts/audit-public-safety` is a repository-local heuristic leak scanner. It
+is a CI defense-in-depth check, not a complete confidentiality gate.
 
 It must report only the affected path and finding category, never discovered
 secret values.
 
-The scanner is expected to detect high-signal credential material and
-machine-specific private data in tracked content, with additional checks for
-secret-like content in installable package trees.
+On current `main`, repository-wide scanning covers a limited set of
+high-signal credential formats and personal home paths. Generic secret-like
+words and assignments are checked only in installable user package trees.
+Therefore the current scanner does **not** prove that arbitrary tracked files
+outside those trees are free of secrets.
 
-Security exceptions, if supported by the scanner, must be narrow, explicit,
-reviewable, and content-bound. A changed blob must not remain authorized merely
-because its path was previously allow-listed.
+In particular, reviewers must not assume that current CI necessarily rejects
+all examples of:
+
+- `.env` or similarly named secret-bearing files;
+- generic password or secret assignments outside the scanned install trees;
+- cookies or session values;
+- arbitrary `Authorization` or bearer-token headers;
+- provider formats not represented by the scanner's high-signal patterns.
+
+The repository policy remains that real credentials and private data must not
+be committed. Manual review and other security tooling remain required where
+the current scanner has no coverage.
+
+If scanner exceptions or broader repository-wide categories are introduced,
+they must be narrow, explicit, reviewable, and preferably content-bound so a
+changed blob cannot remain authorized solely because its path was previously
+allow-listed.
 
 The confidentiality scanner is repository-local policy. It is not itself a
 cryptographic trust root for runner releases.
