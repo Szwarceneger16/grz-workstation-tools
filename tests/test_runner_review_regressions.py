@@ -171,6 +171,52 @@ print -- 'unexpected continuation to unlink'
         self.assertIn("refusing to remove files while units may be active", result.stderr)
         self.assertEqual(result.stdout, "")
 
+    def test_user_template_enumeration_failure_aborts_even_with_partial_output(self):
+        script = self.function("run.sh", "stop_user_template_instances") + """
+systemctl() {
+  if [[ "$2" == list-units ]]; then print -- 'fixture@one.service loaded active running'; return 1; fi
+  print -- 'unexpected stop'; exit 99
+}
+die() { print -u2 -- "$*"; exit 65; }
+stop_user_template_instances fixture fixture@.service
+print -- 'unexpected continuation to unlink'
+"""
+        result = self.zsh(script)
+        self.assertEqual(result.returncode, 65, result.stderr)
+        self.assertIn("failed to enumerate user instances", result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_user_template_enumeration_empty_success_instances_and_stop_failure(self):
+        script = self.function("run.sh", "stop_user_template_instances") + """
+fixture_listing="$1"
+stop_rc="$2"
+systemctl() {
+  if [[ "$2" == list-units ]]; then print -r -- "$fixture_listing"; return 0; fi
+  print -- "stopped $3"; return "$stop_rc"
+}
+die() { print -u2 -- "$*"; exit 65; }
+stop_user_template_instances fixture fixture@.service
+print -- 'unlink allowed'
+"""
+        for listing, stop_rc, expected in (("", "0", 0), ("fixture@one.service loaded active running\nfixture@two.service loaded active running", "0", 0),
+                                           ("fixture@one.service loaded active running", "1", 65)):
+            result = self.zsh(script, listing, stop_rc)
+            self.assertEqual(result.returncode, expected, result.stderr)
+            self.assertEqual("unlink allowed" in result.stdout, expected == 0)
+
+    def test_system_template_enumeration_failure_warns_without_using_partial_output(self):
+        script = self.function("scripts/system-copy-select", "stop_system_template_instances") + """
+sudo() {
+  if [[ "$3" == list-units ]]; then print -- 'fixture@one.service loaded active running'; return 1; fi
+  print -- 'unexpected stop'; exit 99
+}
+stop_system_template_instances fixture@.service
+"""
+        result = self.zsh(script)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("warning: failed to enumerate system instances", result.stderr)
+        self.assertEqual(result.stdout, "")
+
     def test_user_manager_probe_handles_online_offline_and_degraded_status(self):
         script = self.function("run.sh", "user_manager_reachable") + """
 systemctl() { print -r -- "$fixture_state"; return "$fixture_rc"; }

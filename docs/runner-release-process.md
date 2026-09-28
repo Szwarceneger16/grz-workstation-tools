@@ -49,8 +49,11 @@ For the first release, `previous-tag` is `none` and the default version is
 to a higher minor or major version; automation preserves a valid unused manual
 version. Unexpected branch changes outside `runner.release` stop the update.
 An invalid manual version is an error, never silently reset to a patch.
-No new shared snapshot means no branch merge or empty metadata commit, even
-when unrelated commits have advanced main. Git identity is set before merges.
+No new shared snapshot means no empty metadata commit. An existing open draft
+still merges unrelated advances of main so that its base remains up to date;
+its metadata hashes and manually selected version stay unchanged. If main is
+already included and the snapshot is unchanged, the retry creates no commit.
+Ready PRs are never changed automatically. Git identity is set before merges.
 
 Merging the release PR freezes the shared snapshot but does not create a tag.
 The signing-request workflow opens one owner issue, and the required `Runner

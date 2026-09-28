@@ -619,8 +619,12 @@ find_shadowing_system_unit_path() {
 stop_system_template_instances() {
   local unit="$1"
   local pattern="${unit/@./@*.}"
-  local line instance
-  for line in "${(@f)$(sudo -n systemctl list-units --all --no-legend --plain -- "$pattern" 2>/dev/null)}"; do
+  local line instance listing
+  listing="$(sudo -n systemctl list-units --all --no-legend --plain -- "$pattern")" || {
+    print -u2 -- "warning: failed to enumerate system instances of $unit (ignored)"
+    return 0
+  }
+  for line in "${(@f)listing}"; do
     instance="${${(z)line}[1]}"
     [[ -n "$instance" ]] || continue
     print -- "Stopping $instance (Accept=yes connection instance of $unit)"

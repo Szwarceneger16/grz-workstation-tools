@@ -8,6 +8,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import textwrap
 import unittest
 
 
@@ -625,6 +626,54 @@ class RunnerReleaseTests(unittest.TestCase):
         result = self.helper("update", "--head-ref", "main", "--body-out", str(self.root / "body.md"), check=False)
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(outside.read_text(), "untouched")
+
+    def test_workflow_skips_equal_snapshot_only_when_main_is_included(self):
+        branch = "automation/runner-release-next"
+        body = Path(self.temporary.name) / "body.md"
+        self.git("switch", "-c", branch)
+        self.helper("update", "--head-ref", "main", "--body-out", str(body))
+        metadata = self.root / "runner.release"
+        metadata.write_text(metadata.read_text().replace("version 0.1.0", "version 0.2.0"))
+        self.commit("manually choose minor release")
+        frozen_metadata = metadata.read_bytes()
+        self.git("update-ref", "refs/remotes/origin/" + branch, "HEAD")
+        self.git("update-ref", "refs/remotes/origin/main", "main")
+        workflow = (SOURCE_HELPER.parent.parent / ".github/workflows/runner-release-draft.yml").read_text()
+        start = workflow.index('            if [[ -n "$existing_pr" ]] && ! git merge-base')
+        end = workflow.index('            git switch --create', start)
+        gate = textwrap.dedent(workflow[start:end])
+        runtime = Path(self.temporary.name) / "runtime"
+        runtime.mkdir()
+        shutil.copy2(SOURCE_HELPER, runtime / "propose-runner-release")
+        output = runtime / "output"
+
+        def skipped():
+            output.write_text("")
+            result = subprocess.run(["bash", "-c", "set -euo pipefail\n" + gate], cwd=self.root,
+                env={"PATH": os.environ["PATH"], "RUNNER_TEMP": str(runtime),
+                     "GITHUB_OUTPUT": str(output), "existing_pr": "fixture",
+                     "RELEASE_BRANCH": branch, "RUNNER_RELEASE_REPO_ROOT": str(self.root)},
+                capture_output=True, text=True, timeout=15)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return "skip=true" in output.read_text()
+
+        self.assertTrue(skipped())
+        self.git("switch", "main")
+        self.write("README.md", "unrelated main advance\n")
+        self.commit("unrelated change")
+        self.git("update-ref", "refs/remotes/origin/main", "main")
+        self.assertFalse(skipped())
+        self.git("switch", branch)
+        self.git("merge", "--no-edit", "origin/main")
+        self.helper("update", "--head-ref", "origin/main", "--body-out", str(body))
+        self.assertEqual(metadata.read_bytes(), frozen_metadata)
+        self.assertEqual(self.git("diff", "--name-only").stdout, "")
+        self.assertEqual(self.git("diff", "--name-only", "origin/main...HEAD").stdout, "runner.release\n")
+        self.git("merge-base", "--is-ancestor", "origin/main", "HEAD")
+        self.git("update-ref", "refs/remotes/origin/" + branch, "HEAD")
+        before = self.git("rev-parse", "HEAD").stdout
+        self.assertTrue(skipped())
+        self.assertEqual(self.git("rev-parse", "HEAD").stdout, before)
 
     def test_three_shared_merges_aggregate_without_tags_or_empty_metadata_commits(self):
         self.git("switch", "-c", "automation/runner-release-next")

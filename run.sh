@@ -579,8 +579,10 @@ find_shadowing_system_unit_path() {
 stop_user_template_instances() {
   local package="$1" unit="$2"
   local pattern="${unit/@./@*.}"
-  local line instance
-  for line in "${(@f)$(systemctl --user list-units --all --no-legend --plain -- "$pattern" 2>/dev/null)}"; do
+  local line instance listing
+  listing="$(systemctl --user list-units --all --no-legend --plain -- "$pattern")" ||
+    die "failed to enumerate user instances of $unit for $package; refusing to remove files while units may be active"
+  for line in "${(@f)listing}"; do
     instance="${${(z)line}[1]}"
     [[ -n "$instance" ]] || continue
     print -- "Stopping $instance (Accept=yes connection instance of $unit)"
