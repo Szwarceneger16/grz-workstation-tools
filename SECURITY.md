@@ -180,11 +180,20 @@ contract, it must not be added as an arbitrary `sudo` hook.
 `scripts/check-repo` is the static policy gate for package declarations.
 
 Before a privileged system install or activation mutates the live system, the
-repository/manifest consistency checks must pass.
+repository/manifest consistency checks for the **selected package set** must
+pass.
 
-Repository inconsistency must fail before privileged mutation begins.
+Current `scripts/system-copy-select` invokes `scripts/check-repo` with only
+the packages selected for that operation. An inconsistent unselected package
+does not block installation or activation of a different selected package.
+Accordingly, this pre-mutation invariant is package-selection scoped, not a
+claim that every package in the repository has just been validated.
 
-The checks are expected to reject, among other things:
+Any inconsistency detected in the selected package set must fail before that
+privileged mutation begins. Full-repository consistency remains a separate CI,
+pre-push, or explicit whole-repository check.
+
+The selected-package checks are expected to reject, among other things:
 
 - undeclared or missing system files;
 - malformed manifest rows;
