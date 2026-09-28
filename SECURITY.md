@@ -347,14 +347,16 @@ is a CI defense-in-depth check, not a complete confidentiality gate.
 It must report only the affected path and finding category, never discovered
 secret values.
 
-On current `main`, repository-wide scanning covers a limited set of
-high-signal credential formats and personal home paths. Generic secret-like
-words and assignments are checked only in installable user package trees.
-Therefore the current scanner does **not** prove that arbitrary tracked files
-outside those trees are free of secrets.
+The baseline scanner present when this policy is introduced performs
+repository-wide checks for a limited set of high-signal credential formats and
+personal home paths, while its generic secret-like word/assignment checks are
+limited to installable user package trees. Later hardening may broaden that
+coverage, but scanner success must still not be treated as proof that arbitrary
+tracked files are free of secrets.
 
-In particular, reviewers must not assume that current CI necessarily rejects
-all examples of:
+Unless the checked scanner revision explicitly implements the corresponding
+repository-wide rule, reviewers must not assume CI necessarily rejects every
+example of:
 
 - `.env` or similarly named secret-bearing files;
 - generic password or secret assignments outside the scanned install trees;
