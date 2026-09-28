@@ -171,16 +171,31 @@ sensitive certificate, credential, or externally administered system state.
 
 ## Privileged destination safety
 
-A system installation must not overwrite a symbolic link at the exact target
-destination.
+The current installer performs explicit path/type checks before privileged copy
+and removal operations and refuses several unexpected destination states,
+including exact-destination symlinks and drift detected during uninstall
+validation.
 
-Privileged copies must install to the validated destination and must not use a
-destination symlink as a substitute for that destination.
+These shell-level checks are not an atomic local-filesystem transaction. On
+current `main`, a path may change after validation and before the subsequent
+`install`, `chmod`, `chown`, or `rm` operation. The repository therefore
+does **not** claim race-resistant protection against concurrent replacement of
+a privileged destination or one of its path components.
 
-Uninstall must fail rather than remove a target that is unexpectedly symlinked,
-non-regular, or has drifted where exact source/destination identity is required.
+Privileged package destinations must not be placed below directories writable
+by an untrusted local user. Concurrent mutation by another privileged process
+during an install/uninstall operation is also outside the current atomicity
+guarantee.
 
-Unexpected destination state is a reason to stop, not to broaden the operation.
+In particular, current uninstall logic validates managed files for type and
+content drift before a later removal pass. That protects against state already
+present at validation time, but it does not prove that the same object is still
+being removed. Code that claims concurrency-safe fail-closed deletion must
+revalidate identity immediately before unlinking or use an equivalent
+descriptor/identity-bound primitive.
+
+Unexpected destination state detected by the implemented checks is a reason to
+stop, not a reason to broaden the operation.
 
 ## Set-id and special permission bits
 
@@ -215,10 +230,22 @@ destination, but it must not print secret contents.
 
 The source must be a regular non-symlink file.
 
-Existing secret destinations must not be silently overwritten.
+The installer checks for an existing destination before asking for a config
+source and normally leaves an already-present config untouched. On current
+`main`, that check is not an atomic exclusive-create guarantee across the
+interactive prompt: another process can create or replace the destination
+between the check and the subsequent privileged copy. The policy therefore
+does not claim concurrency-safe non-overwrite semantics for that window.
 
-When `sudoedit` is used, the resulting destination must still be validated as
-a regular non-symlink file before final ownership and permissions are accepted.
+Likewise, the current `sudoedit` path does not provide a descriptor-bound,
+race-resistant guarantee that the object checked after editing is the same
+object later passed to ownership/permission operations. Hardened
+implementations must reject symlink substitution and bind post-edit validation
+to the object being modified before claiming that invariant.
+
+Accordingly, config destinations and their ancestors must not be writable by an
+untrusted local user, and operators should avoid concurrent privileged mutation
+of the same destination while an interactive config install is in progress.
 
 ## Package hooks
 
@@ -272,6 +299,13 @@ not prove who authorized those bytes.
 
 A downstream consumer must not treat successful branch pulling plus SHA-256
 relocking as a trusted release decision.
+
+The legacy pull path also does not constitute a strict Git-tree-type boundary:
+its historical manifest/file checks can follow a symlink while testing or
+copying a listed source path. It must therefore not be used to import an
+untrusted canonical tree or an attacker-controlled mutable ref. This limitation
+is one reason the release train replaces network-enabled pulling with
+independent release verification and reviewed consumer-side proposals.
 
 The signed release-train contract below is the required provenance model once
 that automation is enabled.
@@ -424,11 +458,16 @@ Wildcard export of arbitrary repository content is not permitted.
 A downstream consumer may select a subset of the public export, but it must not
 import a path outside the corresponding canonical allow-list.
 
-## Canonical path requirements
+## Signed release-train canonical path requirements
+
+The requirements in this section apply to the signed release-train contract
+once its activation gate is satisfied. They are not a claim that the historical
+`scripts/sync-runner pull` implementation enforces the same Git-tree-type and
+symlink properties.
 
 Canonical entries must be normalized repository-relative regular-file paths.
 
-Validation must reject:
+Release-train validation must reject:
 
 - absolute paths;
 - `..` traversal;
