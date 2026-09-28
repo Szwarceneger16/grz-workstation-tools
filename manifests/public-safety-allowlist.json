@@ -1,0 +1,32 @@
+[
+  {
+    "path": ".github/workflows/runner-release-draft.yml",
+    "category": "secret-word",
+    "sha256": "89dc1507890c8382c43eb38f145fb22505aa3502296762c2a61cb9aaeadd7cb1",
+    "reason": "Reviewed Actions context references; no embedded credential values."
+  },
+  {
+    "path": ".github/workflows/runner-release-signing-request.yml",
+    "category": "secret-word",
+    "sha256": "9064d23080038f13ef0653a2f117fb3979ae4f41f5a33d8dbb20989965812484",
+    "reason": "Reviewed Actions context references; no embedded credential values."
+  },
+  {
+    "path": ".github/workflows/runner-release-state.yml",
+    "category": "secret-word",
+    "sha256": "dc6c7582fdb2b244f2bc62d02514a465f11f35dfe2b82a7c873edfd665677854",
+    "reason": "Reviewed Actions context references; no embedded credential values."
+  },
+  {
+    "path": ".github/workflows/runner-release-verify.yml",
+    "category": "secret-word",
+    "sha256": "04ad786384f3d619074e7d938f3f68bb34bf385dae0bf5f5a855257f5626a303",
+    "reason": "Reviewed Actions context references; no embedded credential values."
+  },
+  {
+    "path": "tests/test_runner_config_safety.py",
+    "category": "secret-word",
+    "sha256": "084000c2d05f360f2594750b62734db6fd6f9e9d4d1826c7ed6d3ea963514f4a",
+    "reason": "Reviewed synthetic scanner regression fixtures and generated vendor-format markers, not usable credentials."
+  }
+]

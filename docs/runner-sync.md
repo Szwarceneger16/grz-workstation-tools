@@ -47,9 +47,13 @@ The scanner checks repository content for possible confidential data; it does
 not validate installation behavior or prove that code is harmless. Its scope
 is the repository being checked, not just the shared runner files. Neither
 scan results nor `manifests/public-safety-allowlist.json` are synchronized.
-Generic secret indicators cover both `packages/*/install/**` and
-`packages/*/system-install/**`, including newly indexed package trees. Template
-files ending in `.example` remain subject to high-signal credential checks.
+Generic password, key, secret and token assignments, authentication headers and
+cookie values are checked repository-wide, including tooling, workflows, docs,
+binary blobs, symlink text and `.example` templates. Names in prose and empty
+values are not stored credentials. Variable references are not blanket-exempt;
+where supported, reviewed false positives require exact blob-bound exceptions.
+Additional broad word indicators cover both `packages/*/install/**` and
+`packages/*/system-install/**` outside templates, including newly indexed trees.
 `scripts/check-repo` remains shared: it validates the package declarations and
 installation contract rather than replacing confidentiality checks.
 

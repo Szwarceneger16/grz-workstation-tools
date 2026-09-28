@@ -9,6 +9,7 @@
 /bootstrap/** @Szwarceneger16
 /githooks/** @Szwarceneger16
 /scripts/** @Szwarceneger16
+/manifests/public-safety-allowlist.json @Szwarceneger16
 /tests/** @Szwarceneger16
 /docs/runner-sync.md @Szwarceneger16
 /docs/runner-release-process.md @Szwarceneger16

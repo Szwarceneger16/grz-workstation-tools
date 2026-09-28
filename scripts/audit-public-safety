@@ -6,6 +6,7 @@ set -euo pipefail
 # or grep's text/binary classification. Report paths/categories, never values.
 # No external policy, consumer information or blanket scanner-file exclusion.
 exec python3 -I - "${0:A:h:h}" <<'PY'
+import hashlib
 import json
 import re
 import subprocess
@@ -20,6 +21,42 @@ def git(*args):
     return result.stdout
 
 
+def exceptions():
+    # This public, repository-local policy is reviewed with the scanner. Read
+    # indexed policy bytes as well as indexed content; unstaged policy edits
+    # cannot authorize a finding. This is not an external trust boundary.
+    records = git("ls-files", "--stage", "-z", "--", "manifests/public-safety-allowlist.json")
+    if not records:
+        return set()
+    rows = records.rstrip(b"\0").split(b"\0")
+    if len(rows) != 1:
+        raise ValueError("invalid indexed safety policy")
+    metadata, path = rows[0].split(b"\t", 1)
+    mode, oid, stage = metadata.split()
+    if (mode not in {b"100644", b"100755"} or stage != b"0"
+            or path != b"manifests/public-safety-allowlist.json"):
+        raise ValueError("invalid indexed safety policy")
+    entries = json.loads(git("cat-file", "blob", oid.decode("ascii")))
+    if not isinstance(entries, list):
+        raise ValueError("invalid safety exception policy")
+    result = set()
+    for entry in entries:
+        if (not isinstance(entry, dict) or set(entry) != {"path", "category", "sha256", "reason"}
+                or not all(isinstance(value, str) for value in entry.values())
+                or entry["category"] not in {"credential", "home-path", "secret-word", "dotenv-path"}
+                or not re.fullmatch(r"[0-9a-f]{64}", entry["sha256"])
+                or not entry["reason"].strip()
+                or not entry["path"] or entry["path"].startswith("/")
+                or any(part in {"", ".", ".."} for part in entry["path"].split("/"))):
+            raise ValueError("invalid safety exception entry")
+        key = (entry["path"], entry["category"], entry["sha256"])
+        if key in result:
+            raise ValueError("duplicate safety exception")
+        result.add(key)
+    return result
+
+
+
 credential = re.compile(rb"-----BEGIN ([A-Z]+ )?PRIVATE KEY-----|ghp_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{30,}|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{10,}|AIza[0-9A-Za-z_-]{35}")
 home = re.compile(rb"(?:/home/|/Users/)[A-Za-z0-9._-]+")
 # Detect opaque authentication values independently of vendor token formats.
@@ -28,6 +65,15 @@ home = re.compile(rb"(?:/home/|/Users/)[A-Za-z0-9._-]+")
 auth_value = re.compile(
     rb"\b(?:http[_-])?(?:proxy[_-])?authorization[\"']?\s*[:=]\s*[\"']?\s*[^\s\"'|`]"
     rb"|\bbearer[ \t]+[^\s\"'|`]", re.I)
+# Assignment/header indicators apply to every blob, including templates and
+# repository tooling. A name in prose is not a stored value. Do not exempt
+# variable references or placeholders: those require exact reviewed policy.
+generic_value = re.compile(
+    rb"\b[a-z0-9_-]*(?:password|passwd|secret|api[_-]?key|token)[\"']?"
+    rb"\s*(?::|=(?!=))\s*[\"']?\s*[^\s\"'|`=]", re.I)
+cookie_value = re.compile(
+    rb"\b(?:[a-z0-9_-]*cookie|set-cookie)[\"']?"
+    rb"\s*(?::|=(?!=))\s*[\"']?\s*[^\s\"'|`=]", re.I)
 words = re.compile(
     rb"password|passwd[\"']?\s*[:=]|secret|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret"
     rb"|\b(?:[a-z_][a-z0-9_-]*)?token[\"']?\s*(?::|=(?!=))", re.I)
@@ -43,6 +89,8 @@ def dotenv_path(path):
                for index, part in enumerate(parts))
 
 try:
+    allowed = exceptions()
+    reviewed = 0
     findings = 0
     for record in git("ls-files", "--stage", "-z").split(b"\0"):
         if not record:
@@ -57,22 +105,26 @@ try:
         categories = []
         if dotenv_path(path):
             categories.append("dotenv-path")
-        if credential.search(payload) or auth_value.search(payload):
+        if credential.search(payload) or auth_value.search(payload) or cookie_value.search(payload):
             categories.append("credential")
         if any(match.group() != b"/home/runner" for match in home.finditer(payload)):
             categories.append("home-path")
         parts = path.split("/")
-        if (len(parts) >= 4 and parts[0] == "packages" and parts[2] in {"install", "system-install"}
-                and not path.endswith(".example") and words.search(payload)):
+        if (generic_value.search(payload)
+                or (len(parts) >= 4 and parts[0] == "packages" and parts[2] in {"install", "system-install"}
+                    and not path.endswith(".example") and words.search(payload))):
             categories.append("secret-word")
         for category in categories:
+            if (path, category, hashlib.sha256(payload).hexdigest()) in allowed:
+                reviewed += 1
+                continue
             label = path if re.fullmatch(r"[A-Za-z0-9._/@+-]+", path) else json.dumps(path, ensure_ascii=True)
             print(f"audit-public-safety: POSSIBLE LEAK [{category}]: {label}", file=sys.stderr)
             findings += 1
     if findings:
         print(f"audit-public-safety: FAILED with {findings} finding(s)", file=sys.stderr)
         sys.exit(1)
-    print("audit-public-safety: ok")
+    print(f"audit-public-safety: ok ({reviewed} exact reviewed exceptions)")
 except (OSError, UnicodeError, ValueError):
     # Git errors may contain candidate data. Never include raw exception text.
     print("audit-public-safety: ERROR: indexed content could not be validated", file=sys.stderr)

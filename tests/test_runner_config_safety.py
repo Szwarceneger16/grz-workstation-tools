@@ -1,4 +1,6 @@
 """Regression tests for shared config validation and staged public-safety scans."""
+import hashlib
+import json
 import os
 from pathlib import Path
 import shutil
@@ -52,7 +54,7 @@ class RunnerPrefixTests(unittest.TestCase):
 @unittest.skipUnless(shutil.which("zsh") and shutil.which("git"), "requires zsh and git")
 class PublicSafetyPathTests(unittest.TestCase):
     def audit(self, content, unstaged=None, *, relative="fixture.txt", remove_package=False,
-              symlink=False, scanner_marker=None, fail_reads=False):
+              symlink=False, scanner_marker=None, fail_reads=False, policy=None):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "scripts").mkdir()
@@ -71,6 +73,12 @@ class PublicSafetyPathTests(unittest.TestCase):
             subprocess.run(["git", "init", "-q", root], check=True, env=env, capture_output=True)
             subprocess.run(["git", "add", "--", "scripts/audit-public-safety", relative],
                            cwd=root, check=True, env=env, capture_output=True)
+            if policy is not None:
+                policy_path = root / "manifests/public-safety-allowlist.json"
+                policy_path.parent.mkdir()
+                policy_path.write_text(policy)
+                subprocess.run(["git", "add", "--", "manifests/public-safety-allowlist.json"],
+                               cwd=root, check=True, env=env, capture_output=True)
             if unstaged is not None:
                 sample.write_text(unstaged)
             if remove_package:
@@ -97,10 +105,10 @@ class PublicSafetyPathTests(unittest.TestCase):
                     self.assertIn("[secret-word]: " + path, result.stderr)
                     self.assertNotIn("synthetic-value", result.stdout + result.stderr)
 
-    def test_templates_in_both_layers_only_exempt_generic_words(self):
+    def test_templates_do_not_exempt_generic_assignments(self):
         for layer in ("install", "system-install"):
             path = f"packages/new/{layer}/config.example"
-            self.assertEqual(self.audit("password=placeholder\n", relative=path).returncode, 0)
+            self.assertEqual(self.audit("pass" + "word=placeholder\n", relative=path).returncode, 1)
             token = "gh" + "p_" + "A" * 36
             result = self.audit(token, relative=path)
             self.assertEqual(result.returncode, 1)
@@ -189,6 +197,79 @@ class PublicSafetyPathTests(unittest.TestCase):
                         'token_count=1\ntokenizer=fixture\n'):
             result = self.audit(content, relative="packages/demo/install/script")
             self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_generic_assignments_are_detected_repository_wide(self):
+        for path in ("scripts/deploy", ".github/workflows/deploy.yml", "docs/example.md",
+                     "config.json", "config.example", "nested/.env.example"):
+            for name in ("PASSWORD", "dbPassword", "DB_PASSWD", "clientSecret", "api-key",
+                         "session_token", "TOKEN"):
+                for assignment in (name + "=opaque-fixture", '"' + name + '": "opaque-fixture"',
+                                   "'" + name + "':\n  'opaque-fixture'", name + "=${VALUE}"):
+                    with self.subTest(path=path, name=name, assignment=assignment):
+                        result = self.audit(assignment, relative=path)
+                        self.assertEqual(result.returncode, 1, result.stderr)
+                        self.assertIn("[secret-word]: " + path, result.stderr)
+                        self.assertNotIn("opaque-fixture", result.stdout + result.stderr)
+
+    def test_cookies_are_detected_repository_wide(self):
+        for path in ("scripts/deploy", ".github/workflows/deploy.yml", "docs/example.md",
+                     "config.example", ".env.example", "packages/new/install/config"):
+            for name in ("Cookie", "cookie", "Set-Cookie", "HTTP_COOKIE"):
+                for assignment in (name + ": session=opaque-fixture", name + "=opaque-fixture",
+                                   '"' + name + '": "opaque-fixture"',
+                                   "'" + name + "':\n  'opaque-fixture'", name + "=${VALUE}"):
+                    with self.subTest(path=path, name=name):
+                        result = self.audit(assignment, relative=path)
+                        self.assertEqual(result.returncode, 1, result.stderr)
+                        self.assertIn("[credential]: " + path, result.stderr)
+                        self.assertNotIn("opaque-fixture", result.stdout + result.stderr)
+
+    def test_repository_wide_indicators_cover_binary_symlinks_and_scanner_itself(self):
+        for payload in ("PASS" + "WORD=opaque-fixture", "Coo" + "kie: session=opaque-fixture"):
+            for content, kwargs in ((b"\0" + payload.encode(), {}), (payload, {"symlink": True}),
+                                    ("clean", {"scanner_marker": payload})):
+                result = self.audit(content, **kwargs)
+                self.assertEqual(result.returncode, 1)
+                self.assertNotIn("opaque-fixture", result.stdout + result.stderr)
+
+    def test_empty_indicators_prose_and_comparisons_are_not_stored_values(self):
+        for name in ("PASSWORD", "secret", "api_key", "token", "Cookie", "Set-Cookie"):
+            for payload in (name, name + "=", name + ': ""', name + " == other",
+                            name + "_count=1", name + ":|", name + "=''"):
+                with self.subTest(name=name, payload=payload):
+                    result = self.audit(payload)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_reviewed_policy_is_bound_to_path_category_and_complete_blob(self):
+        for name, category in (("PASSWORD", "secret-word"), ("Cookie", "credential")):
+            payload = name + "=${FIXTURE_INPUT}"
+            entry = {"path": "fixture.txt", "category": category,
+                     "sha256": hashlib.sha256(payload.encode()).hexdigest(),
+                     "reason": "Reviewed synthetic variable reference"}
+            policy = json.dumps([entry])
+            self.assertEqual(self.audit(payload, policy=policy).returncode, 0)
+            self.assertEqual(self.audit(payload + "extra", policy=policy).returncode, 1)
+            self.assertEqual(self.audit(payload, relative="other.txt", policy=policy).returncode, 1)
+            other = dict(entry, category="home-path")
+            self.assertEqual(self.audit(payload, policy=json.dumps([other])).returncode, 1)
+            marker = "gh" + "p_" + "X" * 36
+            content = payload + "\n" + marker
+            allowed = dict(entry, sha256=hashlib.sha256(content.encode()).hexdigest(), category="secret-word")
+            self.assertEqual(self.audit(content, policy=json.dumps([allowed])).returncode, 1)
+
+    def test_malformed_or_duplicate_policy_fails_closed(self):
+        entry = {"path": "fixture.txt", "category": "secret-word",
+                 "sha256": "a" * 64, "reason": "Synthetic fixture"}
+        invalid = ("not-json", "{}", "[null]", json.dumps([entry, entry]),
+                   json.dumps([dict(entry, path="../fixture")]),
+                   json.dumps([dict(entry, category="all")]),
+                   json.dumps([dict(entry, sha256="not-a-digest")]),
+                   json.dumps([dict(entry, reason="")]))
+        for policy in invalid:
+            with self.subTest(policy=policy):
+                result = self.audit("clean", policy=policy)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertNotIn("not-json", result.stdout + result.stderr)
 
     def test_dotenv_paths_are_rejected_independently_of_content(self):
         paths = (".env", "nested/.env", "packages/demo/install/.env", ".env.local",
