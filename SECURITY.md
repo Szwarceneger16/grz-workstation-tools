@@ -122,6 +122,21 @@ After the signed release train is active, an independently verified signed
 release may also be accepted where the installation workflow is designed to
 consume it.
 
+Revision identity alone is not sufficient if another local user can mutate the
+checkout after it is accepted. The checkout directory, repository files used by
+the privileged operation, and all relevant source-path ancestors must not be
+writable by an untrusted local user for the duration of privileged execution.
+The accepted checkout must not be concurrently modified while
+`system-install/` content is being validated and copied.
+
+On current `main`, ordinary `system-install.manifest` sources are validated
+by pathname and later reopened by the privileged `install` command. Those two
+steps are not bound to one file identity. Therefore the repository does **not**
+claim race-resistant source integrity if the checkout/source tree can change
+between validation and the privileged open. A hardened implementation must bind
+validation and copy to the same object, or provide an equivalent
+identity-preserving primitive, before relaxing this operational restriction.
+
 This is an operational trust precondition. Current `run.sh`,
 `scripts/system-copy-select`, and their in-repository preflight do not prove
 Git provenance of their own checkout. A candidate revision can replace both the
@@ -179,8 +194,17 @@ The checks are expected to reject, among other things:
   `system-install/etc/systemd/system/`;
 - real secret configs committed instead of examples;
 - unsupported package hooks;
-- privileged use from user-layer hooks;
+- direct textual `sudo` invocations in user-layer hooks that match the
+  current static check;
 - unsafe special permission bits unless explicitly allowed.
+
+The current hook scan is a heuristic, not a proof that a hook cannot obtain or
+invoke privilege indirectly. For example, constructing `sudo` through a
+variable or another executable path can evade a simple textual match. The
+repository policy still forbids user-layer hooks from invoking `sudo` or
+otherwise escalating privilege, but indirect privilege use must be prevented by
+review and by keeping privileged behavior in the declarative system layer; it
+must not be described as something `check-repo` can prove exhaustively.
 
 On current `main`, system-unit declaration checks do not enumerate every
 systemd load directory. A unit-like file placed under another load directory,
@@ -333,9 +357,16 @@ Hooks must:
 - reside in the package root;
 - be executable;
 - run as the normal user;
-- not invoke `sudo`;
+- not invoke `sudo` or otherwise obtain privileged execution;
 - be idempotent;
 - return non-zero on failure.
+
+`check-repo` rejects unknown hook names and detects supported hooks containing
+direct textual `sudo` invocations covered by its pattern. This check is
+defense in depth only: it is not a shell semantic analyzer and does not prove
+that indirect command construction cannot reach `sudo` or another privilege
+boundary. The no-privilege hook rule is therefore also a mandatory review-time
+constraint.
 
 Unknown `*.hook.sh` files are rejected.
 
