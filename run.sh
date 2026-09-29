@@ -1980,6 +1980,7 @@ reap_orphaned_package() {
   # a root would silently strand that package's dangling links on --orphaned.
   scan_roots=(
     ".local/bin"
+    ".local/lib"
     ".local/my-custom-bin"
     ".local/share/applications"
     ".config/systemd/user"
@@ -1992,7 +1993,9 @@ reap_orphaned_package() {
   found_links=()
   for root in "${scan_roots[@]}"; do
     scan_root="$target/$root"
-    [[ -d "$scan_root" ]] || continue
+    # Stow can fold the entire root into a symlink, including a dangling one.
+    # find's default -P inspects that link itself without following its target.
+    [[ -d "$scan_root" || -L "$scan_root" ]] || continue
     while IFS= read -r link; do
       [[ -n "$link" ]] || continue
       # Resolve only this symlink's own (possibly relative, possibly
