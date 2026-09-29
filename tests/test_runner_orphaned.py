@@ -10,6 +10,54 @@ import test_runner_review_regressions as fixtures
 
 @unittest.skipUnless(shutil.which("zsh"), "requires zsh")
 class OrphanedLibraryTests(unittest.TestCase):
+    def cleanup(self, repo, target, dry_run):
+        helper = fixtures.ExistingReviewFixTests()
+        script = "set -eu\n" + helper.function("run.sh", "reap_orphaned_package") + '''
+repo_root="$1"
+target="$2"
+validate_package_name() { [[ "$1" == fixture ]]; }
+package_has_user_install() { return 1; }
+stow_target_is_home() { return 1; }
+die() { print -u2 -- "$*"; exit 65; }
+systemctl() { print -u2 -- "unexpected systemctl"; exit 99; }
+reap_orphaned_package fixture "$3" 1
+'''
+        return helper.zsh(script, str(repo), str(target), str(int(dry_run)))
+
+    def test_dangling_folded_roots_are_inspected_without_following_foreign_roots(self):
+        roots = (".local/lib", ".local/bin", ".local/my-custom-bin", ".local/share/applications",
+                 ".config/systemd/user", ".config/autostart", ".config/zsh/rc.d",
+                 ".config/profile.d", ".zsh_scripts")
+        for relative in roots:
+            for dry_run in (True, False):
+                for marker in ("stow/fixture", "packages/fixture/install", "other/stow/fixture"):
+                    with self.subTest(root=relative, dry_run=dry_run, marker=marker), tempfile.TemporaryDirectory() as directory:
+                        root = Path(directory)
+                        repo, target = root / "repo", root / "target"
+                        repo.mkdir()
+                        link = target / relative
+                        link.parent.mkdir(parents=True)
+                        destination = repo / marker / relative
+                        link.symlink_to(os.path.relpath(destination, link.parent))
+                        self.assertFalse(link.exists())
+                        result = self.cleanup(repo, target, dry_run)
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertEqual(link.is_symlink(), dry_run or marker.startswith("other/"))
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, target, outside = root / "repo", root / "target", root / "outside"
+            repo.mkdir()
+            outside.mkdir()
+            (target / ".local").mkdir(parents=True)
+            (target / ".local/lib").symlink_to(outside)
+            protected = outside / "owned.py"
+            protected.symlink_to(repo / "stow/fixture/.local/lib/owned.py")
+            result = self.cleanup(repo, target, False)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(protected.is_symlink())
+            self.assertTrue((target / ".local/lib").is_symlink())
+
     def test_library_links_are_found_without_removing_unowned_content(self):
         helper = fixtures.ExistingReviewFixTests()
         for dry_run in (True, False):

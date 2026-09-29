@@ -57,7 +57,7 @@ def exceptions():
 
 
 
-credential = re.compile(rb"-----BEGIN ([A-Z]+ )?PRIVATE KEY-----|ghp_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{30,}|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{10,}|AIza[0-9A-Za-z_-]{35}")
+credential = re.compile(rb"-----BEGIN (?:PGP PRIVATE KEY BLOCK|(?:[A-Z]+ )?PRIVATE KEY)-----|ghp_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{30,}|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{10,}|AIza[0-9A-Za-z_-]{35}")
 home = re.compile(rb"(?:/home/|/Users/)[A-Za-z0-9._-]+")
 # Detect opaque authentication values independently of vendor token formats.
 # Require a value, so empty header names and grep alternations in safety docs
