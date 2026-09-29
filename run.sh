@@ -1931,6 +1931,7 @@ reap_orphaned_package() {
   # a root would silently strand that package's dangling links on --orphaned.
   scan_roots=(
     ".local/bin"
+    ".local/lib"
     ".local/my-custom-bin"
     ".local/share/applications"
     ".config/systemd/user"
