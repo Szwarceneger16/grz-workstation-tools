@@ -37,8 +37,8 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install zsh
-        run: sudo apt-get update && sudo apt-get install -y zsh
+      - name: Install shell and isolated rebind test dependencies
+        run: sudo apt-get update && sudo apt-get install -y zsh stow
 
       - name: Syntax check shell entrypoints
         run: |

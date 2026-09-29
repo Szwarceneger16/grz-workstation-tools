@@ -1,0 +1,3 @@
+# Explicit old-path -> new-path mappings within this package's user install tree.
+.config/zsh/rc.d/20-grz-zsh-tools-pre.zsh .config/zsh/rc.d/20-grz-workstation-tools-pre.zsh
+.config/zsh/rc.d/60-grz-zsh-tools-post.zsh .config/zsh/rc.d/60-grz-workstation-tools-post.zsh

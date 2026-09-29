@@ -30,6 +30,8 @@ trap finish_run_sudo_session EXIT
 
 usage() {
   print -u2 -- "usage: $script_name install [--verbose] [--verify] [--test] all|all-user|all-system|<package>"
+  print -u2 -- "       $script_name install --rebind [--from-repo <checkout>] [--dry-run] [-y] <package>"
+  print -u2 -- "       $script_name verify --rebind [--from-repo <checkout>] <package>|all-user"
   print -u2 -- "       $script_name uninstall [--verbose] all|all-user|all-system|<package>"
   print -u2 -- "       $script_name uninstall --orphaned [--dry-run] [-y] <package>"
   print -u2 -- "       $script_name activate all|all-user|all-system|<package>"
@@ -1567,14 +1569,32 @@ run_test() {
   print -- "test: OK — $ok check(s) passed"
 }
 
+run_user_rebind() {
+  local helper="$repo_root/scripts/rebind-user-package"
+  [[ -f "$helper" && ! -L "$helper" ]] || \
+    die "optional rebind helper is not installed: scripts/rebind-user-package"
+  python3 -I "$helper" --target "$target" "$@"
+}
+
 parse_verify() {
   local selector=""
   local verbose=0
+  local rebind=0
+  local -a legacy_roots
+  legacy_roots=()
 
   while (( $# > 0 )); do
     case "$1" in
       --verbose|-v)
         verbose=1
+        ;;
+      --rebind)
+        rebind=1
+        ;;
+      --from-repo|--legacy-root)
+        (( $# >= 2 )) || die "$1 requires an absolute checkout path"
+        legacy_roots+=(--from-repo "$2")
+        shift
         ;;
       --)
         shift
@@ -1595,6 +1615,11 @@ parse_verify() {
 
   [[ -n "$selector" ]] || { usage; exit 64; }
 
+  if (( rebind )); then
+    run_user_rebind --inspect --package "$selector" "${legacy_roots[@]}"
+    return
+  fi
+  (( ${#legacy_roots[@]} == 0 )) || die "--from-repo/--legacy-root requires --rebind"
   run_verify "$selector" standalone "$verbose"
 }
 
@@ -1748,6 +1773,9 @@ parse_install() {
   local verbose=0
   local do_verify=0
   local do_test=0
+  local rebind=0
+  local -a rebind_args
+  rebind_args=()
 
   while (( $# > 0 )); do
     case "$1" in
@@ -1759,6 +1787,20 @@ parse_install() {
         ;;
       --test)
         do_test=1
+        ;;
+      --rebind)
+        rebind=1
+        ;;
+      --dry-run|-n)
+        rebind_args+=(--dry-run)
+        ;;
+      --yes|-y)
+        rebind_args+=(--yes)
+        ;;
+      --from-repo|--legacy-root)
+        (( $# >= 2 )) || die "$1 requires an absolute checkout path"
+        rebind_args+=(--from-repo "$2")
+        shift
         ;;
       --)
         shift
@@ -1790,6 +1832,13 @@ parse_install() {
     usage
     exit 64
   }
+
+  if (( rebind )); then
+    (( ! do_verify && ! do_test )) || die "--rebind verifies links itself; --verify/--test hooks are not allowed"
+    run_user_rebind --package "$selector" "${rebind_args[@]}"
+    return
+  fi
+  (( ${#rebind_args[@]} == 0 )) || die "--from-repo/--legacy-root, --dry-run and --yes require --rebind"
 
   select_install_hook_packages "$selector"
   run_check_repo_for_packages "${hook_packages[@]}"

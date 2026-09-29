@@ -38,7 +38,12 @@ class RunnerSyncTests(unittest.TestCase):
         self.assertEqual(locked.returncode, 0, locked.stderr)
         checked = self.run_sync("check")
         self.assertEqual(checked.returncode, 0, checked.stderr)
-        self.assertIn("docs (2)", checked.stdout)
+        for label, manifest in (("code", "runner-canonical-files.txt"),
+                                ("docs", "runner-canonical-docs.txt")):
+            entries = [line for line in (self.root / "scripts" / manifest).read_text().splitlines()
+                       if line.strip() and not line.lstrip().startswith("#")]
+            self.assertTrue(entries)
+            self.assertIn(f"{label} ({len(entries)})", checked.stdout)
 
     def test_lock_requires_explicit_write_guard(self) -> None:
         result = self.run_sync("lock")

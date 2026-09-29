@@ -1,0 +1,451 @@
+#!/usr/bin/env python3
+"""Explicit single-package user-link handoff. Never run hooks or system actions."""
+import argparse
+from contextlib import contextmanager
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import tempfile
+import uuid
+
+
+class Refusal(Exception):
+    pass
+
+
+def require(ok, message):
+    if not ok:
+        raise Refusal(message)
+
+
+@contextmanager
+def mutation_record():
+    # A handled signal must not land between a filesystem mutation and recording
+    # its rollback ownership. Linux-only helper, like the workstation runner.
+    previous = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT, signal.SIGTERM})
+    try:
+        yield
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+
+
+def identity(path):
+    try:
+        s = path.lstat()
+        return (s.st_dev, s.st_ino, s.st_mode, s.st_mtime_ns, s.st_size)
+    except FileNotFoundError:
+        return None
+
+
+def directories(path, missing=False):
+    for part in reversed((path, *path.parents)):
+        entry = identity(part)
+        if entry is None and missing:
+            continue
+        require(entry is not None and stat.S_ISDIR(entry[2]), f"unsafe directory: {part}")
+
+
+def absolute(value):
+    p = Path(value)
+    require(p.is_absolute() and str(p) == value and '..' not in p.parts and
+            not any(ord(c) < 32 or ord(c) == 127 for c in value), 'expected normalized absolute path')
+    require(p != Path('/'), 'filesystem root is not a valid installation target')
+    directories(p)
+    return p
+
+
+def relative(value):
+    require(re.fullmatch(r'[A-Za-z0-9_./+@-]+', value) and
+            all(p not in {'', '.', '..', '.git'} for p in value.split('/')),
+            'unsafe package-relative path')
+    require(value.startswith(('.config/', '.local/', '.zsh_scripts/')),
+            'rebind only supports explicit user configuration paths')
+    return value
+
+
+IGNORES = (
+    r'(^|/)\.git(/|$)', r'(^|/)\.gitignore$', r'(^|/)\.gitattributes$',
+    r'(^|/)\.gitmodules$', r'(^|/)\.gitkeep$', r'(^|/)\.stow-local-ignore$',
+    r'(^|/)(__pycache__|\.pytest_cache|\.mypy_cache|\.ruff_cache|\.tox|\.nox)(/|$)',
+    r'\.py[co]$', r'(^|/)\.DS_Store$', r'(^|/)Thumbs\.db$', r'~$', r'\.sw[opx]$',
+    r'(^|/)\.#', r'(^|/)#.*#$',
+)
+
+
+def unreadable_tree(error):
+    raise Refusal('cannot enumerate the complete package tree') from error
+
+
+def inventory(repo, package):
+    source = repo / 'packages' / package / 'install'
+    directories(source)
+    directories(repo / 'stow')
+    link = repo / 'stow' / package
+    require(link.is_symlink() and os.readlink(link) == f'../packages/{package}/install',
+            f'invalid Stow package mapping: {link}')
+    records = {}
+    for directory, dirs, files in os.walk(source, followlinks=False, onerror=unreadable_tree):
+        for name in sorted(dirs + files):
+            p = Path(directory) / name
+            rel = p.relative_to(source).as_posix()
+            require(name != '.stow-local-ignore', 'custom Stow ignore policy is not supported by rebind')
+            if any(re.search(pattern, rel) for pattern in IGNORES):
+                if name in dirs:
+                    dirs.remove(name)
+                continue
+            s = p.lstat()
+            require(stat.S_ISREG(s.st_mode) or stat.S_ISDIR(s.st_mode), f'non-regular package entry: {rel}')
+            relative(rel + '/entry' if p.is_dir() else rel)
+            if stat.S_ISREG(s.st_mode):
+                records[rel] = (identity(p), hashlib.sha256(p.read_bytes()).hexdigest())
+    require(records, f'empty user package: {package}')
+    return records
+
+
+def mappings(repo, package, files):
+    path = repo / 'packages' / package / 'rebind-paths.manifest'
+    if identity(path) is None:
+        return {}, None
+    require(stat.S_ISREG(path.lstat().st_mode), 'rename manifest must be a regular file')
+    raw = path.read_bytes()
+    result = {}
+    for line in raw.decode('utf-8').splitlines():
+        if not line.strip() or line.startswith('#'):
+            continue
+        fields = line.split()
+        require(len(fields) == 2, 'rename record must contain old-path new-path')
+        old, new = map(relative, fields)
+        require(old not in result and new not in result.values() and old not in files and new in files,
+                'duplicate, ambiguous or unsupported rename')
+        result[old] = new
+    return result, (identity(path), hashlib.sha256(raw).hexdigest())
+
+
+def plan(repo, target, package, roots):
+    directories(target)
+    files = inventory(repo, package)
+    renames, mapping_state = mappings(repo, package, files)
+    legacy = {str(root): inventory(root, package) for root in roots}
+    rows = []
+    conflicts = []
+    renamed_changes = {}
+    for rel in sorted(set(files) | set(renames) | {p for values in legacy.values() for p in values}):
+        dest = target / rel
+        directories(dest.parent, missing=True)
+        before = identity(dest)
+        raw = os.readlink(dest) if before and stat.S_ISLNK(before[2]) else None
+        resolved = None
+        source = repo / 'packages' / package / 'install' / rel
+        allowed = {source, repo / 'stow' / package / rel}
+        for root in roots:
+            if rel in legacy[str(root)]:
+                allowed.update({root / 'stow' / package / rel,
+                                root / 'packages' / package / 'install' / rel})
+        # Never resolve an arbitrary foreign chain outside the known package layouts.
+        if raw is not None and Path(os.path.abspath(dest.parent / raw)) in allowed:
+            try:
+                resolved = dest.resolve(strict=True)
+            except (OSError, RuntimeError):
+                pass
+        owner = None
+        if resolved is not None:
+            for root in roots:
+                if rel in legacy[str(root)] and resolved == root / 'packages' / package / 'install' / rel:
+                    # Only a direct reference to the approved layout, not an arbitrary symlink chain.
+                    lexical = Path(os.path.abspath(dest.parent / raw))
+                    allowed = {root / 'stow' / package / rel, root / 'packages' / package / 'install' / rel}
+                    if lexical in allowed:
+                        owner = str(root)
+        if before is None:
+            state = 'missing' if rel in files else 'absent-legacy'
+        elif resolved == source and rel in files and raw is not None and Path(os.path.abspath(dest.parent / raw)) in {
+                source, repo / 'stow' / package / rel}:
+            state = 'current'
+        elif owner:
+            state = 'rebind' if rel in files else 'rename' if rel in renames else 'legacy-residue'
+        else:
+            state = 'conflict'
+        if state in {'legacy-residue', 'conflict'}:
+            conflicts.append(rel)
+        new = os.path.relpath(repo / 'stow' / package / rel, dest.parent) if rel in files else None
+        changed = owner is not None and rel in files and (
+            files[rel][1] != legacy[owner][rel][1] or
+            stat.S_IMODE(files[rel][0][2]) != stat.S_IMODE(legacy[owner][rel][0][2]))
+        if state == 'rename':
+            replacement = files[renames[rel]]
+            original = legacy[owner][rel]
+            renamed_changes[renames[rel]] = (replacement[1] != original[1] or
+                stat.S_IMODE(replacement[0][2]) != stat.S_IMODE(original[0][2]))
+        rows.append({'path': rel, 'state': state, 'before': before, 'old': raw, 'new': new,
+                     'content_changed': changed, 'from_repo': owner})
+    for row in rows:
+        row['content_changed'] |= renamed_changes.get(row['path'], False)
+    return {'files': files, 'legacy': legacy, 'mapping': mapping_state, 'renames': renames,
+            'rows': rows, 'conflicts': conflicts}
+
+
+def discover_sources(repo, target, package):
+    """Inspect exact declared destinations, never enumerate target directories."""
+    directories(target)
+    files = inventory(repo, package)
+    renames, _ = mappings(repo, package, files)
+    roots = set()
+    for rel in sorted(set(files) | set(renames)):
+        dest = target / rel
+        directories(dest.parent, missing=True)
+        entry = identity(dest)
+        if entry is None or not stat.S_ISLNK(entry[2]):
+            continue
+        raw = os.readlink(dest)
+        require(not any(ord(c) < 32 or ord(c) == 127 for c in raw),
+                f'unsafe link text at declared destination: {rel}')
+        lexical = Path(os.path.abspath(dest.parent / raw))
+        for suffix in (Path('stow') / package / rel,
+                       Path('packages') / package / 'install' / rel):
+            count = len(suffix.parts)
+            if lexical.parts[-count:] != suffix.parts:
+                continue
+            root = absolute(str(lexical.parents[count - 1]))
+            if root != repo:
+                roots.add(root)
+    return sorted(roots)
+
+
+def prepare(repo, target, package, explicit_roots):
+    require(re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]*', package) and
+            package not in {'all', 'all-user', 'all-system'}, 'select exactly one explicit package')
+    roots = explicit_roots if explicit_roots else discover_sources(repo, target, package)
+    require(len(set(roots)) == len(roots) and repo not in roots,
+            'supply distinct source checkouts, never the current checkout')
+    require(not any(target == r or target.is_relative_to(r) for r in [repo, *roots]),
+            'installation target cannot be inside a source checkout')
+    snapshot = plan(repo, target, package, roots)
+    print(f'Repository: {repo}\nTarget: {target}\nPackage: {package}')
+    for root in roots:
+        label = 'Selected source repository' if explicit_roots else 'Detected source candidate'
+        print(f'{label}: {root}')
+    if not roots:
+        print('No other source checkout detected at declared package paths.')
+    for row in snapshot['rows']:
+        detail = ' (payload differs)' if row['content_changed'] else ''
+        print(f'{row["state"]}: {row["path"]}{detail}')
+        if row['from_repo'] is not None:
+            print(f'  from repository: {row["from_repo"]}')
+    require(not snapshot['conflicts'], 'conflicts or unmapped legacy residue; no changes made')
+    stow_projection(repo, package, snapshot['files'])
+    return roots, snapshot
+
+
+def inspect_all(repo, target, explicit_roots):
+    directories(repo / 'stow')
+    packages = sorted(path.name for path in (repo / 'stow').iterdir())
+    require(packages, 'no user packages to inspect')
+    failures = pending = 0
+    for package in packages:
+        try:
+            _, snapshot = prepare(repo, target, package, explicit_roots)
+            pending += any(row['state'] not in {'current', 'absent-legacy'} for row in snapshot['rows'])
+        except (Refusal, OSError, ValueError, subprocess.SubprocessError) as error:
+            failures += 1
+            print(f'Inspection failed for {package!r}: {error}', file=sys.stderr)
+    print(f'Inspection summary: {len(packages)} packages, {pending} need migration, {failures} failed; no changes made.')
+    return 1 if failures else 3 if pending else 0
+
+
+def stow_projection(repo, package, files):
+    stow = shutil.which('stow')
+    require(stow, 'GNU Stow is required')
+    with tempfile.TemporaryDirectory(prefix='runner-rebind-projection-', dir='/tmp') as directory:
+        scratch = Path(directory)
+        projected = scratch / 'target'
+        projected.mkdir()
+        args = [stow, '--dir', str(repo / 'stow'), '--target', str(projected), '--no-folding']
+        args += ['--ignore=' + pattern for pattern in IGNORES]
+        args += ['--stow', '--', package]
+        result = subprocess.run(args, cwd=scratch, env={'PATH': os.environ['PATH'], 'HOME': str(scratch)},
+                                capture_output=True, timeout=60)
+        require(result.returncode == 0, 'Stow projection failed; no live paths were changed')
+        actual = set()
+        for directory, dirs, names in os.walk(projected, followlinks=False, onerror=unreadable_tree):
+            require(all(not (Path(directory) / name).is_symlink() for name in dirs), 'Stow folded a directory')
+            for name in names:
+                p = Path(directory) / name
+                rel = p.relative_to(projected).as_posix()
+                require(p.is_symlink() and rel in files and
+                        p.resolve(strict=True) == repo / 'packages' / package / 'install' / rel,
+                        'Stow projection differs from the reviewed inventory')
+                actual.add(rel)
+        require(actual == set(files), 'Stow omitted package files')
+
+
+def parent_fd(target, rel, created):
+    fd = os.open(target, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    current = target
+    try:
+        for name in Path(rel).parts[:-1]:
+            current = current / name
+            try:
+                child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            except FileNotFoundError:
+                with mutation_record():
+                    os.mkdir(name, dir_fd=fd)
+                    created.append((current, identity(current)))
+                child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def verify_result(target, repo, package, snapshot):
+    for row in snapshot['rows']:
+        p = target / row['path']
+        directories(p.parent, missing=row['new'] is None)
+        if row['new'] is not None:
+            require(p.is_symlink() and p.resolve(strict=True) == repo / 'packages' / package / 'install' / row['path'],
+                    f'final link verification failed: {row["path"]}')
+        else:
+            require(identity(p) is None, f'legacy path remains: {row["path"]}')
+
+
+def apply(repo, target, package, roots, snapshot):
+    # Advisory lock shared across all packages; no lock file is created in HOME.
+    fd = os.open(target, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    changed, created = [], []
+    journal = None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        require(plan(repo, target, package, roots) == snapshot, 'candidate changed after approval; rerun')
+        journal = Path(tempfile.mkdtemp(prefix='runner-rebind-journal-', dir='/tmp')) / 'before.json'
+        journal.write_text(json.dumps({'repository': str(repo), 'target': str(target), 'package': package,
+                                       'snapshot': snapshot}, indent=2) + '\n')
+        journal.chmod(0o600)
+        print(f'Rollback journal: {journal}', flush=True)
+        for row in snapshot['rows']:
+            if row['state'] in {'current', 'absent-legacy'}:
+                continue
+            p = target / row['path']
+            parent = parent_fd(target, row['path'], created)
+            try:
+                require(identity(p) == row['before'], f'live path changed: {row["path"]}')
+                if row['old'] is not None:
+                    require(os.readlink(p) == row['old'], 'live link changed')
+                temporary = '.runner-rebind-' + uuid.uuid4().hex
+                if row['new'] is not None:
+                    try:
+                        os.symlink(row['new'], temporary, dir_fd=parent)
+                        own = os.stat(temporary, dir_fd=parent, follow_symlinks=False)
+                        expected = (own.st_dev, own.st_ino)
+                        # Recheck immediately before publication, not only before staging.
+                        require(identity(p) == row['before'], 'live path changed before publication')
+                        with mutation_record():
+                            if row['before'] is None:
+                                # link() gives no-clobber publication for previously absent paths.
+                                os.link(temporary, p.name, src_dir_fd=parent, dst_dir_fd=parent, follow_symlinks=False)
+                            else:
+                                os.replace(temporary, p.name, src_dir_fd=parent, dst_dir_fd=parent)
+                            changed.append((row, expected))
+                    finally:
+                        try:
+                            os.unlink(temporary, dir_fd=parent)
+                        except FileNotFoundError:
+                            pass
+                else:
+                    with mutation_record():
+                        os.unlink(p.name, dir_fd=parent)
+                        changed.append((row, None))
+            finally:
+                os.close(parent)
+        fresh = plan(repo, target, package, roots)
+        require(all(fresh[key] == snapshot[key] for key in ('files', 'legacy', 'mapping', 'renames')),
+                'source changed during transaction')
+        verify_result(target, repo, package, snapshot)
+        print('Rebind verified; hooks, system files and service state were not touched.')
+    except BaseException:
+        for row, own in reversed(changed):
+            p = target / row['path']
+            try:
+                directories(p.parent)
+                now = identity(p)
+                require((now is None if own is None else now is not None and now[:2] == own and
+                         p.is_symlink() and os.readlink(p) == row['new']), 'rollback ownership lost')
+                if row['old'] is None:
+                    p.unlink()
+                else:
+                    temp = p.with_name('.runner-rebind-rollback-' + uuid.uuid4().hex)
+                    temp.symlink_to(row['old'])
+                    try:
+                        if own is None:
+                            os.link(temp, p, follow_symlinks=False)
+                        else:
+                            os.replace(temp, p)
+                    finally:
+                        if temp.is_symlink():
+                            temp.unlink()
+            except (OSError, Refusal):
+                print(f'Manual rollback required: {p}; journal: {journal}', file=sys.stderr)
+        for directory, own in reversed(created):
+            try:
+                current = identity(directory)
+                if current and current[:2] == own[:2] and stat.S_ISDIR(current[2]):
+                    directory.rmdir()  # Empty directories created by this transaction only.
+            except OSError:
+                pass
+        raise
+    finally:
+        os.close(fd)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--package', required=True)
+    parser.add_argument('--target', required=True)
+    parser.add_argument('--from-repo', '--legacy-root', dest='from_repo', action='append', default=[])
+    parser.add_argument('--dry-run', action='store_true')
+    parser.add_argument('--inspect', action='store_true')
+    parser.add_argument('--yes', action='store_true')
+    args = parser.parse_args()
+    repo = absolute(str(Path(__file__).absolute().parent.parent))
+    target = absolute(args.target)
+    explicit_roots = [absolute(value) for value in args.from_repo]
+    if args.inspect and args.package == 'all-user':
+        return inspect_all(repo, target, explicit_roots)
+    roots, snapshot = prepare(repo, target, args.package, explicit_roots)
+    if args.dry_run or args.inspect:
+        print('Read-only preflight complete; no installed paths changed.')
+        if roots and any(row['state'] not in {'current', 'absent-legacy'} for row in snapshot['rows']):
+            command = ['python3', '-I', str(repo / 'scripts/rebind-user-package'),
+                       '--target', str(target), '--package', args.package]
+            for root in roots:
+                command += ['--from-repo', str(root)]
+            print('Review explicit dry-run: ' + shlex.join(command + ['--dry-run']))
+        return 3 if args.inspect and any(row['state'] not in {'current', 'absent-legacy'}
+                                        for row in snapshot['rows']) else 0
+    require(not args.yes or explicit_roots,
+            '--yes requires explicit --from-repo values; discovered sources require interactive approval')
+    if not args.yes:
+        require(sys.stdin.isatty(), 'interactive approval required; review dry-run, then specify --from-repo and --yes')
+        require(input(f'Rebind user links for {args.package}? Type REBIND: ') == 'REBIND', 'cancelled')
+    apply(repo, target, args.package, roots, snapshot)
+
+
+if __name__ == '__main__':
+    def interrupted(signum, frame):
+        raise Refusal(f'interrupted by signal {signum}')
+    signal.signal(signal.SIGTERM, interrupted)
+    try:
+        sys.exit(main())
+    except (Refusal, OSError, ValueError, subprocess.SubprocessError, KeyboardInterrupt) as error:
+        print(f'rebind refused: {error}', file=sys.stderr)
+        sys.exit(1)

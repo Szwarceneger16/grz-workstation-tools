@@ -18,6 +18,7 @@ run.sh
 scripts/check-repo
 scripts/ensure-rcd-loaders
 scripts/list-packages
+scripts/rebind-user-package
 scripts/runner-canonical-docs.txt
 scripts/runner-canonical-files.txt
 scripts/stow-select
