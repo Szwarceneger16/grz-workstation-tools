@@ -59,7 +59,23 @@ zsh_legacy_target='^(.*)/packages/[^/]+/install/\.zshrc$'
 # using the same packages/<pkg>/install/<file> convention would match and get
 # its dangling symlink deleted, which is not ours to decide.
 repo_marker_file='.rcd-loader-repo-id'
-known_repo_ids=(grz-workstation-tools private-consumer)
+known_repo_ids=(grz-workstation-tools grz-zsh-tools private-consumer)
+# Consumer-specific historical identities are local policy, never public exports.
+legacy_ids_file="${0:A:h:h}/.rcd-loader-legacy-repo-ids"
+if [[ -e "$legacy_ids_file" || -L "$legacy_ids_file" ]]; then
+  [[ -f "$legacy_ids_file" && ! -L "$legacy_ids_file" ]] || {
+    print -u2 -- "$script_name: legacy identity policy must be a regular file"
+    exit 1
+  }
+  while IFS= read -r legacy_id || [[ -n "$legacy_id" ]]; do
+    [[ -z "$legacy_id" || "$legacy_id" == \#* ]] && continue
+    [[ "$legacy_id" =~ '^[A-Za-z0-9][A-Za-z0-9._-]*$' ]] || {
+      print -u2 -- "$script_name: invalid legacy repository identity"
+      exit 1
+    }
+    known_repo_ids+=("$legacy_id")
+  done < "$legacy_ids_file"
+fi
 
 profile_detect='(^# >>> profile\.d loader \(managed\) >>>$)|(^[[:space:]]*for[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]+in[[:space:]].*\.config/profile\.d/\*\.sh)'
 # Plain variant: appended to a pre-existing ~/.profile (the common case — most

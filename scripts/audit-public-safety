@@ -2,99 +2,133 @@
 emulate -L zsh
 set -euo pipefail
 
-# Public-safety scanner.
-#
-# Fails if anything that will ACTUALLY be published looks like personal data or a
-# credential. Scope = tracked files (what `git` would publish); untracked and
-# git-ignored files (e.g. .claude/settings*.json) are intentionally not scanned.
-#
-# Per AGENTS.md this reports only the file path + category, never the matched value
-# (so it is safe to run in CI logs).
-#
-# Two tiers keep it precise:
-#   Tier A  whole tracked tree   high-signal leaks that never appear in real docs
-#                                (credential formats, absolute personal home paths)
-#   Tier B  packages/*/install   generic secret-ish words, only in shipped runtime
-#                                code (these words legitimately appear in README /
-#                                AGENTS.md / CI as documentation, so are not failed
-#                                there)
+# Repository-local public policy. Read indexed bytes, not the worktree, filters
+# or grep's text/binary classification. Report paths/categories, never values.
+# No external policy, consumer information or blanket scanner-file exclusion.
+exec python3 -I - "${0:A:h:h}" <<'PY'
+import hashlib
+import json
+import re
+import subprocess
+import sys
 
-repo_root="${0:A:h:h}"
-cd "$repo_root" || { print -u2 -- 'audit-public-safety: cannot cd to repo root'; exit 2; }
 
-command -v git >/dev/null 2>&1 || { print -u2 -- 'audit-public-safety: git is required'; exit 2; }
-git rev-parse --is-inside-work-tree >/dev/null 2>&1 ||
-  { print -u2 -- 'audit-public-safety: not inside a git work tree'; exit 2; }
+def git(*args):
+    result = subprocess.run(["git", "--no-replace-objects", *args], cwd=sys.argv[1],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if result.returncode:
+        raise ValueError("cannot read index objects")
+    return result.stdout
 
-self="${${0:A}#$repo_root/}"   # this script's repo-relative path (excluded from scans)
-findings=0
 
-report() {
-  local category="$1"; shift
-  local f
-  for f in "$@"; do
-    [[ -n "$f" ]] || continue
-    print -u2 -- "audit-public-safety: POSSIBLE LEAK [$category]: $f"
-    findings=$(( findings + 1 ))
-  done
-}
+def exceptions():
+    # This public, repository-local policy is reviewed with the scanner. Read
+    # indexed policy bytes as well as indexed content; unstaged policy edits
+    # cannot authorize a finding. This is not an external trust boundary.
+    records = git("ls-files", "--stage", "-z", "--", "manifests/public-safety-allowlist.json")
+    if not records:
+        return set()
+    rows = records.rstrip(b"\0").split(b"\0")
+    if len(rows) != 1:
+        raise ValueError("invalid indexed safety policy")
+    metadata, path = rows[0].split(b"\t", 1)
+    mode, oid, stage = metadata.split()
+    if (mode not in {b"100644", b"100755"} or stage != b"0"
+            or path != b"manifests/public-safety-allowlist.json"):
+        raise ValueError("invalid indexed safety policy")
+    entries = json.loads(git("cat-file", "blob", oid.decode("ascii")))
+    if not isinstance(entries, list):
+        raise ValueError("invalid safety exception policy")
+    result = set()
+    for entry in entries:
+        if (not isinstance(entry, dict) or set(entry) != {"path", "category", "sha256", "reason"}
+                or not all(isinstance(value, str) for value in entry.values())
+                or entry["category"] not in {"credential", "home-path", "secret-word", "dotenv-path"}
+                or not re.fullmatch(r"[0-9a-f]{64}", entry["sha256"])
+                or not entry["reason"].strip()
+                or not entry["path"] or entry["path"].startswith("/")
+                or any(part in {"", ".", ".."} for part in entry["path"].split("/"))):
+            raise ValueError("invalid safety exception entry")
+        key = (entry["path"], entry["category"], entry["sha256"])
+        if key in result:
+            raise ValueError("duplicate safety exception")
+        result.add(key)
+    return result
 
-# List indexed files (staged / committed) matching an ERE under the given pathspecs.
-# `-l` prints file names only (never the matched text); exit 1 (no match) is fine.
-# Optional single-letter flags (e.g. -i for case-insensitive) may be passed before the pattern.
-scan() {
-  local -a flags=()
-  while [[ "${1-}" == -[a-zA-Z] ]]; do flags+=("$1"); shift; done
-  local pattern="$1"; shift
-  git grep --cached -lIE "${flags[@]}" -e "$pattern" -- "$@" 2>/dev/null || true
-}
 
-# ---- Tier A -----------------------------------------------------------------
 
-# Concrete credential formats: private keys and provider tokens. Never legitimate.
-cred_pattern='-----BEGIN ([A-Z]+ )?PRIVATE KEY-----|ghp_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{30,}|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{10,}|AIza[0-9A-Za-z_-]{35}'
-typeset -a cred_hits
-cred_hits=(${(f)"$(scan "$cred_pattern" . ":!$self")"})
-cred_hits=(${cred_hits:#})
-(( ${#cred_hits} )) && report 'credential' "${cred_hits[@]}"
+credential = re.compile(rb"-----BEGIN ([A-Z]+ )?PRIVATE KEY-----|ghp_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{30,}|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{10,}|AIza[0-9A-Za-z_-]{35}")
+home = re.compile(rb"(?:/home/|/Users/)[A-Za-z0-9._-]+")
+# Detect opaque authentication values independently of vendor token formats.
+# Require a value, so empty header names and grep alternations in safety docs
+# are not credentials. Do not exempt variable references, docs or templates.
+auth_value = re.compile(
+    rb"\b(?:http[_-])?(?:proxy[_-])?authorization[\"']?\s*[:=]\s*[\"']?\s*[^\s\"'|`]"
+    rb"|\bbearer[ \t]+[^\s\"'|`]", re.I)
+# Assignment/header indicators apply to every blob, including templates and
+# repository tooling. A name in prose is not a stored value. Do not exempt
+# variable references or placeholders: those require exact reviewed policy.
+generic_value = re.compile(
+    rb"\b[a-z0-9_-]*(?:password|passwd|secret|token|"
+    rb"(?:api|private|ssh|encryption|decryption|signing|secret|access|client|auth|session|master|"
+    rb"symmetric|asymmetric|aes|rsa|ecdsa|ed25519)[_-]?key(?:[_-]?(?:b64|base64|pem|der|hex))?)[\"']?"
+    rb"\s*(?::|=(?!=))\s*[\"']?\s*[^\s\"'|`=]", re.I)
+cookie_value = re.compile(
+    rb"\b(?:[a-z0-9_-]*cookie|set-cookie)[\"']?"
+    rb"\s*(?::|=(?!=))\s*[\"']?\s*[^\s\"'|`=]", re.I)
+words = re.compile(
+    rb"password|passwd[\"']?\s*[:=]|secret|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret"
+    rb"|\b(?:[a-z_][a-z0-9_-]*)?token[\"']?\s*(?::|=(?!=))", re.I)
 
-# Absolute personal home paths (deanonymizing). /home/runner is the GitHub
-# Actions runner home — a known-safe placeholder; files whose only home-path
-# hits are /home/runner are not flagged.
-home_pattern='(/home/|/Users/)[A-Za-z0-9._-]+'
-typeset -a home_raw home_hits=()
-home_raw=(${(f)"$(scan "$home_pattern" . ":!$self")"})
-home_raw=(${home_raw:#})
-for f in "${home_raw[@]}"; do
-  git grep --cached -IhE -e "$home_pattern" -- "$f" 2>/dev/null \
-    | grep -qvE '/home/runner([^A-Za-z0-9._-]|$)' \
-    && home_hits+=("$f") || true
-done
-(( ${#home_hits} )) && report 'home-path' "${home_hits[@]}"
 
-# ---- Tier B -----------------------------------------------------------------
+def dotenv_path(path):
+    # Only the exact template basename is exempt from the path rule. A template
+    # directory or a different suffix must not conceal a dotenv file. Content
+    # checks still apply, including high-signal credentials inside templates.
+    parts = path.split("/")
+    return any((part.casefold() == ".env" or part.casefold().startswith(".env."))
+               and not (index == len(parts) - 1 and part == ".env.example")
+               for index, part in enumerate(parts))
 
-typeset -a install_dirs
-install_dirs=(packages/*/install(N/))
-if (( ${#install_dirs} )); then
-  # Generic secret-ish words in shipped runtime code. `passwd` is matched only
-  # as a value assignment (`passwd=`, `passwd :`, quoted keys like `"passwd":`)
-  # so the Unix passwd database and user-resolution idioms (`getent passwd`,
-  # `/etc/passwd`, a `passwd_entry` variable) do not trip the scan, while a
-  # real `db_passwd=...` or `"db_passwd": "..."` still does.
-  word_pattern="password|passwd[\"']?[[:space:]]*[:=]|secret|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret"
-  typeset -a word_hits
-  word_hits=(${(f)"$(scan -i "$word_pattern" "${install_dirs[@]}")"})
-  word_hits=(${word_hits:#*.example})
-  word_hits=(${word_hits:#})
-  (( ${#word_hits} )) && report 'secret-word' "${word_hits[@]}"
-fi
-
-# ---- Result -----------------------------------------------------------------
-
-if (( findings > 0 )); then
-  print -u2 -- "audit-public-safety: FAILED with $findings finding(s)"
-  exit 1
-fi
-
-print -- 'audit-public-safety: ok'
+try:
+    allowed = exceptions()
+    reviewed = 0
+    findings = 0
+    for record in git("ls-files", "--stage", "-z").split(b"\0"):
+        if not record:
+            continue
+        metadata, raw_path = record.split(b"\t", 1)
+        mode, oid, stage = metadata.split()
+        if stage != b"0" or mode not in {b"100644", b"100755", b"120000"}:
+            raise ValueError("unmerged or unsupported index entry")
+        path = raw_path.decode("utf-8", "strict")
+        # Includes binary bytes and symlink target text; never follow the link.
+        payload = git("cat-file", "blob", oid.decode("ascii"))
+        categories = []
+        if dotenv_path(path):
+            categories.append("dotenv-path")
+        if credential.search(payload) or auth_value.search(payload) or cookie_value.search(payload):
+            categories.append("credential")
+        if any(match.group() != b"/home/runner" for match in home.finditer(payload)):
+            categories.append("home-path")
+        parts = path.split("/")
+        if (generic_value.search(payload)
+                or (len(parts) >= 4 and parts[0] == "packages" and parts[2] in {"install", "system-install"}
+                    and not path.endswith(".example") and words.search(payload))):
+            categories.append("secret-word")
+        for category in categories:
+            if (path, category, hashlib.sha256(payload).hexdigest()) in allowed:
+                reviewed += 1
+                continue
+            label = path if re.fullmatch(r"[A-Za-z0-9._/@+-]+", path) else json.dumps(path, ensure_ascii=True)
+            print(f"audit-public-safety: POSSIBLE LEAK [{category}]: {label}", file=sys.stderr)
+            findings += 1
+    if findings:
+        print(f"audit-public-safety: FAILED with {findings} finding(s)", file=sys.stderr)
+        sys.exit(1)
+    print(f"audit-public-safety: ok ({reviewed} exact reviewed exceptions)")
+except (OSError, UnicodeError, ValueError):
+    # Git errors may contain candidate data. Never include raw exception text.
+    print("audit-public-safety: ERROR: indexed content could not be validated", file=sys.stderr)
+    sys.exit(2)
+PY

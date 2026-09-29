@@ -1,0 +1,73 @@
+#!/usr/bin/env python3
+"""Dispatch read-only CI for an exact metadata-only release PR from trusted main."""
+
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+
+ROOT = Path(__file__).resolve().parent.parent
+BRANCH = "automation/runner-release-next"
+WORKFLOW = "check-repo.yml"
+SHA = re.compile(r"[0-9a-f]{40}")
+
+
+def run(*args):
+    return subprocess.run(args, cwd=ROOT, check=True, text=True, capture_output=True).stdout.strip()
+
+
+def api(repo, endpoint):
+    return json.loads(run("gh", "api", f"repos/{repo}/{endpoint}"))
+
+
+def require(condition, message):
+    if not condition:
+        raise ValueError(message)
+
+
+def validate_pr(pr, repo):
+    require(pr["state"] == "open" and pr["base"]["ref"] == "main"
+            and pr["base"]["repo"]["full_name"] == repo
+            and pr["head"]["ref"] == BRANCH and pr["head"]["repo"]["full_name"] == repo,
+            "expected an open same-repository aggregate release PR targeting main")
+    require(type(pr["number"]) is int and pr["number"] > 0, "invalid PR number")
+    require(SHA.fullmatch(pr["head"]["sha"]), "invalid release head SHA")
+    return pr["head"]["sha"]
+
+
+def main():
+    repo = os.environ["GITHUB_REPOSITORY"]
+    require(re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo), "invalid repository")
+    require(os.environ.get("GITHUB_REF") == "refs/heads/main", "dispatcher must run from main")
+    base = run("git", "rev-parse", "HEAD")
+    require(SHA.fullmatch(base), "invalid trusted checkout SHA")
+    require(api(repo, "git/ref/heads/main")["object"]["sha"] == base, "trusted main checkout is stale")
+    owner = repo.split("/")[0]
+    prs = api(repo, f"pulls?state=open&base=main&head={owner}:{BRANCH}&per_page=100")
+    require(isinstance(prs, list) and len(prs) == 1, "expected exactly one open release PR")
+    pr = prs[0]
+    head = validate_pr(pr, repo)
+    # Fetch as data only; never check out or execute code from this branch.
+    run("git", "fetch", "--no-tags", "origin", f"refs/heads/{BRANCH}")
+    require(run("git", "rev-parse", "FETCH_HEAD") == head, "release branch changed during fetch")
+    run("git", "merge-base", "--is-ancestor", base, head)
+    require(run("git", "diff", "--name-only", base, head, "--") == "runner.release",
+            "release head must differ from trusted main only in runner.release")
+    # Recheck both mutable refs immediately before dispatch. The dispatched job
+    # independently rejects a ref race by binding github.sha to this input.
+    fresh = api(repo, f"pulls/{pr['number']}")
+    require(validate_pr(fresh, repo) == head, "release PR changed before dispatch")
+    require(api(repo, "git/ref/heads/main")["object"]["sha"] == base, "main changed before dispatch")
+    run("gh", "workflow", "run", WORKFLOW, "--repo", repo, "--ref", BRANCH,
+        "-f", f"expected_head_sha={head}")
+    print(f"Dispatched Repo consistency for release PR #{pr['number']} at {head}.")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, KeyError, TypeError, ValueError, subprocess.CalledProcessError) as error:
+        print(f"dispatch-runner-release-checks: {error}", file=sys.stderr)
+        raise SystemExit(1)

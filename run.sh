@@ -579,8 +579,10 @@ find_shadowing_system_unit_path() {
 stop_user_template_instances() {
   local package="$1" unit="$2"
   local pattern="${unit/@./@*.}"
-  local line instance
-  for line in "${(@f)$(systemctl --user list-units --all --no-legend --plain -- "$pattern" 2>/dev/null)}"; do
+  local line instance listing
+  listing="$(systemctl --user list-units --all --no-legend --plain -- "$pattern")" ||
+    die "failed to enumerate user instances of $unit for $package; refusing to remove files while units may be active"
+  for line in "${(@f)listing}"; do
     instance="${${(z)line}[1]}"
     [[ -n "$instance" ]] || continue
     print -- "Stopping $instance (Accept=yes connection instance of $unit)"
@@ -651,13 +653,12 @@ activation_bases_for_unit() {
 # starting, ...) to stdout whenever it can reach a user manager, regardless of
 # its own exit code; only empty output or the literal "offline" status mean no
 # manager is reachable at all (no D-Bus user session in an SSH/cron/sudo
-# context). This is the single no-user-bus signal that downgrades an otherwise
-# fatal user unit activation/deactivation failure to a clean skip; every other
-# non-zero systemctl status stays fatal.
+# context). Activation can then enable units offline and skip reload/start;
+# deactivation must abort before unlinking files that may still be in use.
 user_manager_reachable() {
-  local status
-  status="$(systemctl --user is-system-running 2>/dev/null)" || true
-  case "$status" in
+  local manager_state
+  manager_state="$(systemctl --user is-system-running 2>/dev/null)" || true
+  case "$manager_state" in
     ""|offline) return 1 ;;
   esac
   return 0
@@ -871,6 +872,12 @@ deactivate_user_units() {
   fi
 
   unit_dir="$repo_root/packages/$package/install/.config/systemd/user"
+  # Reject any bad live link or template shadow before stopping even the first
+  # trigger. Keep the per-unit checks below as a second check immediately before
+  # mutation; preflight is not a lock against concurrent filesystem changes.
+  for unit in "${user_units[@]}"; do
+    verify_user_unit_owned_for_deactivation "$unit_dir" "$unit"
+  done
   activation_bases=()
   for unit in "${user_units[@]}"; do
     for base in "${(@f)$(activation_bases_for_unit "$unit_dir" "$unit")}"; do
@@ -1792,9 +1799,10 @@ parse_install() {
   run_system_action install "$selector" "$verbose"
 
   if (( do_verify )); then
-    run_verify "$selector" install
+    run_verify "$selector" install "$verbose"
   fi
   if (( do_test )); then
+    verify_verbose="$verbose"
     run_test "$selector"
   fi
 }

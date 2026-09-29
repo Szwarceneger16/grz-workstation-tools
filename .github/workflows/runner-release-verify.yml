@@ -1,0 +1,68 @@
+name: Runner release verification
+
+# A tag CI run is only a notification. This definition comes from main.
+on:
+  workflow_run:
+    workflows: [check-repo]
+    types: [completed]
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: runner-release-verification
+  cancel-in-progress: false
+
+jobs:
+  verify-release:
+    if: github.ref == 'refs/heads/main' && vars.RUNNER_AUTOMATION_ENABLED == 'true'
+    runs-on: ubuntu-24.04
+    outputs:
+      release_tag: ${{ steps.verify.outputs.release_tag }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify Git objects independently of the triggering run
+        id: verify
+        env:
+          RUNNER_COMMIT_ALLOWED_SIGNER_B64: ${{ vars.RUNNER_COMMIT_ALLOWED_SIGNER_B64 }}
+          RUNNER_COMMIT_SIGNING_FINGERPRINT: ${{ vars.RUNNER_COMMIT_SIGNING_FINGERPRINT }}
+          RUNNER_RELEASE_ALLOWED_SIGNER_B64: ${{ vars.RUNNER_RELEASE_ALLOWED_SIGNER_B64 }}
+          RUNNER_RELEASE_SIGNING_FINGERPRINT: ${{ vars.RUNNER_RELEASE_SIGNING_FINGERPRINT }}
+        run: |
+          set -euo pipefail
+          git fetch origin 'refs/tags/runner-v*:refs/tags/runner-v*'
+          ./scripts/propose-runner-release inspect --head-ref HEAD --json-out "$RUNNER_TEMP/state.json"
+          if [[ "$(jq -r '.pending_release' "$RUNNER_TEMP/state.json")" == "false" ]] && [[ -f runner.release ]]; then
+            version="$(awk '$1 == "version" { print $2 }' runner.release)"
+            echo "release_tag=runner-v${version}" >> "$GITHUB_OUTPUT"
+          fi
+
+  report-release:
+    needs: verify-release
+    if: needs.verify-release.outputs.release_tag != ''
+    runs-on: ubuntu-24.04
+    permissions:
+      issues: write
+    steps:
+      - name: Close only a bot-owned signing notification
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.verify-release.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          title="Sign ${RELEASE_TAG}"
+          number="$(gh issue list --state open --author 'github-actions[bot]' \
+            --search "${title} in:title" --json number,title,body \
+            --jq ".[] | select(.title == \"${title}\" and (.body | startswith(\"<!-- runner-signing-request-v1 -->\"))) | .number" | head -n1)"
+          if [[ -n "$number" ]]; then
+            gh issue close "$number" --comment \
+              "Verified the exact release objects in ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}." >/dev/null
+          fi

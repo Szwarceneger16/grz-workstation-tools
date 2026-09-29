@@ -1,0 +1,710 @@
+#!/usr/bin/env python3
+"""Prepare and verify runner release snapshots without executing runner code."""
+
+from __future__ import annotations
+
+import argparse
+import base64
+from contextlib import contextmanager
+import hashlib
+import json
+import os
+from pathlib import Path, PurePosixPath
+import re
+import subprocess
+import sys
+import tempfile
+from typing import NoReturn
+
+
+ROOT = Path(os.environ.get("RUNNER_RELEASE_REPO_ROOT", Path(__file__).resolve().parent.parent)).resolve()
+CANON_CODE = "scripts/runner-canonical-files.txt"
+CANON_DOCS = "scripts/runner-canonical-docs.txt"
+LOCK_CODE = "runner.lock"
+LOCK_DOCS = "runner.docs.lock"
+RELEASE_FILE = "runner.release"
+TAG_RE = re.compile(r"runner-v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)")
+SHA_RE = re.compile(r"[0-9a-f]{40}")
+HASH_RE = re.compile(r"[0-9a-f]{64}")
+LOCK_RE = re.compile(r"(100644|100755) ([0-9a-f]{64})  ([^\0\r\n]+)")
+SAFE_PATH_RE = re.compile(r"(?:[A-Za-z0-9._@+-]+/)*[A-Za-z0-9._@+-]+")
+RELEASE_KEYS = (
+    "version",
+    "previous-tag",
+    "code-manifest-sha256",
+    "docs-manifest-sha256",
+    "code-tree-sha256",
+    "docs-tree-sha256",
+)
+VERIFIED: dict[str, dict[str, str]] | None = None
+TRUST: argparse.Namespace | None = None
+
+
+class ReleaseError(RuntimeError):
+    pass
+
+
+class ReleaseTagVerificationError(ReleaseError):
+    """Verification failed for one well-formed tag, not the namespace or trust setup."""
+
+    def __init__(self, tag: str, error: ReleaseError):
+        super().__init__(str(error))
+        self.tag = tag
+
+
+def fail(message: str) -> NoReturn:
+    raise ReleaseError(message)
+
+
+def run_git(*args: str, check: bool = True, config: list[str] | None = None) -> subprocess.CompletedProcess[bytes]:
+    command = ["git"]
+    for item in config or []:
+        command.extend(["-c", item])
+    command.extend(args)
+    result = subprocess.run(command, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if check and result.returncode:
+        detail = result.stderr.decode("utf-8", "replace").strip()
+        fail(f"git {' '.join(args)} failed: {detail}")
+    return result
+
+
+def git_text(*args: str) -> str:
+    return run_git(*args).stdout.decode("utf-8", "strict").strip()
+
+
+def ref_exists(ref: str) -> bool:
+    return run_git("rev-parse", "--verify", "--quiet", ref, check=False).returncode == 0
+
+
+def semver(value: str) -> tuple[int, int, int]:
+    match = re.fullmatch(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", value)
+    if not match:
+        fail(f"invalid SemVer: {value}")
+    return tuple(int(part) for part in match.groups())
+
+
+def version_from_tag(tag: str) -> tuple[int, int, int]:
+    match = TAG_RE.fullmatch(tag)
+    if not match:
+        fail(f"invalid runner release tag: {tag}")
+    return tuple(int(part) for part in match.groups())
+
+
+def release_tags(exclude: str | None = None) -> list[str]:
+    tags = []
+    for tag in git_text("tag", "--list", "runner-v*").splitlines():
+        # Every protected-namespace tag is significant, including malformed ones.
+        version_from_tag(tag)
+        if tag != exclude:
+            tags.append(tag)
+    return sorted(tags, key=version_from_tag)
+
+
+def latest_tag(exclude: str | None = None) -> str | None:
+    tags = [tag for tag in verified_releases() if tag != exclude]
+    return tags[-1] if tags else None
+
+
+@contextmanager
+def verification_trust():
+    if TRUST is not None:
+        yield TRUST
+        return
+    with tempfile.TemporaryDirectory(prefix="runner-public-trust-") as temporary:
+        values = {}
+        for role in ("commit", "release"):
+            prefix = f"RUNNER_{role.upper()}"
+            encoded = os.environ.get(f"{prefix}_ALLOWED_SIGNER_B64", "")
+            fingerprint = os.environ.get(f"{prefix}_SIGNING_FINGERPRINT", "")
+            if not encoded or not fingerprint:
+                fail("administrator-managed public verification keys are required")
+            path = Path(temporary) / f"{role}.allowed_signers"
+            path.write_bytes(base64.b64decode(encoded, validate=True))
+            values[f"{role}_allowed_signers"] = str(path)
+            values[f"{role}_fingerprint"] = fingerprint
+        values["main_ref"] = os.environ.get("RUNNER_RELEASE_MAIN_REF", "origin/main" if ref_exists("origin/main") else "main")
+        yield argparse.Namespace(**values)
+
+
+def verified_releases() -> dict[str, dict[str, str]]:
+    global VERIFIED
+    if VERIFIED is not None:
+        return VERIFIED
+    tags = release_tags()
+    results = {}
+    if tags:
+        with verification_trust() as trust:
+            previous = "none"
+            for tag in tags:
+                args = argparse.Namespace(**vars(trust), tag=tag, expected_commit=None)
+                try:
+                    results[tag] = verify_tag(args, previous=previous)
+                except ReleaseError as error:
+                    raise ReleaseTagVerificationError(tag, error) from error
+                previous = tag
+    VERIFIED = results
+    return results
+
+
+def safe_path(value: str, origin: str, number: int) -> str:
+    if not value or value != value.strip() or not SAFE_PATH_RE.fullmatch(value):
+        fail(f"{origin}:{number}: malformed path")
+    path = PurePosixPath(value)
+    if path.is_absolute() or any(part in {"", ".", ".."} for part in value.split("/")):
+        fail(f"{origin}:{number}: unsafe repository-relative path: {value}")
+    normalized = path.as_posix()
+    if normalized == ".git" or normalized.startswith(".git/"):
+        fail(f"{origin}:{number}: .git paths are forbidden")
+    return normalized
+
+
+def show_bytes(ref: str, path: str, *, optional: bool = False) -> bytes | None:
+    result = run_git("show", f"{ref}:{path}", check=False)
+    if result.returncode:
+        if optional:
+            return None
+        fail(f"{ref} is missing {path}")
+    return result.stdout
+
+
+def tree_entry(ref: str, path: str, *, optional: bool = False) -> tuple[str, str] | None:
+    raw = run_git("ls-tree", "-z", ref, "--", path).stdout
+    if not raw:
+        if optional:
+            return None
+        fail(f"{ref} is missing {path}")
+    records = [record for record in raw.split(b"\0") if record]
+    if len(records) != 1:
+        fail(f"ambiguous tree entry at {ref}:{path}")
+    metadata, actual = records[0].split(b"\t", 1)
+    mode, kind, object_id = metadata.decode("ascii").split(" ")
+    if actual.decode("utf-8", "strict") != path or kind != "blob" or mode not in {"100644", "100755"}:
+        fail(f"canonical entry must be a regular file at {ref}:{path}")
+    return mode, object_id
+
+
+def parse_manifest(ref: str, path: str) -> tuple[bytes, list[str]]:
+    tree_entry(ref, path)
+    payload = show_bytes(ref, path)
+    assert payload is not None
+    entries: list[str] = []
+    seen: set[str] = set()
+    for number, raw in enumerate(payload.decode("utf-8", "strict").splitlines(), 1):
+        if not raw or raw.startswith("#"):
+            continue
+        entry = safe_path(raw, path, number)
+        if entry in seen:
+            fail(f"{path}:{number}: duplicate entry: {entry}")
+        seen.add(entry)
+        entries.append(entry)
+    if not entries or entries != sorted(entries):
+        fail(f"{path} must be non-empty and bytewise sorted")
+    for entry in entries:
+        tree_entry(ref, entry)
+    return payload, entries
+
+
+def parse_lock(ref: str, path: str) -> dict[str, tuple[str, str]]:
+    tree_entry(ref, path)
+    payload = show_bytes(ref, path)
+    assert payload is not None
+    result: dict[str, tuple[str, str]] = {}
+    previous = ""
+    for number, line in enumerate(payload.decode("utf-8", "strict").splitlines(), 1):
+        match = LOCK_RE.fullmatch(line)
+        if not match:
+            fail(f"{path}:{number}: invalid lock record")
+        mode, digest, raw_path = match.groups()
+        entry = safe_path(raw_path, path, number)
+        if entry in result or (previous and entry <= previous):
+            fail(f"{path}:{number}: duplicate or unsorted path: {entry}")
+        previous = entry
+        result[entry] = (mode, digest)
+    return result
+
+
+def aggregate_tree_hash(ref: str, paths: list[str]) -> str:
+    digest = hashlib.sha256()
+    for path in paths:
+        entry = tree_entry(ref, path)
+        assert entry is not None
+        mode, _ = entry
+        payload = show_bytes(ref, path)
+        assert payload is not None
+        line = f"{mode} {hashlib.sha256(payload).hexdigest()}  {path}\n"
+        digest.update(line.encode("utf-8"))
+    return digest.hexdigest()
+
+
+def snapshot(ref: str) -> dict[str, object]:
+    code_payload, code_paths = parse_manifest(ref, CANON_CODE)
+    docs_payload, docs_paths = parse_manifest(ref, CANON_DOCS)
+    if CANON_CODE not in code_paths or CANON_DOCS not in code_paths:
+        fail(f"{CANON_CODE} must export both canonical manifests")
+    overlap = set(code_paths) & set(docs_paths)
+    if overlap:
+        fail(f"code and docs manifests overlap: {sorted(overlap)[0]}")
+    for paths, lock_path in ((code_paths, LOCK_CODE), (docs_paths, LOCK_DOCS)):
+        locked = parse_lock(ref, lock_path)
+        if list(locked) != paths:
+            fail(f"{lock_path} path set differs from its manifest")
+        for path in paths:
+            payload = show_bytes(ref, path)
+            assert payload is not None
+            mode, digest = locked[path]
+            if tree_entry(ref, path)[0] != mode:
+                fail(f"{lock_path}: file mode mismatch: {path}")
+            if hashlib.sha256(payload).hexdigest() != digest:
+                fail(f"{lock_path}: content hash mismatch: {path}")
+    return {
+        "main_sha": git_text("rev-parse", f"{ref}^{{commit}}"),
+        "code_manifest_sha256": hashlib.sha256(code_payload).hexdigest(),
+        "docs_manifest_sha256": hashlib.sha256(docs_payload).hexdigest(),
+        "code_tree_sha256": aggregate_tree_hash(ref, code_paths),
+        "docs_tree_sha256": aggregate_tree_hash(ref, docs_paths),
+        "code_paths": code_paths,
+        "docs_paths": docs_paths,
+    }
+
+
+def parse_release(payload: bytes, origin: str = RELEASE_FILE) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for number, line in enumerate(payload.decode("utf-8", "strict").splitlines(), 1):
+        pieces = line.split(" ", 1)
+        if len(pieces) != 2 or pieces[0] not in RELEASE_KEYS or pieces[0] in result:
+            fail(f"{origin}:{number}: invalid or duplicate release field")
+        result[pieces[0]] = pieces[1]
+    if tuple(result) != RELEASE_KEYS:
+        fail(f"{origin}: fields must appear exactly in the documented order")
+    semver(result["version"])
+    previous = result["previous-tag"]
+    if previous != "none":
+        version_from_tag(previous)
+    for key in RELEASE_KEYS[2:]:
+        if not HASH_RE.fullmatch(result[key]):
+            fail(f"{origin}: invalid hash in {key}")
+    return result
+
+
+def release_payload(values: dict[str, str]) -> str:
+    return "".join(f"{key} {values[key]}\n" for key in RELEASE_KEYS)
+
+
+def has_shared_delta(previous: str | None, snap: dict[str, object]) -> bool:
+    if previous is None or previous == "none":
+        return True
+    previous_snapshot = snapshot(previous)
+    return any(snap[key.replace("-", "_")] != previous_snapshot[key.replace("-", "_")]
+               for key in RELEASE_KEYS[2:])
+
+
+def validate_release(ref: str, *, current_tag: str | None = None, previous: str = "__latest__") -> dict[str, str]:
+    tree_entry(ref, RELEASE_FILE)
+    payload = show_bytes(ref, RELEASE_FILE)
+    assert payload is not None
+    release = parse_release(payload, f"{ref}:{RELEASE_FILE}")
+    snap = snapshot(ref)
+    for key in RELEASE_KEYS[2:]:
+        if release[key] != snap[key.replace("-", "_")]:
+            fail(f"{ref}:{RELEASE_FILE}: {key} does not match the snapshot")
+    if previous == "__latest__":
+        previous = latest_tag(exclude=current_tag) or "none"
+    expected_previous = previous
+    if release["previous-tag"] != expected_previous:
+        fail(f"previous-tag must be {expected_previous}")
+    if previous != "none" and semver(release["version"]) <= version_from_tag(previous):
+        fail("release version must be greater than the previous release")
+    if not has_shared_delta(previous, snap):
+        fail("release requires a canonical code or documentation delta from previous-tag")
+    expected_tag = f"runner-v{release['version']}"
+    if current_tag is None and ref_exists(f"refs/tags/{expected_tag}"):
+        fail(f"release tag already exists: {expected_tag}")
+    if current_tag is not None and current_tag != expected_tag:
+        fail(f"tag {current_tag} does not match runner.release version")
+    return release
+
+
+def entry_signature(ref: str | None, path: str) -> tuple[str, str] | None:
+    if ref is None:
+        return None
+    return tree_entry(ref, path, optional=True)
+
+
+def manifest_paths_optional(ref: str | None, path: str) -> list[str]:
+    if ref is None or show_bytes(ref, path, optional=True) is None:
+        return []
+    return parse_manifest(ref, path)[1]
+
+
+def changed_shared_paths(base: str | None, head: str) -> list[str]:
+    watched = {CANON_CODE, CANON_DOCS, LOCK_CODE, LOCK_DOCS}
+    for ref in (base, head):
+        watched.update(manifest_paths_optional(ref, CANON_CODE))
+        watched.update(manifest_paths_optional(ref, CANON_DOCS))
+    return sorted(path for path in watched if entry_signature(base, path) != entry_signature(head, path))
+
+
+def current_pending_release(ref: str) -> tuple[bool, dict[str, str] | None]:
+    tree_entry(ref, RELEASE_FILE, optional=True)
+    payload = show_bytes(ref, RELEASE_FILE, optional=True)
+    if payload is None:
+        # Bootstrap has no metadata yet, but protected tags are still a trust
+        # boundary. Never report a clean state for a poisoned tag namespace.
+        verified_releases()
+        return False, None
+    release = parse_release(payload, f"{ref}:{RELEASE_FILE}")
+    expected_tag = f"runner-v{release['version']}"
+    if ref_exists(f"refs/tags/{expected_tag}"):
+        try:
+            verified = verified_releases()
+        except ReleaseTagVerificationError as error:
+            if error.tag != expected_tag or release_tags()[-1] != expected_tag:
+                raise
+            # Only failure of this pending tag permits unrelated PRs. Namespace,
+            # trust setup, and other release failures must fail the entire gate.
+            return True, release
+        frozen = verified[expected_tag]["release_parent"]
+        if show_bytes(frozen, RELEASE_FILE) != payload:
+            fail("tag metadata differs from main's frozen snapshot")
+        return False, release
+    # Pending metadata must describe a new, valid shared snapshot, not just a
+    # higher version with the previous release's unchanged content.
+    validate_release(ref)
+    return True, release
+
+
+def frozen_release_parent(main_ref: str, metadata_ref: str) -> str:
+    tree_entry(metadata_ref, RELEASE_FILE)
+    payload = show_bytes(metadata_ref, RELEASE_FILE)
+    commits = git_text("rev-list", "--first-parent", main_ref, "--", RELEASE_FILE).splitlines()
+    matching = [commit for commit in commits if show_bytes(commit, RELEASE_FILE, optional=True) == payload]
+    if len(matching) != 1:
+        fail("cannot identify one exact frozen metadata commit on main")
+    return matching[0]
+
+
+def inspect(head: str) -> dict[str, object]:
+    snap = snapshot(head)
+    previous = latest_tag()
+    pending, pending_release = current_pending_release(head)
+    release_parent = frozen_release_parent(head, head) if pending else ""
+    if release_parent:
+        validate_release(release_parent)
+    changed = changed_shared_paths(previous, head)
+    previous_version = version_from_tag(previous) if previous else (0, 0, 0)
+    suggested = (0, 1, 0) if previous is None else (previous_version[0], previous_version[1], previous_version[2] + 1)
+    result = dict(snap)
+    result.update(
+        {
+            "needs_release": has_shared_delta(previous, snap) and not pending,
+            "pending_release": pending,
+            "pending_version": pending_release["version"] if pending_release else "",
+            "release_parent": release_parent,
+            "previous_tag": previous or "none",
+            "suggested_version": ".".join(str(part) for part in suggested),
+            "changed_paths": changed,
+            "merged_prs": merged_pr_references(previous, head),
+        }
+    )
+    return result
+
+
+def merged_pr_references(base: str | None, head: str) -> list[int]:
+    revision = f"{base}..{head}" if base else head
+    watched = {CANON_CODE, CANON_DOCS, LOCK_CODE, LOCK_DOCS}
+    for ref in (base, head):
+        watched.update(manifest_paths_optional(ref, CANON_CODE))
+        watched.update(manifest_paths_optional(ref, CANON_DOCS))
+    subjects = git_text("log", "--first-parent", "--format=%s", revision, "--", *sorted(watched)).splitlines()
+    numbers: set[int] = set()
+    for subject in subjects:
+        # GitHub's merge-commit and squash-merge subjects both identify PRs.
+        merge = re.match(r"^Merge pull request #([1-9][0-9]*) from \S+", subject)
+        squash = re.search(r"\(#([1-9][0-9]*)\)$", subject)
+        match = merge or squash
+        if match:
+            numbers.add(int(match.group(1)))
+    return sorted(numbers)
+
+
+def write_output(path: str | None, values: dict[str, object]) -> None:
+    if not path:
+        return
+    with Path(path).open("a", encoding="utf-8") as handle:
+        for key in ("needs_release", "pending_release", "previous_tag", "suggested_version", "main_sha", "release_parent"):
+            if key in values:
+                value = values[key]
+                if isinstance(value, bool):
+                    value = str(value).lower()
+                handle.write(f"{key}={value}\n")
+
+
+def render_body(data: dict[str, object]) -> str:
+    paths = "\n".join(f"- `{path}`" for path in data["changed_paths"]) or "- None"
+    prs = "\n".join(f"- #{number}" for number in data["merged_prs"]) or "- No PR number found in commit subjects"
+    return f"""## Runner release snapshot
+
+- Previous tag: `{data['previous_tag']}`
+- Proposed tag: `runner-v{data['version']}`
+- Public main SHA: `{data['main_sha']}`
+- Code tree SHA-256: `{data['code_tree_sha256']}`
+- Documentation tree SHA-256: `{data['docs_tree_sha256']}`
+
+### Shared paths changed since the previous release
+
+{paths}
+
+### Aggregated pull requests
+
+{prs}
+
+### Owner checklist
+
+- [ ] Review every shared path and aggregated PR.
+- [ ] Confirm `runner.release` hashes match the required checks.
+- [ ] Change patch to a valid higher minor/major version if needed.
+- [ ] Mark this PR ready manually.
+- [ ] Obtain the required CODEOWNER approval and merge manually.
+
+Merging this PR does **not** create a tag. It freezes the snapshot and opens a
+signing request. The owner must then create a signed, empty release-attestation
+commit and a separately signed annotated tag outside GitHub Actions.
+"""
+
+
+def command_inspect(args: argparse.Namespace) -> None:
+    data = inspect(args.head_ref)
+    Path(args.json_out).write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    write_output(args.github_output, data)
+
+
+def command_update(args: argparse.Namespace) -> None:
+    data = inspect(args.head_ref)
+    if data["pending_release"]:
+        fail(f"runner-v{data['pending_version']} is awaiting signature")
+    if not data["needs_release"]:
+        fail("no shared delta requires a release")
+    version = str(data["suggested_version"])
+    current = ROOT / RELEASE_FILE
+    if current.is_symlink() or (current.exists() and not current.is_file()):
+        fail("runner.release must be a regular file")
+    if current.is_file() and not current.is_symlink():
+        existing = parse_release(current.read_bytes())
+        previous_version = version_from_tag(str(data["previous_tag"])) if data["previous_tag"] != "none" else (0, 0, 0)
+        inherited = show_bytes(args.head_ref, RELEASE_FILE, optional=True)
+        if current.read_bytes() != inherited:
+            if semver(existing["version"]) <= previous_version or ref_exists(f"refs/tags/runner-v{existing['version']}"):
+                fail("manual release version must be higher and unused")
+            version = existing["version"]
+    values = {
+        "version": version,
+        "previous-tag": str(data["previous_tag"]),
+        "code-manifest-sha256": str(data["code_manifest_sha256"]),
+        "docs-manifest-sha256": str(data["docs_manifest_sha256"]),
+        "code-tree-sha256": str(data["code_tree_sha256"]),
+        "docs-tree-sha256": str(data["docs_tree_sha256"]),
+    }
+    current.write_text(release_payload(values), encoding="utf-8")
+    body_data = dict(data)
+    body_data["version"] = version
+    Path(args.body_out).write_text(render_body(body_data), encoding="utf-8")
+
+
+def command_validate_release(args: argparse.Namespace) -> None:
+    current_tag = None
+    if args.allow_existing_tag:
+        payload = show_bytes(args.ref, RELEASE_FILE)
+        assert payload is not None
+        current_tag = f"runner-v{parse_release(payload, f'{args.ref}:{RELEASE_FILE}')['version']}"
+    print(json.dumps(validate_release(args.ref, current_tag=current_tag), sort_keys=True))
+
+
+def verify_signature(kind: str, object_id: str, allowed_signers: str, fingerprint: str) -> None:
+    if not re.fullmatch(r"SHA256:[A-Za-z0-9+/=]+", fingerprint):
+        fail(f"invalid expected {kind} signing fingerprint")
+    verb = "verify-tag" if kind == "tag" else "verify-commit"
+    result = run_git(
+        verb,
+        "--raw",
+        object_id,
+        check=False,
+        config=["gpg.format=ssh", f"gpg.ssh.allowedSignersFile={allowed_signers}"],
+    )
+    output = (result.stdout + result.stderr).decode("utf-8", "replace")
+    verified_keys = re.findall(r'^Good "git" signature for [^\n]+ with [A-Z0-9-]+ key (SHA256:[A-Za-z0-9+/=]+)$', output, re.MULTILINE)
+    if result.returncode or verified_keys != [fingerprint]:
+        fail(f"{kind} signature verification failed or used an unexpected key")
+
+
+def tag_message(tag: str) -> dict[str, str]:
+    payload = run_git("cat-file", "tag", tag).stdout.decode("utf-8", "strict")
+    _, separator, message = payload.partition("\n\n")
+    if not separator:
+        fail("annotated tag has no message")
+    unsigned_message = message.split("-----BEGIN SSH SIGNATURE-----", 1)[0]
+    unsigned_message = unsigned_message.split("-----BEGIN PGP SIGNATURE-----", 1)[0]
+    lines = unsigned_message.strip().splitlines()
+    if not lines or lines[0] != "runner-release-v1":
+        fail("tag message must start with runner-release-v1")
+    result: dict[str, str] = {}
+    for line in lines[1:]:
+        key, separator, value = line.partition(" ")
+        if not separator or key in result:
+            fail("invalid tag message field")
+        result[key] = value
+    required = {"version", "release-parent", "code-tree-sha256", "docs-tree-sha256"}
+    if set(result) != required:
+        fail("tag message fields do not match the release contract")
+    return result
+
+
+def verify_tag(args: argparse.Namespace, *, previous: str) -> dict[str, str]:
+    tag = args.tag
+    version = version_from_tag(tag)
+    if args.commit_fingerprint == args.release_fingerprint:
+        fail("commit and release signatures must use different keys")
+    if git_text("cat-file", "-t", f"refs/tags/{tag}") != "tag":
+        fail("release tag must be annotated")
+    tag_object = git_text("rev-parse", f"refs/tags/{tag}")
+    tag_data = run_git("cat-file", "tag", tag).stdout.decode("utf-8", "strict")
+    header = tag_data.partition("\n\n")[0].splitlines()
+    object_line = next((line for line in header if line.startswith("object ")), "")
+    type_line = next((line for line in header if line.startswith("type ")), "")
+    if type_line != "type commit" or not object_line:
+        fail("tag must point directly to a commit")
+    target = object_line.split(" ", 1)[1]
+    if args.expected_commit and target != args.expected_commit:
+        fail("tag target differs from expected_commit_sha")
+    verify_signature("tag", tag, args.release_allowed_signers, args.release_fingerprint)
+    verify_signature("commit", target, args.commit_allowed_signers, args.commit_fingerprint)
+    commit_lines = run_git("cat-file", "commit", target).stdout.decode("utf-8", "strict").partition("\n\n")[0].splitlines()
+    parents = [line.split(" ", 1)[1] for line in commit_lines if line.startswith("parent ")]
+    if len(parents) != 1:
+        fail("release-attestation commit must have exactly one parent")
+    parent = parents[0]
+    target_tree = next(line.split(" ", 1)[1] for line in commit_lines if line.startswith("tree "))
+    parent_tree = git_text("show", "-s", "--format=%T", parent)
+    if target_tree != parent_tree:
+        fail("release-attestation commit must have the same tree as its parent")
+    if run_git("merge-base", "--is-ancestor", parent, args.main_ref, check=False).returncode:
+        fail("release parent is not reachable from public main")
+    if frozen_release_parent(args.main_ref, parent) != parent:
+        fail("release parent is not the exact frozen metadata commit on main")
+    release = validate_release(parent, current_tag=tag, previous=previous)
+    message = tag_message(tag)
+    expected_message = {
+        "version": release["version"],
+        "release-parent": parent,
+        "code-tree-sha256": release["code-tree-sha256"],
+        "docs-tree-sha256": release["docs-tree-sha256"],
+    }
+    if message != expected_message:
+        fail("tag message does not attest the frozen release metadata")
+    previous = release["previous-tag"]
+    if previous != "none":
+        previous_target = git_text("rev-parse", f"{previous}^{{commit}}")
+        previous_commit = run_git("cat-file", "commit", previous_target).stdout.decode("utf-8", "strict")
+        previous_parents = [line.split(" ", 1)[1] for line in previous_commit.partition("\n\n")[0].splitlines() if line.startswith("parent ")]
+        if len(previous_parents) != 1 or run_git("merge-base", "--is-ancestor", previous_parents[0], parent, check=False).returncode:
+            fail("release ancestry does not extend the previous frozen snapshot")
+    return {
+        "release_tag": tag,
+        "tag_object": tag_object,
+        "release_commit": target,
+        "release_parent": parent,
+        "version": release["version"],
+        "code_tree_sha256": release["code-tree-sha256"],
+        "docs_tree_sha256": release["docs-tree-sha256"],
+    }
+
+
+def command_verify_tag(args: argparse.Namespace) -> None:
+    global TRUST
+    TRUST = argparse.Namespace(**{key: getattr(args, key) for key in (
+        "main_ref", "commit_allowed_signers", "commit_fingerprint",
+        "release_allowed_signers", "release_fingerprint",
+    )})
+    version_from_tag(args.tag)
+    data = verified_releases().get(args.tag)
+    if data is None:
+        fail("requested release tag does not exist")
+    if args.expected_commit and data["release_commit"] != args.expected_commit:
+        fail("tag target differs from expected_commit_sha")
+    Path(args.json_out).write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def command_release_state(args: argparse.Namespace) -> None:
+    # Candidate CI is PR-controlled. Recompute locks with this trusted helper.
+    snapshot(args.head_ref)
+    pending, release = current_pending_release(args.main_ref)
+    if pending and entry_signature(args.main_ref, RELEASE_FILE) != entry_signature(args.head_ref, RELEASE_FILE):
+        fail("pending runner.release is immutable until its release tag is verified")
+    changed = changed_shared_paths(args.base_ref, args.head_ref)
+    metadata_changed = entry_signature(args.base_ref, RELEASE_FILE) != entry_signature(args.head_ref, RELEASE_FILE)
+    if metadata_changed and changed:
+        fail("runner.release must be reviewed separately from shared changes")
+    if metadata_changed:
+        validate_release(args.head_ref)
+        paths = git_text("diff", "--no-renames", "--name-only", args.base_ref, args.head_ref).splitlines()
+        if paths != [RELEASE_FILE]:
+            fail("release proposal must change only runner.release")
+    data = {
+        "pending_release": pending,
+        "pending_version": release["version"] if release else "",
+        "shared_change": bool(changed),
+        "changed_paths": changed,
+    }
+    Path(args.json_out).write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    write_output(args.github_output, data)
+    if pending and changed:
+        fail(f"runner-v{release['version']} is awaiting signature; shared changes are temporarily blocked")
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser()
+    commands = result.add_subparsers(dest="command", required=True)
+    inspect_parser = commands.add_parser("inspect")
+    inspect_parser.add_argument("--head-ref", default="HEAD")
+    inspect_parser.add_argument("--json-out", required=True)
+    inspect_parser.add_argument("--github-output")
+    inspect_parser.set_defaults(function=command_inspect)
+    update_parser = commands.add_parser("update")
+    update_parser.add_argument("--head-ref", default="origin/main")
+    update_parser.add_argument("--body-out", required=True)
+    update_parser.set_defaults(function=command_update)
+    validate_parser = commands.add_parser("validate-release")
+    validate_parser.add_argument("--ref", default="HEAD")
+    validate_parser.add_argument("--allow-existing-tag", action="store_true")
+    validate_parser.set_defaults(function=command_validate_release)
+    state_parser = commands.add_parser("release-state")
+    state_parser.add_argument("--main-ref", required=True)
+    state_parser.add_argument("--base-ref", required=True)
+    state_parser.add_argument("--head-ref", required=True)
+    state_parser.add_argument("--json-out", required=True)
+    state_parser.add_argument("--github-output")
+    state_parser.set_defaults(function=command_release_state)
+    verify_parser = commands.add_parser("verify-tag")
+    verify_parser.add_argument("--tag", required=True)
+    verify_parser.add_argument("--expected-commit")
+    verify_parser.add_argument("--main-ref", default="origin/main")
+    verify_parser.add_argument("--commit-allowed-signers", required=True)
+    verify_parser.add_argument("--commit-fingerprint", required=True)
+    verify_parser.add_argument("--release-allowed-signers", required=True)
+    verify_parser.add_argument("--release-fingerprint", required=True)
+    verify_parser.add_argument("--json-out", required=True)
+    verify_parser.set_defaults(function=command_verify_tag)
+    return result
+
+
+def main() -> int:
+    try:
+        args = parser().parse_args()
+        args.function(args)
+    except (OSError, UnicodeError, ValueError, ReleaseError) as error:
+        print(f"propose-runner-release: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
