@@ -23,6 +23,7 @@ else
     local runtime_root="${ZSH_TOOLS_ROOT:-$HOME/.zsh_scripts}"
     local completion_root file name
     local audit_marker='__grz_compaudit_not_run__'
+    local -i audit_rc=0
     local -a completion_roots fields original_fpath
     local -a _i_wdirs _i_wfiles
     local _i_check=yes _i_fail=ign
@@ -44,16 +45,18 @@ else
     if (( ! $+functions[compaudit] )); then
       autoload -RUz compaudit
     fi
-    compaudit "${completion_roots[@]}" >/dev/null 2>&1 || :
+    compaudit "${completion_roots[@]}" >/dev/null 2>&1 || audit_rc=$?
 
-    if (( _i_wdirs[(I)$audit_marker] || _i_wfiles[(I)$audit_marker] )); then
+    if (( audit_rc > 1 ||
+          _i_wdirs[(I)$audit_marker] ||
+          _i_wfiles[(I)$audit_marker] )); then
       fpath=("${original_fpath[@]}")
       return 0
     fi
 
     # Match compinit -i: remove insecure managed roots from the live fpath and
-    # skip insecure files. A non-zero compaudit result means insecurity was
-    # found; it is not itself fatal because the secure subset remains usable.
+    # skip insecure files. A return code of 1 means insecurity was found; it is
+    # not itself fatal because the secure subset remains usable.
     fpath=(${original_fpath:|_i_wdirs})
 
     for completion_root in "${completion_roots[@]}"; do

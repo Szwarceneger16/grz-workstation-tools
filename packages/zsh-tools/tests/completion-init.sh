@@ -132,14 +132,14 @@ EOF
   HOME="$tmp_root/security-and-shadow"
   export HOME
   unset ZSH_TOOLS_ROOT _comp_setup _comp_dumpfile
-  prepare_home "$HOME"
   unfunction compdef compinit compaudit 2>/dev/null || true
 
   local helpers="$HOME/.zsh_scripts/completion/helpers"
   local functions="$HOME/.zsh_scripts/completion/functions"
   local bin="$HOME/.zsh_scripts/completion/bin"
+  mkdir -p "$helpers" "$functions" "$bin"
 
-  cat > "$helpers/_security_shadow" <<'EOF'
+  cat > "$bin/_security_shadow" <<'EOF'
 #compdef insecure-shadow-command
 _security_shadow() { typeset -g SECURITY_SHADOW_SOURCE=insecure; }
 _security_shadow "$@"
@@ -174,7 +174,7 @@ EOF
   source "$fpath_file"
 
   compaudit() {
-    _i_wdirs=("$helpers")
+    _i_wdirs=("$bin")
     _i_wfiles=("$functions/_insecure_file_probe")
     return 1
   }
@@ -190,9 +190,14 @@ EOF
 
   local fpath_entry
   for fpath_entry in "${fpath[@]}"; do
-    [[ "$fpath_entry" == "$helpers" ]] &&
+    [[ "$fpath_entry" == "$bin" ]] &&
       fail "insecure managed root remained in fpath"
   done
+
+  unset SECURITY_SHADOW_SOURCE
+  _security_shadow
+  [[ "${SECURITY_SHADOW_SOURCE:-}" == secure ]] ||
+    fail "secure duplicate autoloaded from the insecure root"
 
   [[ "${_comps[dedup-first-command]-}" == "_dedup_probe" ]] ||
     fail "first secure basename was not registered"
