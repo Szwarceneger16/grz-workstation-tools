@@ -123,6 +123,73 @@ EOF
     fail "stale-dump recovery performed an unintended full fpath rescan"
 )
 
+# A custom ZSH_TOOLS_ROOT must drive both fpath and bounded registration.
+# A mismatched default-runtime copy must not remain available for autoload.
+(
+  emulate -LR zsh
+  set -euo pipefail
+  HOME="$tmp_root/custom-root-home"
+  ZSH_TOOLS_ROOT="$tmp_root/custom-root-runtime"
+  export HOME ZSH_TOOLS_ROOT
+  unset _comp_setup _comp_dumpfile
+  unfunction compdef compinit 2>/dev/null || true
+
+  local custom_functions="$ZSH_TOOLS_ROOT/completion/functions"
+  local default_functions="$HOME/.zsh_scripts/completion/functions"
+  mkdir -p "$custom_functions" "$ZSH_TOOLS_ROOT/completion/helpers" "$ZSH_TOOLS_ROOT/completion/bin" "$default_functions"
+
+  cat > "$custom_functions/_custom_root_probe" <<'EOF'
+#compdef custom-root-probe
+_custom_root_probe() {
+  typeset -g CUSTOM_ROOT_PROBE_SOURCE=custom
+}
+_custom_root_probe "$@"
+EOF
+
+  cat > "$default_functions/_custom_root_probe" <<'EOF'
+#compdef custom-root-probe
+_custom_root_probe() {
+  typeset -g CUSTOM_ROOT_PROBE_SOURCE=default
+}
+_custom_root_probe "$@"
+EOF
+
+  # Simulate stale default-runtime fpath entries left by earlier startup state.
+  fpath=(
+    "$default_functions"
+    "$HOME/.zsh_scripts/completion/helpers"
+    "$HOME/.zsh_scripts/completion/bin"
+    "$fpath[@]"
+  )
+
+  autoload -Uz compinit
+  compinit -D -i
+
+  source "$fpath_file"
+  source "$completion_file"
+
+  [[ "$fpath[1]" == "$ZSH_TOOLS_ROOT/completion/helpers" ]] ||
+    fail "custom runtime helpers were not first in fpath"
+  [[ "$fpath[2]" == "$ZSH_TOOLS_ROOT/completion/functions" ]] ||
+    fail "custom runtime functions were not second in fpath"
+  [[ "$fpath[3]" == "$ZSH_TOOLS_ROOT/completion/bin" ]] ||
+    fail "custom runtime bin was not third in fpath"
+
+  local fpath_entry
+  for fpath_entry in "${fpath[@]}"; do
+    [[ "$fpath_entry" == "$default_functions" ]] &&
+      fail "default runtime functions remained in fpath with a custom root"
+  done
+
+  [[ "${_comps[custom-root-probe]-}" == "_custom_root_probe" ]] ||
+    fail "custom runtime #compdef was not registered"
+
+  unset CUSTOM_ROOT_PROBE_SOURCE
+  _custom_root_probe
+  [[ "${CUSTOM_ROOT_PROBE_SOURCE:-}" == custom ]] ||
+    fail "custom runtime completion autoloaded from the wrong root"
+)
+
 # Successful reload removes the actual active dump, configured/default
 # alternatives, and dumps under a non-HOME ZDOTDIR before replacing the shell.
 (

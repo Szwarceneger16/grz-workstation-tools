@@ -20,6 +20,26 @@ The relevant source files are installed through GNU Stow at:
 | `packages/zsh-tools/install/.zsh_scripts/functions/zshreloadcomp.zsh` | `~/.zsh_scripts/functions/zshreloadcomp.zsh` |
 | `packages/zsh-tools/install/.zsh_scripts/completion/functions/_zshreloadcomp` | `~/.zsh_scripts/completion/functions/_zshreloadcomp` |
 
+## Runtime root and fpath
+
+The runtime root is:
+
+```text
+${ZSH_TOOLS_ROOT:-$HOME/.zsh_scripts}
+```
+
+`05-fpath.zsh` and `90-completion_init.zsh` use that same root. The three
+managed completion directories are prepended to `fpath` in this order:
+
+1. `completion/helpers`
+2. `completion/functions`
+3. `completion/bin`
+
+If `ZSH_TOOLS_ROOT` points outside the default `$HOME/.zsh_scripts`,
+`05-fpath.zsh` also removes pre-existing default zsh-tools completion paths
+from `fpath`. This prevents a registered function from a custom runtime from
+being autoloaded from a stale or mismatched default-runtime copy.
+
 ## Initialization contract
 
 `05-fpath.zsh` exposes the public runtime completion directories before
@@ -31,11 +51,8 @@ The behavior is:
    yet. The package runs `compinit -i`, keeping `grz-workstation-tools`
    usable standalone.
 2. If `compdef` already exists, the package does **not** run another full
-   `compinit`. Instead it performs a bounded metadata scan of the three runtime
-   directories exposed by `05-fpath.zsh`:
-   - `${ZSH_TOOLS_ROOT:-$HOME/.zsh_scripts}/completion/helpers`,
-   - `.../completion/functions`,
-   - `.../completion/bin`.
+   `compinit`. Instead it performs a bounded metadata scan of the same three
+   runtime directories exposed by `05-fpath.zsh`.
    Only `#compdef` declarations from those bounded directories are registered.
 
 The bounded registration mirrors `compinit`'s `#compdef` handling, including
@@ -87,9 +104,10 @@ GRZ_REPO_ROOT="$PWD" packages/zsh-tools/tests/completion-init.sh
 ```
 
 The regression covers standalone initialization, bounded registration across
-the runtime completion directories, recovery from a stale external dump without
-a full `fpath` rescan, preservation of existing mappings, dump-removal failure,
-and login-shell preservation.
+the runtime completion directories, custom `ZSH_TOOLS_ROOT` fpath/autoload
+consistency, recovery from a stale external dump without a full `fpath`
+rescan, preservation of existing mappings, dump-removal failure, and
+login-shell preservation.
 
 The PR intentionally does not modify `.github/workflows/`; repository policy
 requires workflow changes to be isolated in a dedicated CI/workflow PR.
