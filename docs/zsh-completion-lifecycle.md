@@ -31,9 +31,12 @@ The behavior is:
    yet. The package runs `compinit -i`, keeping `grz-workstation-tools`
    usable standalone.
 2. If `compdef` already exists, the package does **not** run another full
-   `compinit`. Instead it performs a bounded metadata scan of
-   `${ZSH_TOOLS_ROOT:-$HOME/.zsh_scripts}/completion/functions` and registers
-   only the `#compdef` declarations found there.
+   `compinit`. Instead it performs a bounded metadata scan of the three runtime
+   directories exposed by `05-fpath.zsh`:
+   - `${ZSH_TOOLS_ROOT:-$HOME/.zsh_scripts}/completion/helpers`,
+   - `.../completion/functions`,
+   - `.../completion/bin`.
+   Only `#compdef` declarations from those bounded directories are registered.
 
 The bounded registration mirrors `compinit`'s `#compdef` handling, including
 `compdef -n`, so an existing user or completion-manager mapping is not
@@ -42,7 +45,7 @@ overwritten.
 This design handles a manager that loads a stale `compinit -C` dump without
 performing a full security check and traversal of every directory in `fpath`
 on each startup. Current runtime `#compdef` declarations are registered
-directly even when an external dump remains stale, and unrelated `fpath`
+directly even when an external dump remains stale, while unrelated `fpath`
 directories are not rescanned.
 
 ## zshreloadcomp
@@ -83,9 +86,10 @@ It can also be run directly from a repository checkout:
 GRZ_REPO_ROOT="$PWD" packages/zsh-tools/tests/completion-init.sh
 ```
 
-The regression covers standalone initialization, bounded registration with an
-existing completion owner, recovery from a stale external dump without a full
-`fpath` rescan, dump-removal failure, and login-shell preservation.
+The regression covers standalone initialization, bounded registration across
+the runtime completion directories, recovery from a stale external dump without
+a full `fpath` rescan, preservation of existing mappings, dump-removal failure,
+and login-shell preservation.
 
 The PR intentionally does not modify `.github/workflows/`; repository policy
 requires workflow changes to be isolated in a dedicated CI/workflow PR.

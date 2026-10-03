@@ -15,14 +15,21 @@ fail() {
 
 prepare_home() {
   local home_dir="$1"
-  mkdir -p "$home_dir/.zsh_scripts/completion"
-  ln -s "$completion_functions" "$home_dir/.zsh_scripts/completion/functions"
+  local completion_root="$home_dir/.zsh_scripts/completion"
+
+  mkdir -p "$completion_root/bin" "$completion_root/helpers"
+  ln -s "$completion_functions" "$completion_root/functions"
+  cat > "$completion_root/bin/_runtime_bin_probe" <<'EOF'
+#compdef runtime-bin-probe
+_arguments '*:value:'
+EOF
 }
 
 tmp_root="$(mktemp -d)"
 trap 'rm -rf -- "$tmp_root"' EXIT
 
-# Standalone zsh-tools must initialize completion and register its own mappings.
+# Standalone zsh-tools must initialize completion and register mappings across
+# the runtime completion directories.
 (
   emulate -LR zsh
   set -euo pipefail
@@ -40,10 +47,12 @@ trap 'rm -rf -- "$tmp_root"' EXIT
     fail "standalone compinit did not register zshreloadcomp"
   [[ "${_comps[pr-open-comments-copyq]-}" == "_pr-open-comments" ]] ||
     fail "standalone compinit did not register a multi-command #compdef"
+  [[ "${_comps[runtime-bin-probe]-}" == "_runtime_bin_probe" ]] ||
+    fail "standalone compinit did not register completion/bin"
 )
 
-# With an existing owner, register only this runtime directory. Existing
-# mappings must win because the bounded registration mirrors compinit's -n.
+# With an existing owner, bounded registration must cover all runtime completion
+# directories. Existing mappings must win because it mirrors compinit's -n.
 (
   emulate -LR zsh
   set -euo pipefail
@@ -63,12 +72,14 @@ trap 'rm -rf -- "$tmp_root"' EXIT
   [[ "${_comps[zshreloadcomp]-}" == "_user_override" ]] ||
     fail "bounded registration overwrote an existing completion mapping"
   [[ "${_comps[pr-open-comments-copyq]-}" == "_pr-open-comments" ]] ||
-    fail "bounded registration did not add current runtime mappings"
+    fail "bounded registration did not add current function mappings"
+  [[ "${_comps[runtime-bin-probe]-}" == "_runtime_bin_probe" ]] ||
+    fail "bounded registration did not add completion/bin mappings"
 )
 
-# A later owner may trust a dump created before the runtime completion directory
-# was exposed. Bounded registration must add only this runtime's metadata: an
-# unrelated fpath completion must remain absent, proving that no full rescan ran.
+# A later owner may trust a dump created before the runtime completion
+# directories were exposed. Bounded registration must add only runtime metadata:
+# an unrelated fpath completion remains absent, proving that no full rescan ran.
 (
   emulate -LR zsh
   set -euo pipefail
@@ -95,6 +106,8 @@ EOF
   compinit -C -d "$stale_dump" -i
   [[ -z ${_comps[zshreloadcomp]-} ]] ||
     fail "stale dump unexpectedly contained zsh-tools mappings"
+  [[ -z ${_comps[runtime-bin-probe]-} ]] ||
+    fail "stale dump unexpectedly contained completion/bin mappings"
   [[ -z ${_comps[unrelated-probe]-} ]] ||
     fail "stale dump unexpectedly contained the unrelated mapping"
 
@@ -104,6 +117,8 @@ EOF
     fail "bounded stale-dump recovery did not register zsh-tools"
   [[ "${_comps[pr-open-comments-copyq]-}" == "_pr-open-comments" ]] ||
     fail "bounded stale-dump recovery missed a multi-command #compdef"
+  [[ "${_comps[runtime-bin-probe]-}" == "_runtime_bin_probe" ]] ||
+    fail "bounded stale-dump recovery missed completion/bin"
   [[ -z ${_comps[unrelated-probe]-} ]] ||
     fail "stale-dump recovery performed an unintended full fpath rescan"
 )
