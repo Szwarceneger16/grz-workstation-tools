@@ -24,7 +24,7 @@ else
     local completion_root file name
     local audit_marker='__grz_compaudit_not_run__'
     local -i audit_rc=0
-    local -a completion_roots fields original_fpath
+    local -a completion_roots fields original_fpath audit_search_fpath
     local -a _i_wdirs _i_wfiles
     local _i_check=yes _i_fail=ign
     local -A seen
@@ -36,9 +36,12 @@ else
     )
 
     # compaudit uses dynamic scope for these variables and temporarily assigns
-    # fpath to its positional arguments. Keep the caller's fpath and fail
-    # closed if compaudit cannot actually run.
+    # fpath to its positional arguments. Before invoking it, remove the roots
+    # being audited from the autoload search path so an insecure managed root
+    # cannot provide the compaudit implementation itself.
     original_fpath=("${fpath[@]}")
+    audit_search_fpath=(${original_fpath:|completion_roots})
+    fpath=("${audit_search_fpath[@]}")
     _i_wdirs=("$audit_marker")
     _i_wfiles=("$audit_marker")
 
