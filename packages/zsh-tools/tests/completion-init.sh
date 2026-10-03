@@ -1,6 +1,7 @@
 #!/usr/bin/env zsh
 emulate -LR zsh
 set -euo pipefail
+unset ZDOTDIR ZSH_COMPDUMP XDG_CACHE_HOME ZSH_TOOLS_ROOT _comp_dumpfile
 
 repo_root="${GRZ_REPO_ROOT:?GRZ_REPO_ROOT is required}"
 fpath_file="$repo_root/packages/zsh-tools/install/.zsh_scripts/core/05-fpath.zsh"
@@ -135,9 +136,9 @@ EOF
   unfunction compdef compinit compaudit 2>/dev/null || true
 
   local helpers="$HOME/.zsh_scripts/completion/helpers"
-  local functions="$HOME/.zsh_scripts/completion/functions"
+  local function_dir="$HOME/.zsh_scripts/completion/functions"
   local bin="$HOME/.zsh_scripts/completion/bin"
-  mkdir -p "$helpers" "$functions" "$bin"
+  mkdir -p "$helpers" "$function_dir" "$bin"
 
   cat > "$bin/_security_shadow" <<'EOF'
 #compdef insecure-shadow-command
@@ -145,13 +146,13 @@ _security_shadow() { typeset -g SECURITY_SHADOW_SOURCE=insecure; }
 _security_shadow "$@"
 EOF
 
-  cat > "$functions/_security_shadow" <<'EOF'
+  cat > "$function_dir/_security_shadow" <<'EOF'
 #compdef secure-shadow-command
 _security_shadow() { typeset -g SECURITY_SHADOW_SOURCE=secure; }
 _security_shadow "$@"
 EOF
 
-  cat > "$functions/_insecure_file_probe" <<'EOF'
+  cat > "$function_dir/_insecure_file_probe" <<'EOF'
 #compdef insecure-file-command
 _arguments '*:value:'
 EOF
@@ -162,7 +163,7 @@ _dedup_probe() { typeset -g DEDUP_PROBE_SOURCE=helpers; }
 _dedup_probe "$@"
 EOF
 
-  cat > "$functions/_dedup_probe" <<'EOF'
+  cat > "$function_dir/_dedup_probe" <<'EOF'
 #compdef dedup-second-command
 _dedup_probe() { typeset -g DEDUP_PROBE_SOURCE=functions; }
 _dedup_probe "$@"
@@ -175,7 +176,7 @@ EOF
 
   compaudit() {
     _i_wdirs=("$bin")
-    _i_wfiles=("$functions/_insecure_file_probe")
+    _i_wfiles=("$function_dir/_insecure_file_probe")
     return 1
   }
 
@@ -209,6 +210,191 @@ EOF
   [[ "${DEDUP_PROBE_SOURCE:-}" == helpers ]] ||
     fail "deduplicated completion autoloaded from the wrong managed root"
 )
+# Cached mappings, loaded functions, helper calls and widgets must not retain
+# access to an insecure file. A secure duplicate after an insecure file must
+# autoload from its audited path even though the insecure directory is retained.
+(
+  emulate -LR zsh
+  set -euo pipefail
+  HOME="$tmp_root/cached-security"
+  export HOME
+  unset ZSH_TOOLS_ROOT _comp_setup _comp_dumpfile
+  local helpers="$HOME/.zsh_scripts/completion/helpers"
+  local function_dir="$HOME/.zsh_scripts/completion/functions"
+  local bin="$HOME/.zsh_scripts/completion/bin"
+  mkdir -p "$helpers" "$function_dir" "$bin"
+  local name
+  for name in _cached_bad _cached_duplicate _compiled_bad; do
+    print -rl -- "#compdef ${name#_}" 'typeset -g UNSAFE_EXECUTED=yes' > "$helpers/$name"
+  done
+  print -rl -- '#compdef secure-duplicate' 'typeset -g DUPLICATE_SOURCE=secure' > "$function_dir/_cached_duplicate"
+  print -rl -- '#autoload' 'typeset -g UNSAFE_EXECUTED=yes' > "$helpers/_bad_helper"
+  touch "$helpers/_compiled_bad.zwc"
+  print -rl -- '#autoload' '_loaded_alias() { typeset -g UNSAFE_EXECUTED=yes; }' > "$helpers/_loaded_bad"
+
+  autoload -Uz compinit
+  compinit -D -i
+  source "$fpath_file"
+  _comps[cached-bad]=_cached_bad
+  _comps[cached-alias]=_cached_bad
+  _services[cached-alias]=cached-service
+  _patcomps['cached-*']=_cached_bad
+  _postpatcomps['post-*']='=cached-service=_cached_bad'
+  _compautos[_bad_helper]=yes
+  compdef -K _cached_bad _cached_widget complete-word '^X^B'
+  _cached_bad() { typeset -g UNSAFE_EXECUTED=yes; }
+  autoload -Uz _bad_helper
+  _comps[cached-compiled]=_compiled_bad
+  _comps[cached-duplicate]=_cached_duplicate
+  source "$helpers/_loaded_bad"
+  _comps[cached-alias-implementation]=_loaded_alias
+
+  compaudit() {
+    _i_wdirs=()
+    _i_wfiles=("$helpers/_cached_bad" "$helpers/_bad_helper" "$helpers/_cached_duplicate" "$helpers/_compiled_bad.zwc" "$helpers/_loaded_bad")
+    return 1
+  }
+  source "$completion_file"
+
+  [[ -z ${_comps[cached-bad]-} && -z ${_comps[cached-alias]-} && -z ${_services[cached-alias]-} ]] ||
+    fail "cached insecure command/service mappings survived"
+  [[ -z ${_patcomps['cached-*']-} && -z ${_postpatcomps['post-*']-} ]] ||
+    fail "cached insecure pattern mappings survived"
+  [[ -z ${_compautos[_bad_helper]-} && -z ${_comps[cached-compiled]-} ]] ||
+    fail "insecure helper/compiled metadata survived"
+  _cached_bad && fail "loaded insecure function remained executable"
+  _bad_helper && fail "insecure helper remained autoloadable"
+  _compiled_bad && fail "insecure compiled companion remained autoloadable"
+  _loaded_alias && fail "an alias defined by an insecure source remained callable"
+  [[ -z ${_comps[cached-alias-implementation]-} ]] || fail "an insecure source alias retained a mapping"
+  [[ ${widgets[_cached_widget]-} == completion:.complete-word:_cached_bad ]] ||
+    fail "widget regression no longer points at the quarantined function"
+  [[ -z ${UNSAFE_EXECUTED-} ]] || fail "insecure completion code executed"
+  [[ "${_comps[secure-duplicate]-}" == _cached_duplicate ]] ||
+    fail "secure duplicate mapping was not registered"
+  _cached_duplicate
+  [[ ${DUPLICATE_SOURCE-} == secure && -z ${UNSAFE_EXECUTED-} ]] ||
+    fail "secure duplicate resolved to an earlier insecure file"
+)
+
+# Parent and digest findings invalidate roots too. Audit failure must quarantine
+# all managed roots and cached state, rather than restore unsafe fpath entries.
+for audit_case in parent digest unavailable; do
+  (
+    emulate -LR zsh
+    set -euo pipefail
+    HOME="$tmp_root/audit-$audit_case"
+    export HOME
+    unset ZSH_TOOLS_ROOT _comp_setup _comp_dumpfile
+    local helpers="$HOME/.zsh_scripts/completion/helpers"
+    local function_dir="$HOME/.zsh_scripts/completion/functions"
+    local bin="$HOME/.zsh_scripts/completion/bin"
+    mkdir -p "$helpers" "$function_dir" "$bin"
+    print -rl -- '#compdef audit-probe' 'typeset -g UNSAFE_EXECUTED=yes' > "$helpers/_audit_probe"
+    print -rl -- '#compdef deleted-probe' 'typeset -g DELETED_EXECUTED=yes' > "$helpers/_deleted_probe"
+    autoload -Uz compinit
+    compinit -D -i
+    source "$fpath_file"
+    _comps[audit-probe]=_audit_probe
+    autoload -Uz _audit_probe
+    autoload -Uz "$helpers/_deleted_probe"
+    _deleted_probe
+    unset DELETED_EXECUTED
+    rm -- "$helpers/_deleted_probe"
+    compaudit() {
+      _i_wfiles=()
+      case "$audit_case" in
+        parent) _i_wdirs=("${helpers:h}"); return 1 ;;
+        digest) _i_wdirs=("$helpers.zwc"); return 1 ;;
+        unavailable) _i_wdirs=(); return 2 ;;
+      esac
+    }
+    source "$completion_file"
+    (( ! fpath[(Ie)$helpers] )) || fail "$audit_case left an insecure root on fpath"
+    [[ -z ${_comps[audit-probe]-} ]] || fail "$audit_case retained an insecure cached mapping"
+    _audit_probe && fail "$audit_case retained an insecure autoload"
+    _deleted_probe && fail "$audit_case retained a deleted loaded function from an insecure root"
+    [[ -z ${UNSAFE_EXECUTED-} ]] || fail "$audit_case executed insecure code"
+    [[ -z ${DELETED_EXECUTED-} ]] || fail "$audit_case executed deleted insecure code"
+  )
+done
+
+# Exercise upstream compaudit as well as deterministic mocked ownership results.
+# A world-writable managed root must be rejected for both initialization owners.
+for completion_owner in standalone external; do
+  (
+    emulate -LR zsh
+    set -euo pipefail
+    HOME="$tmp_root/real-audit-$completion_owner"
+    export HOME
+    unset ZSH_TOOLS_ROOT _comp_setup _comp_dumpfile
+    local helpers="$HOME/.zsh_scripts/completion/helpers"
+    mkdir -p "$helpers" "$HOME/.zsh_scripts/completion/functions" "$HOME/.zsh_scripts/completion/bin"
+    print -rl -- '#compdef writable-probe' 'typeset -g UNSAFE_EXECUTED=yes' > "$helpers/_writable_probe"
+    unfunction compdef compinit compaudit 2>/dev/null || true
+    if [[ "$completion_owner" == external ]]; then
+      source "$fpath_file"
+      autoload -Uz compinit
+      compinit -d "$HOME/owner.dump" -i
+      chmod 777 "$helpers"
+      compinit -C -d "$HOME/owner.dump"
+      [[ ${_comps[writable-probe]-} == _writable_probe ]] ||
+        fail "stale owner dump did not preload the insecure mapping"
+    else
+      chmod 777 "$helpers"
+    fi
+    source "$fpath_file"
+    source "$completion_file"
+    (( ! fpath[(Ie)$helpers] )) || fail "real audit left a writable root on fpath"
+    [[ -z ${_comps[writable-probe]-} ]] || fail "real audit accepted a writable root"
+    _writable_probe && fail "real audit left unsafe code callable"
+    [[ -z ${UNSAFE_EXECUTED-} ]] || fail "real audit executed unsafe code"
+  )
+done
+
+# compdef -n alone does not preserve pattern and command=service overrides.
+# Managed roots may also have been reordered by the external owner.
+(
+  emulate -LR zsh
+  set -euo pipefail
+  HOME="$tmp_root/owner-overrides"
+  export HOME
+  unset ZSH_TOOLS_ROOT _comp_setup _comp_dumpfile
+  local helpers="$HOME/.zsh_scripts/completion/helpers"
+  local function_dir="$HOME/.zsh_scripts/completion/functions"
+  local bin="$HOME/.zsh_scripts/completion/bin"
+  mkdir -p "$helpers" "$function_dir" "$bin"
+  print -rl -- '#compdef -p owner-*' 'return 0' > "$helpers/_owner_pattern"
+  print -rl -- '#compdef -P post-*' 'return 0' > "$helpers/_owner_postpattern"
+  print -rl -- '#compdef owner-command=new-service' 'return 0' > "$helpers/_owner_service"
+  print -rl -- '#compdef owner-plain=new-service' 'return 0' > "$helpers/_owner_plain"
+  print -rl -- '#compdef helpers-command' 'typeset -g ORDER_SOURCE=helpers' > "$helpers/_order_probe"
+  print -rl -- '#compdef bin-command' 'typeset -g ORDER_SOURCE=bin' > "$bin/_order_probe"
+  autoload -Uz compinit
+  compinit -D -i
+  _patcomps['owner-*']=_user_override
+  _postpatcomps['post-*']=_user_override
+  _owner_service() { typeset -g OWNER_IMPLEMENTATION=preserved; }
+  _comps[owner-command]=_owner_service
+  _services[owner-command]=old-service
+  _comps[owner-plain]=_user_override
+  source "$fpath_file"
+  fpath=("$bin" "${(@)fpath:#$bin}")
+  source "$completion_file"
+  [[ ${_patcomps['owner-*']-} == _user_override && ${_postpatcomps['post-*']-} == _user_override ]] ||
+    fail "bounded registration overwrote pattern overrides"
+  [[ ${_comps[owner-command]-} == _owner_service && ${_services[owner-command]-} == old-service ]] ||
+    fail "bounded registration overwrote a service override"
+  _owner_service
+  [[ ${OWNER_IMPLEMENTATION-} == preserved ]] || fail "bounded registration replaced an owner's explicit implementation"
+  [[ ${_comps[owner-plain]-} == _user_override && -z ${_services[owner-plain]-} ]] ||
+    fail "bounded registration attached a new service to an existing plain override"
+  [[ ${_comps[bin-command]-} == _order_probe && -z ${_comps[helpers-command]-} ]] ||
+    fail "basename shadowing ignored the current managed fpath order"
+  _order_probe
+  [[ ${ORDER_SOURCE-} == bin ]] || fail "reordered root autoload chose the wrong copy"
+)
+
 # A custom ZSH_TOOLS_ROOT must drive both fpath and bounded registration.
 # A mismatched default-runtime copy must not remain available for autoload.
 (
@@ -342,6 +528,44 @@ EOF
 [[ -f "$tmp_root/non-file-sink-invoked" ]] ||
   fail "non-file compdump sink blocked shell replacement"
 
+# All paths use the same regular-file/symlink policy, including .zwc companions
+# and legacy globs. Non-files are retained; dangling/directory symlinks are
+# unlinked without touching their targets.
+(
+  emulate -LR zsh
+  set -euo pipefail
+  HOME="$tmp_root/dump-types-home"
+  ZDOTDIR="$tmp_root/dump-types-zdot"
+  XDG_CACHE_HOME="$tmp_root/dump-types-cache"
+  ZSH_COMPDUMP="$tmp_root/dump-types-active"
+  export HOME ZDOTDIR XDG_CACHE_HOME ZSH_COMPDUMP
+  _comp_dumpfile="$tmp_root/dump-types-sink"
+  mkdir -p "$HOME/.zcompdump" "$HOME/.zcompdump-backups" "$ZDOTDIR/.zcompdump" "$ZDOTDIR/.zcompdump-backups" "$XDG_CACHE_HOME/zsh/compdump.zwc" "$ZSH_COMPDUMP.zwc" "$tmp_root/dump-types-target" "$tmp_root/dump-types-bin"
+  mkfifo "$_comp_dumpfile" "$HOME/.zcompdump-fifo" "$ZDOTDIR/.zcompdump-fifo"
+  touch "$_comp_dumpfile.zwc" "$ZSH_COMPDUMP" "$XDG_CACHE_HOME/zsh/compdump" "$HOME/.zcompdump-regular" "$ZDOTDIR/.zcompdump-regular"
+  ln -s "$tmp_root/dump-types-target" "$HOME/.zcompdump-link-dir"
+  ln -s "$tmp_root/dump-types-missing" "$ZDOTDIR/.zcompdump-link-dangling"
+  cat > "$tmp_root/dump-types-bin/zsh" <<EOF
+#!/bin/sh
+printf '%s\n' invoked > "$tmp_root/dump-types-invoked"
+EOF
+  chmod +x "$tmp_root/dump-types-bin/zsh"
+  PATH="$tmp_root/dump-types-bin:$PATH"
+  export PATH
+  source "$reload_file"
+  zshreloadcomp
+)
+[[ -f "$tmp_root/dump-types-invoked" ]] || fail "non-file cache candidates blocked reload"
+for retained in dump-types-home/.zcompdump dump-types-home/.zcompdump-backups dump-types-zdot/.zcompdump dump-types-zdot/.zcompdump-backups dump-types-active.zwc dump-types-cache/zsh/compdump.zwc dump-types-target; do
+  [[ -d "$tmp_root/$retained" ]] || fail "reload removed a directory candidate or symlink target"
+done
+for retained in dump-types-sink dump-types-home/.zcompdump-fifo dump-types-zdot/.zcompdump-fifo; do
+  [[ -p "$tmp_root/$retained" ]] || fail "reload removed a non-file sink"
+done
+for removed in dump-types-sink.zwc dump-types-active dump-types-cache/zsh/compdump dump-types-home/.zcompdump-regular dump-types-zdot/.zcompdump-regular dump-types-home/.zcompdump-link-dir dump-types-zdot/.zcompdump-link-dangling; do
+  [[ ! -e "$tmp_root/$removed" && ! -L "$tmp_root/$removed" ]] || fail "reload missed a file or symlink candidate"
+done
+
 # A real dump-file deletion failure must keep the current shell and return
 # non-zero. Use a fake rm to make the failure deterministic without privilege.
 if (
@@ -390,5 +614,39 @@ HOME="$login_home" ZDOTDIR="$login_zdot" RELOAD_FILE="$reload_file" ZSHRELOADCOM
 
 [[ -f "$login_marker" ]] ||
   fail "zshreloadcomp did not preserve login-shell mode"
+
+# Verify all LOGIN/INTERACTIVE combinations with a real replacement interpreter
+# and redirected stdin. The replacement records modes in .zshenv, and interactive
+# cases must additionally reach .zshrc; -c deliberately does not survive exec.
+for login_mode in 0 1; do
+  for interactive_mode in 0 1; do
+    mode_zdot="$tmp_root/modes-$login_mode-$interactive_mode"
+    mkdir -p "$mode_zdot"
+    cat > "$mode_zdot/.zshenv" <<'EOF'
+if [[ ${RELOAD_REPLACED:-0} == 1 ]]; then
+  print -r -- "${options[login]}:${options[interactive]}" > "$RELOAD_MODE_MARKER"
+fi
+EOF
+    cat > "$mode_zdot/.zshrc" <<'EOF'
+if [[ ${RELOAD_REPLACED:-0} == 1 ]]; then
+  print -r -- reached > "$RELOAD_RC_MARKER"
+  exit 0
+fi
+EOF
+    mode_flags=()
+    expected_login=off
+    expected_interactive=off
+    if (( login_mode )); then mode_flags+=(-l); expected_login=on; fi
+    if (( interactive_mode )); then mode_flags+=(-i); expected_interactive=on; fi
+    HOME="$mode_zdot" ZDOTDIR="$mode_zdot" RELOAD_FILE="$reload_file" RELOAD_MODE_MARKER="$mode_zdot/modes" RELOAD_RC_MARKER="$mode_zdot/rc" zsh "${mode_flags[@]}" -c 'source "$RELOAD_FILE"; export RELOAD_REPLACED=1; zshreloadcomp' </dev/null
+    [[ "$(<"$mode_zdot/modes")" == "$expected_login:$expected_interactive" ]] ||
+      fail "reload changed LOGIN/INTERACTIVE combination $login_mode/$interactive_mode"
+    if (( interactive_mode )); then
+      [[ -f "$mode_zdot/rc" ]] || fail "interactive replacement skipped .zshrc"
+    else
+      [[ ! -e "$mode_zdot/rc" ]] || fail "noninteractive replacement loaded .zshrc"
+    fi
+  done
+done
 
 print -- "ok - zsh completion lifecycle"

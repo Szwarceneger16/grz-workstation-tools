@@ -1,8 +1,11 @@
 # ~/.zsh_scripts/core/05-fpath.zsh
 
 () {
+  emulate -L zsh
   local runtime_root="${ZSH_TOOLS_ROOT:-$HOME/.zsh_scripts}"
   local default_root="$HOME/.zsh_scripts"
+  runtime_root="${runtime_root:a}"
+  default_root="${default_root:a}"
   local dir managed
   local -i skip
   local -a runtime_completion_roots remove_roots remaining_fpath
@@ -35,7 +38,7 @@
   for dir in "${fpath[@]}"; do
     skip=0
     for managed in "${remove_roots[@]}"; do
-      if [[ "$dir" == "$managed" ]]; then
+      if [[ "${dir:a}" == "$managed" ]]; then
         skip=1
         break
       fi

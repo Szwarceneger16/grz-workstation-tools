@@ -29,7 +29,8 @@ ${ZSH_TOOLS_ROOT:-$HOME/.zsh_scripts}
 ```
 
 `05-fpath.zsh` and `90-completion_init.zsh` use that same root. The three
-managed completion directories are prepended to `fpath` in this order:
+managed completion directories are normalized to absolute paths and prepended
+to `fpath` in this order:
 
 1. `completion/helpers`
 2. `completion/functions`
@@ -48,24 +49,43 @@ being autoloaded from a stale or mismatched default-runtime copy.
 The behavior is:
 
 1. If `compdef` does not exist, no standard Zsh completion owner is available
-   yet. The package runs `compinit -i`, keeping `grz-workstation-tools`
-   usable standalone.
+   yet. The package resolves initialization helpers outside the managed roots,
+   audits those roots, and runs `compinit -i`, keeping `grz-workstation-tools`
+   usable standalone. Cached managed mappings are reconciled afterwards too.
 2. If `compdef` already exists, the package does **not** run another full
    `compinit`. Instead it performs a bounded metadata scan of the same three
    runtime directories exposed by `05-fpath.zsh`.
 
-Before bounded registration, the managed roots are passed to `compaudit`.
-Results are handled like `compinit -i`: insecure managed roots are removed from
-the live `fpath`, and insecure completion files are skipped. If `compaudit`
-cannot actually run, bounded registration fails closed and adds no mappings.
+Before registration, the managed roots are passed to `compaudit`. The audit's
+autoload search excludes those roots. All of compaudit's result forms matter:
+an insecure root, its parent directory, or its directory digest (`root.zwc`)
+removes that managed root from live `fpath`. Insecure files and their `.zwc`
+companions are skipped. If the audit cannot run, all managed roots are
+quarantined instead of restoring their unchecked paths.
+
+Filtering new registrations alone is insufficient when an owner's dump already
+contains mappings. Normal, pattern, post-pattern, service and autoload metadata
+referencing insecure functions are cleared. Loaded functions and autoload stubs
+are replaced with harmless functions returning non-zero, also preventing
+retained widget/helper references from executing them. The inventory includes
+aliases defined by insecure source files and loaded functions from quarantined
+roots whose source files were deleted.
 
 Within the secure subset, files are processed in managed-`fpath` order and each
 basename is accepted only once, matching `compinit`'s `_i_test` shadowing
 behavior. An insecure copy does not claim the basename, so a later secure copy
-can still be registered. Only `#compdef` declarations are consumed.
+can still be registered. Each selected function is pinned to its audited file
+with an absolute-path autoload, including helpers. An owner's explicit
+implementation sourced outside the current/default runtime is preserved.
+This prevents lookup from
+selecting an earlier insecure file or a previously pinned default-runtime copy.
+Only `#compdef` declarations add command mappings. The current managed-root
+order in `fpath` determines which secure duplicate wins.
 
-The bounded registration uses `compdef -n`, so an existing user or
-completion-manager mapping is not overwritten.
+The bounded registration uses `compdef -n` and restores pre-existing safe
+owner mappings after registration. The explicit restoration also protects
+pattern and `command=service` mappings, which `compdef -n` alone does not fully
+preserve. Security filtering takes precedence over preserving an override.
 
 This design handles a manager that loads a stale `compinit -C` dump without
 performing a full security check and traversal of every directory in `fpath`
@@ -85,16 +105,20 @@ It considers:
 - legacy `.zcompdump*` files under `$HOME`,
 - the default XDG cache dump.
 
-Regular dump files and symlinks are removed before restart. Explicit non-file
-dump sinks such as `/dev/null` are skipped because they do not persist stale
-completion state.
+Regular dump files and symlinks are removed before restart. One policy covers
+explicit paths, their compiled companions, and both legacy globs. Each candidate
+is checked independently, including orphaned compiled files. Directories and
+non-file sinks such as `/dev/null` or FIFOs are skipped. Dangling symlinks and
+symlinks to directories are unlinked without removing their targets.
 
 Dump cleanup is fail-closed: if a selected removable dump file cannot be
 removed, the command returns non-zero and does not replace the current shell.
 
-After successful cleanup it replaces the current shell. A normal shell uses
-`exec zsh`; a login shell uses `exec -l zsh`, preserving the Zsh `LOGIN` mode
-and its login-only startup/logout file semantics.
+After successful cleanup it replaces the current shell with `exec zsh` and
+explicit invocation flags. `-l` preserves login mode, `-i` preserves interactive
+mode even with redirected stdin, and `+i` keeps noninteractive shells
+noninteractive even with a terminal on stdin. Login and interactive modes are
+independent and can be combined.
 
 Because the shell process is replaced, non-exported session-only state is not
 guaranteed to survive. See `cmdhelp zshreloadcomp` for the user-facing behavior.
@@ -117,8 +141,37 @@ GRZ_REPO_ROOT="$PWD" packages/zsh-tools/tests/completion-init.sh
 The regression covers standalone initialization, bounded registration across
 the runtime completion directories, custom `ZSH_TOOLS_ROOT` fpath/autoload
 consistency, stale external dumps without a full `fpath` rescan, security
-filtering, basename shadowing, preservation of existing mappings, `/dev/null`
-as a non-file dump sink, dump-removal failure, and login-shell preservation.
+filtering of fresh and cached state (including actual upstream compaudit and
+`compinit -C`), insecure parents/digests/compiled files, deleted loaded functions,
+basename shadowing and secure duplicate autoload, preservation of normal/pattern/
+service overrides, non-file sinks and symlinks in every cleanup path,
+dump-removal failure, and all four LOGIN/INTERACTIVE combinations.
+
+`tests/test_runner_zsh_completion.py` exercises `./run.sh test zsh-tools` against
+a temporary installation fixture. It proves the shell regression is discovered
+and executed, and connects it to the existing repository CI unittest discovery
+without changing any workflow or requiring installation on the real workstation.
+It also syntax-checks every runtime and completion file, covering both the
+initialization module's glob error and the stray case terminator in `_pnpmls`.
+
+```bash
+python3 -m unittest discover -s tests -p 'test_runner_zsh_completion.py' -v
+```
+
+## Review audit coverage
+
+The follow-up audit checked every completion initialization, fpath setup,
+dump-removal and shell-replacement occurrence in this repository, including the
+pre/post rc.d loaders. These related cases were fixed together:
+
+| Problem family | Related variants covered |
+|---|---|
+| Insecure completion state | Fresh registration, cached dispatch, loaded functions, widgets/helpers, parent and digest results, failed audits |
+| Autoload shadowing | Insecure earlier files, secure duplicates, reordered managed roots, pinned default-runtime functions |
+| Owner overrides | Normal mappings, pattern/post-pattern mappings, command/service aliases |
+| Dump cleanup | Active/configured/default paths, HOME/ZDOTDIR globs, independent `.zwc` companions, directories/FIFOs, dangling/directory symlinks |
+| Shell invocation | Login/non-login and interactive/noninteractive, including redirected stdin |
+| Executable regression coverage | Glob and `_pnpmls` syntax errors, all runtime/completion syntax, a test-local variable shadowing Zsh's special `functions` parameter, actual package-runner discovery in CI |
 
 The PR intentionally does not modify `.github/workflows/`; repository policy
 requires workflow changes to be isolated in a dedicated CI/workflow PR.

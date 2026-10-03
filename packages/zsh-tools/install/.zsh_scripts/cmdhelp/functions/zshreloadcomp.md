@@ -18,10 +18,12 @@ shell startup, including:
 - the active `_comp_dumpfile`, when available,
 - `ZSH_COMPDUMP`, when configured,
 - the default `${ZDOTDIR:-$HOME}/.zcompdump*` files,
+- legacy `$HOME/.zcompdump*` files when `ZDOTDIR` differs,
 - the default XDG cache dump under `${XDG_CACHE_HOME:-$HOME/.cache}/zsh/compdump`.
 
-An explicit non-file dump sink such as `/dev/null` is skipped: there is no
-persistent dump to invalidate.
+Directories and non-file dump sinks such as `/dev/null` or FIFOs are skipped
+in every location, including compiled `.zwc` companions. Symlinks are unlinked
+without removing their targets; dangling symlinks are removed too.
 
 Every required file removal is fail-closed. If an existing dump file cannot be
 removed, `zshreloadcomp` returns an error and keeps the current shell instead
@@ -29,9 +31,10 @@ of restarting into a state that could reuse the stale dump.
 
 After successful cleanup it replaces the current process with a new Zsh:
 
-- a normal interactive Zsh uses `exec zsh`,
-- a login Zsh uses `exec -l zsh` so login-shell startup/logout semantics are
-  preserved.
+- an interactive Zsh uses `exec zsh -i`, including when stdin is redirected,
+- a login Zsh additionally receives `-l` so login-shell startup/logout semantics
+  are preserved,
+- a noninteractive Zsh receives `+i` and stays noninteractive.
 
 The terminal stays open, but normal shell startup runs again.
 
