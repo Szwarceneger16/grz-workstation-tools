@@ -297,6 +297,7 @@ for audit_case in parent digest unavailable; do
     source "$fpath_file"
     _comps[audit-probe]=_audit_probe
     autoload -Uz _audit_probe
+    fpath=("$helpers/../helpers.zwc" "$fpath[@]")
     autoload -Uz "$helpers/_deleted_probe"
     _deleted_probe
     unset DELETED_EXECUTED
@@ -311,6 +312,7 @@ for audit_case in parent digest unavailable; do
     }
     source "$completion_file"
     (( ! fpath[(Ie)$helpers] )) || fail "$audit_case left an insecure root on fpath"
+    (( ! fpath[(Ie)$helpers/../helpers.zwc] )) || fail "$audit_case left an explicit managed digest on fpath"
     [[ -z ${_comps[audit-probe]-} ]] || fail "$audit_case retained an insecure cached mapping"
     _audit_probe && fail "$audit_case retained an insecure autoload"
     _deleted_probe && fail "$audit_case retained a deleted loaded function from an insecure root"
@@ -352,6 +354,63 @@ for completion_owner in standalone external; do
   )
 done
 
+# Explicit directory digests must not supply initialization/audit helpers, even
+# if an owner adds them after 05-fpath. Loaded digest functions use a .zwc
+# directory in functions_source and must be quarantined after source deletion.
+for runtime_case in default custom; do
+  for completion_owner in standalone external; do
+    for root_kind in helpers functions bin; do
+      (
+        emulate -LR zsh
+        set -euo pipefail
+        HOME="$tmp_root/explicit-digest-$runtime_case-$completion_owner-$root_kind"
+        export HOME
+        unset ZSH_TOOLS_ROOT _comp_setup _comp_dumpfile
+        unfunction compdef compinit compaudit compdump compinstall 2>/dev/null || true
+        local runtime_root="$HOME/.zsh_scripts"
+        if [[ "$runtime_case" == custom ]]; then
+          ZSH_TOOLS_ROOT="$HOME/custom-runtime"
+          export ZSH_TOOLS_ROOT
+          runtime_root="$ZSH_TOOLS_ROOT"
+        fi
+        mkdir -p "$runtime_root/completion/"{helpers,functions,bin}
+        local digest_root="$runtime_root/completion/$root_kind"
+        print -rl -- '#compdef digest-probe' 'typeset -g UNSAFE_EXECUTED=yes' > "$digest_root/_digest_probe"
+        print -rl -- '#autoload' 'typeset -g DELETED_DIGEST_EXECUTED=yes' > "$digest_root/_digest_deleted"
+        local helper_name
+        for helper_name in compaudit compinit compdump compinstall; do
+          print -rl -- 'typeset -g DIGEST_HELPER_EXECUTED=yes' 'return 2' > "$digest_root/$helper_name"
+        done
+        zcompile -Uz "$digest_root.zwc" "$digest_root/"{_digest_probe,_digest_deleted,compaudit,compinit,compdump,compinstall}
+        if [[ "$completion_owner" == external ]]; then
+          autoload -Uz compinit
+          compinit -D -i
+        fi
+        # Both initial normalization and a later owner insertion are exercised.
+        fpath=("$digest_root/../$root_kind.zwc" "$fpath[@]")
+        source "$fpath_file"
+        (( ! fpath[(Ie)$digest_root/../$root_kind.zwc] )) || fail "05-fpath retained an explicit managed digest"
+        fpath=("$digest_root/../$root_kind.zwc" "$fpath[@]")
+        autoload -Uz _digest_deleted
+        _digest_deleted
+        zmodload zsh/parameter
+        [[ "${functions_source[_digest_deleted]:a}" == "$digest_root.zwc/_digest_deleted" ]] ||
+          fail "fixture did not load the function from its directory digest"
+        unset DELETED_DIGEST_EXECUTED
+        rm -- "$digest_root/_digest_deleted"
+        chmod 777 "$digest_root"
+        unfunction compaudit 2>/dev/null || true
+        source "$completion_file"
+        [[ -z ${DIGEST_HELPER_EXECUTED-} ]] || fail "managed digest supplied an initialization/audit helper"
+        (( ! fpath[(Ie)$digest_root/../$root_kind.zwc] )) || fail "audit retained an explicit insecure digest"
+        [[ -z ${_comps[digest-probe]-} ]] || fail "audit retained a mapping from an insecure digest root"
+        _digest_deleted && fail "audit retained a deleted function loaded from an insecure digest"
+        [[ -z ${DELETED_DIGEST_EXECUTED-} ]] || fail "audit executed deleted digest code"
+      )
+    done
+  done
+done
+
 # compdef -n alone does not preserve pattern and command=service overrides.
 # Managed roots may also have been reordered by the external owner.
 (
@@ -368,14 +427,34 @@ done
   print -rl -- '#compdef -P post-*' 'return 0' > "$helpers/_owner_postpattern"
   print -rl -- '#compdef owner-command=new-service' 'return 0' > "$helpers/_owner_service"
   print -rl -- '#compdef owner-plain=new-service' 'return 0' > "$helpers/_owner_plain"
+  print -rl -- '#compdef owner-file' 'return 0' > "$helpers/_owner_file"
+  print -rl -- '#compdef owner-empty' 'return 0' > "$helpers/_owner_empty"
+  print -rl -- '#compdef owner-pinned' 'return 0' > "$helpers/_owner_pinned"
   print -rl -- '#compdef helpers-command' 'typeset -g ORDER_SOURCE=helpers' > "$helpers/_order_probe"
   print -rl -- '#compdef bin-command' 'typeset -g ORDER_SOURCE=bin' > "$bin/_order_probe"
   autoload -Uz compinit
   compinit -D -i
   _patcomps['owner-*']=_user_override
   _postpatcomps['post-*']=_user_override
-  _owner_service() { typeset -g OWNER_IMPLEMENTATION=preserved; }
+  # Parameter-assigned functions have no source path; this is different from
+  # an unresolved autoload stub, which also has an empty functions_source.
+  functions[_owner_service]='typeset -g OWNER_IMPLEMENTATION=preserved'
+  zmodload zsh/parameter
+  [[ -z ${functions_source[_owner_service]-} ]] || fail "owner fixture unexpectedly has a source path"
+  _owner_file() { typeset -g OWNER_FILE_IMPLEMENTATION=preserved; }
+  functions[_owner_empty]=''
+  local owner_dir="$HOME/owner-functions"
+  mkdir -p "$owner_dir"
+  print -r -- 'typeset -g OWNER_PINNED_IMPLEMENTATION=preserved' > "$owner_dir/_owner_pinned"
+  autoload -Uz "$owner_dir/_owner_pinned"
+  [[ ${functions_source[_owner_pinned]-} == "$owner_dir/_owner_pinned" ]] || fail "owner fixture did not pin its source file"
+  local empty_body="${functions[_owner_empty]}"
+  autoload -Uz _order_probe
+  [[ -z ${functions_source[_order_probe]-} ]] || fail "autoload fixture unexpectedly has a source path"
   _comps[owner-command]=_owner_service
+  _comps[owner-file]=_owner_file
+  _comps[owner-empty]=_owner_empty
+  _comps[owner-pinned]=_owner_pinned
   _services[owner-command]=old-service
   _comps[owner-plain]=_user_override
   source "$fpath_file"
@@ -385,6 +464,11 @@ done
     fail "bounded registration overwrote pattern overrides"
   [[ ${_comps[owner-command]-} == _owner_service && ${_services[owner-command]-} == old-service ]] ||
     fail "bounded registration overwrote a service override"
+  _owner_pinned
+  [[ ${OWNER_PINNED_IMPLEMENTATION-} == preserved ]] || fail "bounded registration replaced an owner-pinned autoload"
+  _owner_file
+  [[ ${OWNER_FILE_IMPLEMENTATION-} == preserved ]] || fail "bounded registration replaced a file-backed owner function"
+  [[ ${functions[_owner_empty]} == "$empty_body" ]] || fail "bounded registration replaced an empty owner definition"
   _owner_service
   [[ ${OWNER_IMPLEMENTATION-} == preserved ]] || fail "bounded registration replaced an owner's explicit implementation"
   [[ ${_comps[owner-plain]-} == _user_override && -z ${_services[owner-plain]-} ]] ||
@@ -426,9 +510,24 @@ _custom_root_probe() {
 _custom_root_probe "$@"
 EOF
 
+  print -rl -- '#compdef digest-refresh' 'typeset -g DIGEST_REFRESH_SOURCE=default' > "$default_functions/_digest_refresh"
+  print -rl -- '#compdef digest-refresh' 'typeset -g DIGEST_REFRESH_SOURCE=custom' > "$custom_functions/_digest_refresh"
+  zcompile -Uz "$default_functions.zwc" "$default_functions/_digest_refresh"
+  fpath=("$default_functions.zwc" "$fpath[@]")
+  autoload -Uz _digest_refresh
+  _digest_refresh
+  zmodload zsh/parameter
+  [[ ${functions_source[_digest_refresh]:a:h} == "$default_functions.zwc" ]] || fail "fixture did not load a default-runtime digest function"
+  unset DIGEST_REFRESH_SOURCE
+
   # Simulate stale default-runtime fpath entries left by earlier startup state.
   fpath=(
     "$default_functions"
+    "$default_functions.zwc"
+    "$HOME/.zsh_scripts/completion/helpers.zwc"
+    "$HOME/.zsh_scripts/completion/bin.zwc"
+    "$HOME/.zsh_scripts/completion.zwc"
+    "$HOME/.zsh_scripts/.completion.zwc"
     "$HOME/.zsh_scripts/completion/helpers"
     "$HOME/.zsh_scripts/completion/bin"
     "$fpath[@]"
@@ -449,13 +548,15 @@ EOF
 
   local fpath_entry
   for fpath_entry in "${fpath[@]}"; do
-    [[ "$fpath_entry" == "$default_functions" ]] &&
+    [[ "$fpath_entry" == "$HOME/.zsh_scripts/"* ]] &&
       fail "default runtime functions remained in fpath with a custom root"
   done
 
   [[ "${_comps[custom-root-probe]-}" == "_custom_root_probe" ]] ||
     fail "custom runtime #compdef was not registered"
 
+  _digest_refresh
+  [[ ${DIGEST_REFRESH_SOURCE-} == custom ]] || fail "custom runtime did not replace a loaded default-runtime digest function"
   unset CUSTOM_ROOT_PROBE_SOURCE
   _custom_root_probe
   [[ "${CUSTOM_ROOT_PROBE_SOURCE:-}" == custom ]] ||

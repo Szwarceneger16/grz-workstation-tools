@@ -41,8 +41,9 @@ to `fpath` in this order:
 
 If `ZSH_TOOLS_ROOT` points outside the default `$HOME/.zsh_scripts`,
 `05-fpath.zsh` also removes pre-existing default zsh-tools completion paths
-from `fpath`. This prevents a registered function from a custom runtime from
-being autoloaded from a stale or mismatched default-runtime copy.
+and their explicit directory digests (`path.zwc`) from `fpath`. This prevents a
+registered function from a custom runtime from being autoloaded from a stale
+or mismatched default-runtime copy.
 
 `cmdhelp` and its completion use the same runtime root for help topics and
 managed function names. Explicit `__CMDHELP_ROOT`/`__CMDHELP_FUNCTIONS_ROOT`
@@ -67,10 +68,11 @@ The behavior is:
    runtime directories exposed by `05-fpath.zsh`.
 
 Before registration, the managed roots are passed to `compaudit`. The audit's
-autoload search excludes those roots. All of compaudit's result forms matter:
+autoload search excludes those roots and explicit `root.zwc` entries, including
+entries an owner adds after fpath setup. All of compaudit's result forms matter:
 an insecure root, its parent directory, or its directory digest (`root.zwc`)
-removes that managed root from live `fpath`. Insecure files and their `.zwc`
-companions are skipped. If the audit cannot run, all managed roots are
+removes that managed root and its explicit digest from live `fpath`. Insecure
+files and their `.zwc` companions are skipped. If the audit cannot run, all managed roots are
 quarantined instead of restoring their unchecked paths.
 
 Filtering new registrations alone is insufficient when an owner's dump already
@@ -79,16 +81,22 @@ referencing insecure functions are cleared. Loaded functions and autoload stubs
 are replaced with harmless functions returning non-zero, also preventing
 retained widget/helper references from executing them. The inventory includes
 aliases defined by insecure source files and loaded functions from quarantined
-roots whose source files were deleted.
+roots whose source files were deleted. Functions loaded through explicit
+directory digests have `root.zwc/function` source paths; these are associated
+with the same managed root for quarantine and runtime refresh.
 
 Within the secure subset, files are processed in managed-`fpath` order and each
 basename is accepted only once, matching `compinit`'s `_i_test` shadowing
 behavior. An insecure copy does not claim the basename, so a later secure copy
 can still be registered. Each selected function is pinned to its audited file
 with an absolute-path autoload, including helpers. An owner's explicit
-implementation sourced outside the current/default runtime is preserved.
-This prevents lookup from
-selecting an earlier insecure file or a previously pinned default-runtime copy.
+implementation sourced outside the current/default runtime is preserved, as
+are real definitions without a source path (including parameter-assigned or
+empty function bodies). Undefined autoload functions are identified using Zsh's
+autoload attribute, so an unresolved stub with an empty source still receives
+the audited path. Explicit owner-pinned autoloads outside either runtime retain
+their source path. This prevents lookup from selecting an earlier insecure file
+or a previously pinned default-runtime copy.
 Only `#compdef` declarations add command mappings. The current managed-root
 order in `fpath` determines which secure duplicate wins.
 
@@ -152,9 +160,11 @@ The regression covers standalone initialization, bounded registration across
 the runtime completion directories, custom `ZSH_TOOLS_ROOT` fpath/autoload
 consistency, stale external dumps without a full `fpath` rescan, security
 filtering of fresh and cached state (including actual upstream compaudit and
-`compinit -C`), insecure parents/digests/compiled files, deleted loaded functions,
-basename shadowing and secure duplicate autoload, preservation of normal/pattern/
-service overrides, non-file sinks and symlinks in every cleanup path,
+`compinit -C`), insecure parents/digests/compiled files, explicit digests in all
+three managed roots with default/custom runtimes and both initialization owners,
+deleted functions loaded from digests, basename shadowing and secure duplicate autoload, preservation of normal/pattern/
+service overrides and owner implementations with/without source paths, explicit
+owner-pinned autoloads, non-file sinks and symlinks in every cleanup path,
 dump-removal failure, and all four LOGIN/INTERACTIVE combinations.
 
 `tests/test_runner_zsh_completion.py` exercises `./run.sh test zsh-tools` against
@@ -176,10 +186,10 @@ pre/post rc.d loaders. These related cases were fixed together:
 
 | Problem family | Related variants covered |
 |---|---|
-| Insecure completion state | Fresh registration, cached dispatch, loaded functions, widgets/helpers, parent and digest results, failed audits |
-| Autoload shadowing | Insecure earlier files, secure duplicates, reordered managed roots, pinned default-runtime functions |
+| Insecure completion state | Fresh registration, cached dispatch, loaded functions, widgets/helpers, parent and digest results, explicit digest fpath entries, deleted digest-loaded functions, failed audits |
+| Autoload shadowing | Insecure earlier files, secure duplicates, reordered managed roots, pinned default-runtime functions, directory/digest source-path equivalence |
 | Custom runtime roots | fpath, completion registration, help core defaults, help completion/command fallbacks and explicit help-root overrides |
-| Owner overrides | Normal mappings, pattern/post-pattern mappings, command/service aliases |
+| Owner overrides | Normal mappings, pattern/post-pattern mappings, command/service aliases, file-backed and source-less implementations, empty definitions versus unresolved autoload stubs, explicit outside-runtime autoload pins |
 | Dump cleanup | Active/configured/default paths, HOME/ZDOTDIR globs, independent `.zwc` companions, directories/FIFOs, dangling/directory symlinks |
 | Shell invocation | Login/non-login and interactive/noninteractive, including redirected stdin |
 | Executable regression coverage | Glob and `_pnpmls` syntax errors, all runtime/completion syntax, a test-local variable shadowing Zsh's special `functions` parameter, actual package-runner discovery in CI |

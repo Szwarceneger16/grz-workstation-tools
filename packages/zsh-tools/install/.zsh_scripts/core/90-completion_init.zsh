@@ -17,10 +17,10 @@ zstyle ':completion:*:functions-non-comp' ignored-patterns '_*'
   local default_root="$HOME/.zsh_scripts"
   runtime_root="${runtime_root:a}"
   default_root="${default_root:a}"
-  local completion_root file name bad key value table source_file
+  local completion_root file name bad key value table source_file source_root autoload_root
   local audit_marker='__grz_compaudit_not_run__'
   local -i audit_rc=0 audit_failed=0 insecure=0
-  local -a completion_roots fields original_fpath audit_search_fpath safe_fpath
+  local -a completion_roots fields original_fpath audit_search_fpath safe_fpath undefined_functions
   local -a _i_wdirs _i_wfiles _i_files _i_addfiles
   local _i_check=yes _i_fail=ign _i_q _i_line _i_file
   local -A seen blocked unsafe_roots prior_comps prior_services prior_patterns prior_postpatterns
@@ -33,11 +33,14 @@ zstyle ':completion:*:functions-non-comp' ignored-patterns '_*'
 
   # compaudit uses dynamic scope for these variables and temporarily assigns
   # fpath to its positional arguments. Before invoking it, remove the roots
-  # being audited from the autoload search path so an insecure managed root
+  # being audited and their explicit directory digests from the autoload
+  # search path so an insecure managed root
   # cannot provide the compaudit implementation itself.
   original_fpath=("${fpath[@]}")
   for completion_root in "${original_fpath[@]}"; do
-    (( completion_roots[(Ie)${completion_root:a}] )) ||
+    autoload_root="${completion_root:a}"
+    autoload_root="${autoload_root%.zwc}"
+    (( completion_roots[(Ie)$autoload_root] )) ||
       audit_search_fpath+=("$completion_root")
   done
   fpath=("${audit_search_fpath[@]}")
@@ -80,7 +83,9 @@ zstyle ':completion:*:functions-non-comp' ignored-patterns '_*'
   done
 
   for completion_root in "${original_fpath[@]}"; do
-    (( $+unsafe_roots[${completion_root:a}] )) || safe_fpath+=("$completion_root")
+    autoload_root="${completion_root:a}"
+    autoload_root="${autoload_root%.zwc}"
+    (( $+unsafe_roots[$autoload_root] )) || safe_fpath+=("$completion_root")
   done
   fpath=("${safe_fpath[@]}")
 
@@ -89,7 +94,9 @@ zstyle ':completion:*:functions-non-comp' ignored-patterns '_*'
   zmodload zsh/parameter
   for name file in "${(@kv)functions_source}"; do
     [[ -n "$file" ]] || continue
-    if (( $+unsafe_roots[${file:a:h}] || _i_wfiles[(Ie)$file] || _i_wfiles[(Ie)$file.zwc] )); then
+    source_root="${file:a:h}"
+    source_root="${source_root%.zwc}"
+    if (( $+unsafe_roots[$source_root] || _i_wfiles[(Ie)$file] || _i_wfiles[(Ie)$file.zwc] )); then
       blocked[$name]=1
     fi
   done
@@ -125,6 +132,11 @@ zstyle ':completion:*:functions-non-comp' ignored-patterns '_*'
   prior_patterns=("${(@kv)_patcomps}")
   prior_postpatterns=("${(@kv)_postpatcomps}")
 
+  # List undefined functions by their autoload attribute, rather than treating
+  # every empty source path as an absent definition. Parameter-assigned owner
+  # functions also have no source path and must keep their implementation.
+  undefined_functions=("${(@f)$(builtin functions -u +)}")
+
   # Respect the current managed-fpath order, even if an owner rearranged it.
   for completion_root in "${fpath[@]}"; do
     completion_root="${completion_root:a}"
@@ -139,11 +151,15 @@ zstyle ':completion:*:functions-non-comp' ignored-patterns '_*'
       # Pin secure files to their audited directory. Merely skipping an
       # insecure earlier copy still lets a name-only autoload choose it.
       source_file="${functions_source[$name]-}"
-      # Preserve an owner's explicit implementation outside either runtime.
+      source_root="${source_file:a:h}"
+      source_root="${source_root%.zwc}"
+      # Preserve an owner's explicit implementation outside either runtime,
+      # including definitions without a source file.
       # Loaded or pinned files from the current/default managed roots must be
       # refreshed; blocked names always take the audited replacement.
-      if [[ -z "$source_file" || "${source_file:a:h}" == "$default_root/completion/"(helpers|functions|bin) ]] ||
-          (( $+blocked[$name] || completion_roots[(Ie)${source_file:a:h}] )); then
+      if [[ "$source_root" == "$default_root/completion/"(helpers|functions|bin) ]] ||
+          (( ! $+functions[$name] || (undefined_functions[(Ie)$name] && ! ${#source_file}) ||
+             $+blocked[$name] || completion_roots[(Ie)$source_root] )); then
         unfunction -- "$name" 2>/dev/null
         autoload -Uz "$file"
       fi

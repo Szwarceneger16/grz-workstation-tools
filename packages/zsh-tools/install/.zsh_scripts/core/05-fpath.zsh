@@ -35,10 +35,11 @@
     )
   fi
 
+  # Explicit directory digests bypass directory-based fpath filtering too.
   for dir in "${fpath[@]}"; do
     skip=0
     for managed in "${remove_roots[@]}"; do
-      if [[ "${dir:a}" == "$managed" ]]; then
+      if [[ "${dir:a}" == "$managed" || "${dir:a}" == "$managed.zwc" ]]; then
         skip=1
         break
       fi
