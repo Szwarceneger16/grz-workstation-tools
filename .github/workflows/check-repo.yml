@@ -52,6 +52,9 @@ jobs:
           zsh -n scripts/audit-public-safety
           python3 -m py_compile scripts/sync-runner scripts/propose-runner-release scripts/dispatch-runner-release-checks
 
+      - name: Run zsh-tools completion regression
+        run: GRZ_REPO_ROOT="$GITHUB_WORKSPACE" packages/zsh-tools/tests/completion-init.sh
+
       - name: Run repository checks
         run: ./scripts/check-repo
 

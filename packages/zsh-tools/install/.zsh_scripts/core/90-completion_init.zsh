@@ -7,12 +7,19 @@ zstyle ':completion:*:*:-command-:*:commands'   ignored-patterns '*__impl'
 zstyle ':completion:*:*:-command-:*:*' tag-order 'functions:-non-comp *' functions
 zstyle ':completion:*:functions-non-comp' ignored-patterns '_*'
 
-# Initialize completion only when nobody has claimed it yet, or when our fpath
-# was added after an already-completed compinit and therefore needs one rescan.
-# If another completion owner appeared after 05-fpath, our paths were already
-# visible to it and a second compinit would only disturb its lifecycle.
-if (( ! $+functions[compdef] || ${_grz_zsh_tools_fpath_added_after_compinit:-0} )); then
+# Keep zsh-tools standalone, but do not unconditionally take over completion
+# after another owner has already initialized it.
+if (( ! $+functions[compdef] )); then
   autoload -Uz compinit
   compinit -i
-  typeset -gi _grz_zsh_tools_fpath_added_after_compinit=0
+elif [[ ${_comps[zshreloadcomp]-} != _zshreloadcomp ]]; then
+  # A completion owner exists, but its loaded state does not contain this
+  # package's sentinel mapping. This can happen when compinit -C trusts a dump
+  # created before the zsh-tools completion directories were installed.
+  #
+  # -D forces a full in-memory scan without reading or writing a dump file, so
+  # we repair the current session without taking ownership of the other
+  # manager's dump lifecycle.
+  autoload -Uz compinit
+  compinit -D -i
 fi
