@@ -53,11 +53,19 @@ The behavior is:
 2. If `compdef` already exists, the package does **not** run another full
    `compinit`. Instead it performs a bounded metadata scan of the same three
    runtime directories exposed by `05-fpath.zsh`.
-   Only `#compdef` declarations from those bounded directories are registered.
 
-The bounded registration mirrors `compinit`'s `#compdef` handling, including
-`compdef -n`, so an existing user or completion-manager mapping is not
-overwritten.
+Before bounded registration, the managed roots are passed to `compaudit`.
+Results are handled like `compinit -i`: insecure managed roots are removed from
+the live `fpath`, and insecure completion files are skipped. If `compaudit`
+cannot actually run, bounded registration fails closed and adds no mappings.
+
+Within the secure subset, files are processed in managed-`fpath` order and each
+basename is accepted only once, matching `compinit`'s `_i_test` shadowing
+behavior. An insecure copy does not claim the basename, so a later secure copy
+can still be registered. Only `#compdef` declarations are consumed.
+
+The bounded registration uses `compdef -n`, so an existing user or
+completion-manager mapping is not overwritten.
 
 This design handles a manager that loads a stale `compinit -C` dump without
 performing a full security check and traversal of every directory in `fpath`
@@ -67,10 +75,9 @@ directories are not rescanned.
 
 ## zshreloadcomp
 
-`zshreloadcomp` is intentionally stronger than an in-place `compinit`
-refresh.
+`zshreloadcomp` is intentionally stronger than an in-place `compinit` refresh.
 
-It removes:
+It considers:
 
 - the active `_comp_dumpfile`, when known,
 - `ZSH_COMPDUMP`, when configured,
@@ -78,12 +85,16 @@ It removes:
 - legacy `.zcompdump*` files under `$HOME`,
 - the default XDG cache dump.
 
-Dump cleanup is fail-closed: if a selected dump exists but cannot be removed,
-the command returns non-zero and does not replace the current shell.
+Regular dump files and symlinks are removed before restart. Explicit non-file
+dump sinks such as `/dev/null` are skipped because they do not persist stale
+completion state.
+
+Dump cleanup is fail-closed: if a selected removable dump file cannot be
+removed, the command returns non-zero and does not replace the current shell.
 
 After successful cleanup it replaces the current shell. A normal shell uses
-`exec zsh`; a login shell uses `exec -l zsh`, preserving the Zsh `LOGIN`
-mode and its login-only startup/logout file semantics.
+`exec zsh`; a login shell uses `exec -l zsh`, preserving the Zsh `LOGIN` mode
+and its login-only startup/logout file semantics.
 
 Because the shell process is replaced, non-exported session-only state is not
 guaranteed to survive. See `cmdhelp zshreloadcomp` for the user-facing behavior.
@@ -105,9 +116,9 @@ GRZ_REPO_ROOT="$PWD" packages/zsh-tools/tests/completion-init.sh
 
 The regression covers standalone initialization, bounded registration across
 the runtime completion directories, custom `ZSH_TOOLS_ROOT` fpath/autoload
-consistency, recovery from a stale external dump without a full `fpath`
-rescan, preservation of existing mappings, dump-removal failure, and
-login-shell preservation.
+consistency, stale external dumps without a full `fpath` rescan, security
+filtering, basename shadowing, preservation of existing mappings, `/dev/null`
+as a non-file dump sink, dump-removal failure, and login-shell preservation.
 
 The PR intentionally does not modify `.github/workflows/`; repository policy
 requires workflow changes to be isolated in a dedicated CI/workflow PR.

@@ -14,6 +14,12 @@ zshreloadcomp() {
   dumps+=("$zdotdir/.zcompdump" "$default_cache_dump")
 
   for dump in "${dumps[@]}"; do
+    # compinit accepts arbitrary -d paths, including non-file sinks such as
+    # /dev/null. There is no stale file to remove in that case.
+    if [[ -e "$dump" && ! -f "$dump" && ! -L "$dump" ]]; then
+      continue
+    fi
+
     if ! command rm -f -- "$dump" "$dump.zwc"; then
       print -u2 -- "zshreloadcomp: failed to remove completion dump: $dump"
       return 1

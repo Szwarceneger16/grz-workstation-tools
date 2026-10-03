@@ -12,17 +12,20 @@ zshreloadcomp [-h|--help]
 
 ## What it does
 
-The command removes completion dump files that can influence the next shell
-startup, including:
+The command removes regular completion dump files that can influence the next
+shell startup, including:
 
 - the active `_comp_dumpfile`, when available,
 - `ZSH_COMPDUMP`, when configured,
 - the default `${ZDOTDIR:-$HOME}/.zcompdump*` files,
 - the default XDG cache dump under `${XDG_CACHE_HOME:-$HOME/.cache}/zsh/compdump`.
 
-Every required removal is fail-closed. If an existing dump cannot be removed,
-`zshreloadcomp` returns an error and keeps the current shell instead of
-restarting into a state that could reuse the stale dump.
+An explicit non-file dump sink such as `/dev/null` is skipped: there is no
+persistent dump to invalidate.
+
+Every required file removal is fail-closed. If an existing dump file cannot be
+removed, `zshreloadcomp` returns an error and keeps the current shell instead
+of restarting into a state that could reuse the stale dump.
 
 After successful cleanup it replaces the current process with a new Zsh:
 

@@ -123,6 +123,87 @@ EOF
     fail "stale-dump recovery performed an unintended full fpath rescan"
 )
 
+# Bounded registration must preserve compinit's security filtering and basename
+# shadowing. A mocked compaudit result lets this regression deterministically
+# exercise insecure-root and insecure-file handling without privileged chown.
+(
+  emulate -LR zsh
+  set -euo pipefail
+  HOME="$tmp_root/security-and-shadow"
+  export HOME
+  unset ZSH_TOOLS_ROOT _comp_setup _comp_dumpfile
+  prepare_home "$HOME"
+  unfunction compdef compinit compaudit 2>/dev/null || true
+
+  local helpers="$HOME/.zsh_scripts/completion/helpers"
+  local functions="$HOME/.zsh_scripts/completion/functions"
+  local bin="$HOME/.zsh_scripts/completion/bin"
+
+  cat > "$helpers/_security_shadow" <<'EOF'
+#compdef insecure-shadow-command
+_security_shadow() { typeset -g SECURITY_SHADOW_SOURCE=insecure; }
+_security_shadow "$@"
+EOF
+
+  cat > "$functions/_security_shadow" <<'EOF'
+#compdef secure-shadow-command
+_security_shadow() { typeset -g SECURITY_SHADOW_SOURCE=secure; }
+_security_shadow "$@"
+EOF
+
+  cat > "$functions/_insecure_file_probe" <<'EOF'
+#compdef insecure-file-command
+_arguments '*:value:'
+EOF
+
+  cat > "$helpers/_dedup_probe" <<'EOF'
+#compdef dedup-first-command
+_dedup_probe() { typeset -g DEDUP_PROBE_SOURCE=helpers; }
+_dedup_probe "$@"
+EOF
+
+  cat > "$functions/_dedup_probe" <<'EOF'
+#compdef dedup-second-command
+_dedup_probe() { typeset -g DEDUP_PROBE_SOURCE=functions; }
+_dedup_probe "$@"
+EOF
+
+  autoload -Uz compinit
+  compinit -D -i
+
+  source "$fpath_file"
+
+  compaudit() {
+    _i_wdirs=("$helpers")
+    _i_wfiles=("$functions/_insecure_file_probe")
+    return 1
+  }
+
+  source "$completion_file"
+
+  [[ -z ${_comps[insecure-shadow-command]-} ]] ||
+    fail "bounded registration accepted a completion from an insecure root"
+  [[ "${_comps[secure-shadow-command]-}" == "_security_shadow" ]] ||
+    fail "secure duplicate did not replace an insecure-root copy"
+  [[ -z ${_comps[insecure-file-command]-} ]] ||
+    fail "bounded registration accepted an insecure completion file"
+
+  local fpath_entry
+  for fpath_entry in "${fpath[@]}"; do
+    [[ "$fpath_entry" == "$helpers" ]] &&
+      fail "insecure managed root remained in fpath"
+  done
+
+  [[ "${_comps[dedup-first-command]-}" == "_dedup_probe" ]] ||
+    fail "first secure basename was not registered"
+  [[ -z ${_comps[dedup-second-command]-} ]] ||
+    fail "shadowed duplicate basename registered an extra command"
+
+  unset DEDUP_PROBE_SOURCE
+  _dedup_probe
+  [[ "${DEDUP_PROBE_SOURCE:-}" == helpers ]] ||
+    fail "deduplicated completion autoloaded from the wrong managed root"
+)
 # A custom ZSH_TOOLS_ROOT must drive both fpath and bounded registration.
 # A mismatched default-runtime copy must not remain available for autoload.
 (
@@ -231,20 +312,51 @@ EOF
 [[ ! -e "$tmp_root/reload-cache/zsh/compdump" && ! -e "$tmp_root/reload-cache/zsh/compdump.zwc" ]] ||
   fail "default cache completion dump was not removed"
 
-# A deletion failure must keep the current shell and return non-zero.
+# A non-file dump sink such as /dev/null must not block a clean shell
+# replacement because there is no persistent dump file to unlink.
+(
+  emulate -LR zsh
+  set -euo pipefail
+  HOME="$tmp_root/non-file-sink-home"
+  export HOME
+  typeset -g _comp_dumpfile=/dev/null
+  mkdir -p "$HOME" "$tmp_root/non-file-sink-bin"
+
+  cat > "$tmp_root/non-file-sink-bin/zsh" <<EOF
+#!/bin/sh
+printf '%s\n' invoked > "$tmp_root/non-file-sink-invoked"
+EOF
+  chmod +x "$tmp_root/non-file-sink-bin/zsh"
+  PATH="$tmp_root/non-file-sink-bin:$PATH"
+  export PATH
+
+  source "$reload_file"
+  zshreloadcomp
+)
+
+[[ -f "$tmp_root/non-file-sink-invoked" ]] ||
+  fail "non-file compdump sink blocked shell replacement"
+
+# A real dump-file deletion failure must keep the current shell and return
+# non-zero. Use a fake rm to make the failure deterministic without privilege.
 if (
   emulate -LR zsh
   set -euo pipefail
   HOME="$tmp_root/reload-failure-home"
   export HOME
-  typeset -g _comp_dumpfile="$tmp_root/unremovable-dump"
-  mkdir -p "$HOME" "$_comp_dumpfile" "$tmp_root/failure-bin"
+  typeset -g _comp_dumpfile="$tmp_root/unremovable.dump"
+  mkdir -p "$HOME" "$tmp_root/failure-bin"
+  touch "$_comp_dumpfile"
 
+  cat > "$tmp_root/failure-bin/rm" <<'EOF'
+#!/bin/sh
+exit 1
+EOF
   cat > "$tmp_root/failure-bin/zsh" <<EOF
 #!/bin/sh
 printf '%s\n' invoked > "$tmp_root/reload-failure-invoked"
 EOF
-  chmod +x "$tmp_root/failure-bin/zsh"
+  chmod +x "$tmp_root/failure-bin/rm" "$tmp_root/failure-bin/zsh"
   PATH="$tmp_root/failure-bin:$PATH"
   export PATH
 
@@ -256,7 +368,6 @@ fi
 
 [[ ! -e "$tmp_root/reload-failure-invoked" ]] ||
   fail "zshreloadcomp replaced the shell after a dump deletion failure"
-
 # A login shell must remain a login shell after replacement. The initial login
 # reads .zprofile before the replacement marker is set; only the replacement
 # should therefore create the marker.
