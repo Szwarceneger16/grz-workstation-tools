@@ -7,18 +7,36 @@ zshreloadcomp() {
   local dump
   local zdotdir="${ZDOTDIR:-$HOME}"
   local default_cache_dump="${XDG_CACHE_HOME:-$HOME/.cache}/zsh/compdump"
-  local -aU dumps
+  local -aU dumps legacy_dumps
 
   [[ -n ${_comp_dumpfile:-} ]] && dumps+=("$_comp_dumpfile")
   [[ -n ${ZSH_COMPDUMP:-} ]] && dumps+=("$ZSH_COMPDUMP")
   dumps+=("$zdotdir/.zcompdump" "$default_cache_dump")
 
   for dump in "${dumps[@]}"; do
-    rm -f -- "$dump" "$dump.zwc"
+    if ! command rm -f -- "$dump" "$dump.zwc"; then
+      print -u2 -- "zshreloadcomp: failed to remove completion dump: $dump"
+      return 1
+    fi
   done
 
-  rm -f -- "$HOME"/.zcompdump*(N)
-  [[ "$zdotdir" == "$HOME" ]] || rm -f -- "$zdotdir"/.zcompdump*(N)
+  legacy_dumps=("$HOME"/.zcompdump*(N))
+  if (( ${#legacy_dumps[@]} )) && ! command rm -f -- "${legacy_dumps[@]}"; then
+    print -u2 -- "zshreloadcomp: failed to remove legacy completion dump(s) under $HOME"
+    return 1
+  fi
 
-  exec zsh
+  if [[ "$zdotdir" != "$HOME" ]]; then
+    legacy_dumps=("$zdotdir"/.zcompdump*(N))
+    if (( ${#legacy_dumps[@]} )) && ! command rm -f -- "${legacy_dumps[@]}"; then
+      print -u2 -- "zshreloadcomp: failed to remove completion dump(s) under $zdotdir"
+      return 1
+    fi
+  fi
+
+  if [[ -o login ]]; then
+    exec -l zsh
+  else
+    exec zsh
+  fi
 }

@@ -6,7 +6,7 @@ repo_root="${GRZ_REPO_ROOT:?GRZ_REPO_ROOT is required}"
 fpath_file="$repo_root/packages/zsh-tools/install/.zsh_scripts/core/05-fpath.zsh"
 completion_file="$repo_root/packages/zsh-tools/install/.zsh_scripts/core/90-completion_init.zsh"
 reload_file="$repo_root/packages/zsh-tools/install/.zsh_scripts/functions/zshreloadcomp.zsh"
-sentinel_file="$repo_root/packages/zsh-tools/install/.zsh_scripts/completion/functions/_zshreloadcomp"
+completion_functions="$repo_root/packages/zsh-tools/install/.zsh_scripts/completion/functions"
 
 fail() {
   print -u2 -- "not ok - $*"
@@ -15,21 +15,21 @@ fail() {
 
 prepare_home() {
   local home_dir="$1"
-  mkdir -p "$home_dir/.zsh_scripts/completion/functions"
-  ln -s "$sentinel_file" "$home_dir/.zsh_scripts/completion/functions/_zshreloadcomp"
+  mkdir -p "$home_dir/.zsh_scripts/completion"
+  ln -s "$completion_functions" "$home_dir/.zsh_scripts/completion/functions"
 }
 
 tmp_root="$(mktemp -d)"
 trap 'rm -rf -- "$tmp_root"' EXIT
 
-# Standalone zsh-tools must initialize completion and register its own sentinel.
+# Standalone zsh-tools must initialize completion and register its own mappings.
 (
   emulate -LR zsh
   set -euo pipefail
   HOME="$tmp_root/standalone"
   export HOME
+  unset ZSH_TOOLS_ROOT _comp_setup _comp_dumpfile
   prepare_home "$HOME"
-  unset _comp_setup _comp_dumpfile
   unfunction compdef compinit 2>/dev/null || true
 
   source "$fpath_file"
@@ -37,63 +37,78 @@ trap 'rm -rf -- "$tmp_root"' EXIT
 
   [[ -v _comp_setup ]] || fail "standalone compinit did not initialize completion"
   [[ "${_comps[zshreloadcomp]-}" == "_zshreloadcomp" ]] ||
-    fail "standalone compinit did not register the zsh-tools sentinel"
+    fail "standalone compinit did not register zshreloadcomp"
+  [[ "${_comps[pr-open-comments-copyq]-}" == "_pr-open-comments" ]] ||
+    fail "standalone compinit did not register a multi-command #compdef"
 )
 
-# If another owner already scanned the public fpath, 90-completion_init should
-# accept the registered sentinel and leave the state intact.
+# With an existing owner, register only this runtime directory. Existing
+# mappings must win because the bounded registration mirrors compinit's -n.
 (
   emulate -LR zsh
   set -euo pipefail
-  HOME="$tmp_root/already-owned"
+  HOME="$tmp_root/existing-owner"
   export HOME
+  unset ZSH_TOOLS_ROOT _comp_setup _comp_dumpfile
   prepare_home "$HOME"
-  unset _comp_setup _comp_dumpfile
   unfunction compdef compinit 2>/dev/null || true
 
-  source "$fpath_file"
   autoload -Uz compinit
   compinit -D -i
+  _comps[zshreloadcomp]="_user_override"
 
-  [[ "${_comps[zshreloadcomp]-}" == "_zshreloadcomp" ]] ||
-    fail "pre-existing completion owner did not register the sentinel"
-
+  source "$fpath_file"
   source "$completion_file"
 
-  [[ "${_comps[zshreloadcomp]-}" == "_zshreloadcomp" ]] ||
-    fail "registered sentinel was lost"
+  [[ "${_comps[zshreloadcomp]-}" == "_user_override" ]] ||
+    fail "bounded registration overwrote an existing completion mapping"
+  [[ "${_comps[pr-open-comments-copyq]-}" == "_pr-open-comments" ]] ||
+    fail "bounded registration did not add current runtime mappings"
 )
 
-# A later owner may trust a dump created before the zsh-tools fpath was exposed.
-# compinit -C must leave the sentinel absent, and 90-completion_init must repair
-# the current session with its dump-independent -D rescan.
+# A later owner may trust a dump created before the runtime completion directory
+# was exposed. Bounded registration must add only this runtime's metadata: an
+# unrelated fpath completion must remain absent, proving that no full rescan ran.
 (
   emulate -LR zsh
   set -euo pipefail
   HOME="$tmp_root/stale-dump"
   export HOME
+  unset ZSH_TOOLS_ROOT _comp_setup _comp_dumpfile
   prepare_home "$HOME"
-  unset _comp_setup _comp_dumpfile
   unfunction compdef compinit 2>/dev/null || true
 
   local stale_dump="$HOME/stale.zcompdump"
+  local unrelated_dir="$HOME/unrelated-completions"
+  mkdir -p "$unrelated_dir"
+  cat > "$unrelated_dir/_unrelated_probe" <<'EOF'
+#compdef unrelated-probe
+_arguments '*:value:'
+EOF
 
   autoload -Uz compinit
   compinit -d "$stale_dump" -i
 
   source "$fpath_file"
+  fpath=("$unrelated_dir" "$fpath[@]")
 
   compinit -C -d "$stale_dump" -i
   [[ -z ${_comps[zshreloadcomp]-} ]] ||
-    fail "stale dump unexpectedly contained the zsh-tools sentinel"
+    fail "stale dump unexpectedly contained zsh-tools mappings"
+  [[ -z ${_comps[unrelated-probe]-} ]] ||
+    fail "stale dump unexpectedly contained the unrelated mapping"
 
   source "$completion_file"
 
   [[ "${_comps[zshreloadcomp]-}" == "_zshreloadcomp" ]] ||
-    fail "stale-dump recovery did not register the zsh-tools sentinel"
+    fail "bounded stale-dump recovery did not register zsh-tools"
+  [[ "${_comps[pr-open-comments-copyq]-}" == "_pr-open-comments" ]] ||
+    fail "bounded stale-dump recovery missed a multi-command #compdef"
+  [[ -z ${_comps[unrelated-probe]-} ]] ||
+    fail "stale-dump recovery performed an unintended full fpath rescan"
 )
 
-# zshreloadcomp must remove the actual active dump, configured/default
+# Successful reload removes the actual active dump, configured/default
 # alternatives, and dumps under a non-HOME ZDOTDIR before replacing the shell.
 (
   emulate -LR zsh
@@ -106,9 +121,8 @@ trap 'rm -rf -- "$tmp_root"' EXIT
 
   typeset -g _comp_dumpfile="$tmp_root/active/custom.dump"
 
-  mkdir -p     "$HOME"     "$ZDOTDIR"     "$XDG_CACHE_HOME/zsh"     "${ZSH_COMPDUMP:h}"     "${_comp_dumpfile:h}"     "$tmp_root/fake-bin"
-
-  touch     "$_comp_dumpfile"     "$_comp_dumpfile.zwc"     "$ZSH_COMPDUMP"     "$ZSH_COMPDUMP.zwc"     "$HOME/.zcompdump-legacy"     "$ZDOTDIR/.zcompdump-current"     "$XDG_CACHE_HOME/zsh/compdump"     "$XDG_CACHE_HOME/zsh/compdump.zwc"
+  mkdir -p "$HOME" "$ZDOTDIR" "$XDG_CACHE_HOME/zsh" "${ZSH_COMPDUMP:h}" "${_comp_dumpfile:h}" "$tmp_root/fake-bin"
+  touch "$_comp_dumpfile" "$_comp_dumpfile.zwc" "$ZSH_COMPDUMP" "$ZSH_COMPDUMP.zwc" "$HOME/.zcompdump-legacy" "$ZDOTDIR/.zcompdump-current" "$XDG_CACHE_HOME/zsh/compdump" "$XDG_CACHE_HOME/zsh/compdump.zwc"
 
   cat > "$tmp_root/fake-bin/zsh" <<EOF
 #!/bin/sh
@@ -134,5 +148,49 @@ EOF
   fail "ZDOTDIR completion dump was not removed"
 [[ ! -e "$tmp_root/reload-cache/zsh/compdump" && ! -e "$tmp_root/reload-cache/zsh/compdump.zwc" ]] ||
   fail "default cache completion dump was not removed"
+
+# A deletion failure must keep the current shell and return non-zero.
+if (
+  emulate -LR zsh
+  set -euo pipefail
+  HOME="$tmp_root/reload-failure-home"
+  export HOME
+  typeset -g _comp_dumpfile="$tmp_root/unremovable-dump"
+  mkdir -p "$HOME" "$_comp_dumpfile" "$tmp_root/failure-bin"
+
+  cat > "$tmp_root/failure-bin/zsh" <<EOF
+#!/bin/sh
+printf '%s\n' invoked > "$tmp_root/reload-failure-invoked"
+EOF
+  chmod +x "$tmp_root/failure-bin/zsh"
+  PATH="$tmp_root/failure-bin:$PATH"
+  export PATH
+
+  source "$reload_file"
+  zshreloadcomp
+); then
+  fail "zshreloadcomp succeeded despite a dump deletion failure"
+fi
+
+[[ ! -e "$tmp_root/reload-failure-invoked" ]] ||
+  fail "zshreloadcomp replaced the shell after a dump deletion failure"
+
+# A login shell must remain a login shell after replacement. The initial login
+# reads .zprofile before the replacement marker is set; only the replacement
+# should therefore create the marker.
+login_home="$tmp_root/login-home"
+login_zdot="$tmp_root/login-zdot"
+login_marker="$tmp_root/login-preserved"
+mkdir -p "$login_home" "$login_zdot"
+cat > "$login_zdot/.zprofile" <<'EOF'
+if [[ ${ZSHRELOADCOMP_REPLACED:-0} == 1 ]]; then
+  print -r -- login > "$ZSHRELOADCOMP_LOGIN_MARKER"
+fi
+EOF
+
+HOME="$login_home" ZDOTDIR="$login_zdot" RELOAD_FILE="$reload_file" ZSHRELOADCOMP_LOGIN_MARKER="$login_marker" zsh -l -c 'source "$RELOAD_FILE"; export ZSHRELOADCOMP_REPLACED=1; zshreloadcomp' </dev/null
+
+[[ -f "$login_marker" ]] ||
+  fail "zshreloadcomp did not preserve login-shell mode"
 
 print -- "ok - zsh completion lifecycle"

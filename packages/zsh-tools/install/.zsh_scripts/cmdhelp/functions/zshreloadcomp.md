@@ -20,14 +20,17 @@ startup, including:
 - the default `${ZDOTDIR:-$HOME}/.zcompdump*` files,
 - the default XDG cache dump under `${XDG_CACHE_HOME:-$HOME/.cache}/zsh/compdump`.
 
-It then runs:
+Every required removal is fail-closed. If an existing dump cannot be removed,
+`zshreloadcomp` returns an error and keeps the current shell instead of
+restarting into a state that could reuse the stale dump.
 
-```bash
-exec zsh
-```
+After successful cleanup it replaces the current process with a new Zsh:
 
-The terminal stays open, but the current Zsh process is replaced and normal
-shell startup runs again.
+- a normal interactive Zsh uses `exec zsh`,
+- a login Zsh uses `exec -l zsh` so login-shell startup/logout semantics are
+  preserved.
+
+The terminal stays open, but normal shell startup runs again.
 
 ## Effect on shell state
 
@@ -37,6 +40,9 @@ The current directory and exported environment are preserved by `exec`, but
 ad-hoc shell-local state that is not recreated by startup files can be lost,
 including non-exported variables, temporary functions, aliases, and other
 session-only changes.
+
+When invoked from a login shell, the replacement remains a login shell and
+therefore continues to use the login-only Zsh startup/shutdown files.
 
 ## When to use it
 

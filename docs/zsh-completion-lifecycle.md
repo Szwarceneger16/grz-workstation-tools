@@ -22,32 +22,28 @@ The relevant source files are installed through GNU Stow at:
 
 ## Initialization contract
 
-`05-fpath.zsh` exposes the public completion directories before
-`90-completion_init.zsh` decides whether any initialization work is required.
-
-`90-completion_init.zsh` uses the public `zshreloadcomp` completion mapping as
-a sentinel:
-
-```text
-_comps[zshreloadcomp] == _zshreloadcomp
-```
+`05-fpath.zsh` exposes the public runtime completion directories before
+`90-completion_init.zsh` decides how to register them.
 
 The behavior is:
 
-1. If `compdef` does not exist, no completion owner has initialized standard
-   Zsh completion yet. The package runs `compinit -i` so that
-   `grz-workstation-tools` remains usable standalone.
-2. If `compdef` exists and the sentinel mapping is present, the package does
-   not run another `compinit`.
-3. If `compdef` exists but the sentinel mapping is missing, the loaded
-   completion state did not include this package. The package runs
-   `compinit -D -i`.
+1. If `compdef` does not exist, no standard Zsh completion owner is available
+   yet. The package runs `compinit -i`, keeping `grz-workstation-tools`
+   usable standalone.
+2. If `compdef` already exists, the package does **not** run another full
+   `compinit`. Instead it performs a bounded metadata scan of
+   `${ZSH_TOOLS_ROOT:-$HOME/.zsh_scripts}/completion/functions` and registers
+   only the `#compdef` declarations found there.
 
-The `-D` path deliberately performs a full in-memory scan without reading or
-writing a completion dump. This repairs the current session while leaving the
-other completion owner's dump lifecycle alone. It also handles the case where a
-later owner used `compinit -C` with a dump created before the zsh-tools
-completion directory existed.
+The bounded registration mirrors `compinit`'s `#compdef` handling, including
+`compdef -n`, so an existing user or completion-manager mapping is not
+overwritten.
+
+This design handles a manager that loads a stale `compinit -C` dump without
+performing a full security check and traversal of every directory in `fpath`
+on each startup. Current runtime `#compdef` declarations are registered
+directly even when an external dump remains stale, and unrelated `fpath`
+directories are not rescanned.
 
 ## zshreloadcomp
 
@@ -62,28 +58,37 @@ It removes:
 - legacy `.zcompdump*` files under `$HOME`,
 - the default XDG cache dump.
 
-It then replaces the current shell with `exec zsh`. This reruns normal shell
-startup in a clean process and avoids sourcing the complete shell configuration
-again inside an already-initialized Zsh process.
+Dump cleanup is fail-closed: if a selected dump exists but cannot be removed,
+the command returns non-zero and does not replace the current shell.
+
+After successful cleanup it replaces the current shell. A normal shell uses
+`exec zsh`; a login shell uses `exec -l zsh`, preserving the Zsh `LOGIN`
+mode and its login-only startup/logout file semantics.
 
 Because the shell process is replaced, non-exported session-only state is not
 guaranteed to survive. See `cmdhelp zshreloadcomp` for the user-facing behavior.
 
 ## Validation
 
-The package regression test is:
+The package regression test is discoverable through the normal package test
+runner:
 
 ```bash
 ./run.sh test zsh-tools
 ```
 
-The isolated test can also be run directly from the repository checkout:
+It can also be run directly from a repository checkout:
 
 ```bash
 GRZ_REPO_ROOT="$PWD" packages/zsh-tools/tests/completion-init.sh
 ```
 
-The repository CI runs the isolated regression test after installing Zsh.
+The regression covers standalone initialization, bounded registration with an
+existing completion owner, recovery from a stale external dump without a full
+`fpath` rescan, dump-removal failure, and login-shell preservation.
+
+The PR intentionally does not modify `.github/workflows/`; repository policy
+requires workflow changes to be isolated in a dedicated CI/workflow PR.
 
 ## Activation
 
