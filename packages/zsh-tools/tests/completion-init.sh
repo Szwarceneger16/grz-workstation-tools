@@ -29,6 +29,100 @@ EOF
 tmp_root="$(mktemp -d)"
 trap 'rm -rf -- "$tmp_root"' EXIT
 
+# Exercise the actual rc.d ordering, with helpers pinned before the pre-loader
+# and aliases reintroduced by an owner afterwards. Stow-like directory links,
+# physical/logical writable parents, explicit digests and alias-only digests
+# share the same identity. A secure root becomes available only after auditing.
+for runtime_case in default custom; do
+  for root_kind in helpers functions bin; do
+    for security_case in secure root physical-parent logical-parent; do
+      (
+        emulate -LR zsh
+        set -euo pipefail
+        HOME="$tmp_root/pre-post-$runtime_case-$root_kind-$security_case"
+        export HOME
+        unset ZSH_TOOLS_ROOT _comp_setup _comp_dumpfile
+        unfunction compdef compinit compaudit compdump compinstall 2>/dev/null || true
+        local runtime_root="$HOME/.zsh_scripts"
+        if [[ "$runtime_case" == custom ]]; then
+          ZSH_TOOLS_ROOT="$HOME/custom-runtime"
+          export ZSH_TOOLS_ROOT
+          runtime_root="$ZSH_TOOLS_ROOT"
+        fi
+        mkdir -p "$runtime_root/core" "$runtime_root/completion/"{helpers,functions,bin} "$HOME/physical-parent/root" "$HOME/aliases"
+        local core_file
+        for core_file in 00-paths.zsh 04-completion-paths.zsh 05-fpath.zsh 90-completion_init.zsh; do
+          ln -s "$repo_root/packages/zsh-tools/install/.zsh_scripts/core/$core_file" "$runtime_root/core/$core_file"
+        done
+        local selected_root="$runtime_root/completion/$root_kind"
+        rmdir "$selected_root"
+        ln -s "$HOME/physical-parent/root" "$selected_root"
+        local dir_alias="$HOME/aliases/directory" digest_alias="$HOME/aliases/digest.zwc"
+        ln -s "$selected_root" "$dir_alias"
+        print -rl -- '#compdef pre-probe' 'typeset -g PRE_PROBE_SOURCE=audited' > "$selected_root/_pre_probe"
+        print -rl -- '#autoload' 'typeset -g DELETED_ALIAS_EXECUTED=yes' > "$selected_root/_alias_deleted"
+        local helper_name
+        for helper_name in compinit compaudit compdump compinstall; do
+          print -rl -- 'typeset -g UNTRUSTED_HELPER_EXECUTED=yes' 'return 2' > "$selected_root/$helper_name"
+        done
+        zcompile -Uz "$selected_root.zwc" "$selected_root/"{_pre_probe,compinit,compaudit,compdump,compinstall}
+        ln -s "$selected_root.zwc" "$digest_alias"
+        # This digest belongs to the alias spelling, not to the audited root.
+        zcompile -Uz "$dir_alias.zwc" "$selected_root/_alias_deleted"
+        fpath=("$dir_alias.zwc" "$fpath[@]")
+        autoload -Uz _alias_deleted
+        _alias_deleted
+        unset DELETED_ALIAS_EXECUTED
+        rm -- "$selected_root/_alias_deleted"
+        autoload -Uz "$dir_alias/compinit" "$digest_alias/compaudit" "$dir_alias/compdump" "$digest_alias/compinstall"
+        # A file link can hide a helper's managed origin in functions_source.
+        print -r -- 'compaudit() { typeset -g UNTRUSTED_HELPER_EXECUTED=yes; return 2; }' > "$HOME/elsewhere-compaudit"
+        rm -- "$selected_root/compaudit"
+        ln -s "$HOME/elsewhere-compaudit" "$selected_root/compaudit"
+        source "$HOME/elsewhere-compaudit"
+        fpath=("$dir_alias" "$digest_alias" "$selected_root" "$selected_root.zwc" "$fpath[@]")
+        case "$security_case" in
+          root) chmod 777 "${selected_root:A}" ;;
+          physical-parent) chmod 777 "$HOME/physical-parent" ;;
+          logical-parent) chmod 777 "$runtime_root/completion" ;;
+        esac
+        source "$repo_root/packages/zsh-tools/install/.config/zsh/rc.d/20-grz-workstation-tools-pre.zsh"
+        local entry
+        for entry in "$dir_alias" "$digest_alias" "$dir_alias.zwc" "$selected_root.zwc" "$runtime_root/completion/"{helpers,functions,bin}; do
+          (( ! fpath[(Ie)$entry] )) || fail "pre-loader exposed an unaudited completion path"
+        done
+        autoload -Uz compinit
+        compinit -D -i || fail "external owner could not initialize from trusted fpath"
+        [[ -z ${UNTRUSTED_HELPER_EXECUTED-} ]] || fail "an initialization helper ran before auditing"
+        # An owner can add aliases after the pre-loader. The post-loader must
+        # exclude them before resolving its auditor, and not restore aliases.
+        fpath=("$dir_alias" "$digest_alias" "$dir_alias.zwc" "$selected_root.zwc" "$fpath[@]")
+        unfunction compaudit
+        autoload -Uz "$digest_alias/compaudit"
+        _comps[deleted-alias]=_alias_deleted
+        source "$repo_root/packages/zsh-tools/install/.config/zsh/rc.d/60-grz-workstation-tools-post.zsh"
+        [[ -z ${UNTRUSTED_HELPER_EXECUTED-} ]] || fail "post-loader resolved an auditor through a managed alias"
+        for entry in "$dir_alias" "$digest_alias" "$dir_alias.zwc" "$selected_root.zwc"; do
+          (( ! fpath[(Ie)$entry] )) || fail "post-loader retained a managed alias or explicit digest"
+        done
+        [[ -z ${_comps[deleted-alias]-} ]] || fail "post-loader retained an unaudited alias-only digest mapping"
+        _alias_deleted && fail "a deleted alias-only digest function survived cleanup"
+        [[ -z ${DELETED_ALIAS_EXECUTED-} ]] || fail "an unaudited alias-only digest executed"
+        if [[ "$security_case" == secure ]]; then
+          [[ ${_comps[pre-probe]-} == _pre_probe ]] || fail "secure completion was not registered after audit"
+          _pre_probe
+          [[ ${PRE_PROBE_SOURCE-} == audited ]] || fail "secure completion did not use its audited file"
+        else
+          (( ! fpath[(Ie)$selected_root] )) || fail "post-loader exposed an insecure root/parent"
+          [[ -z ${_comps[pre-probe]-} && -z ${_comps[deleted-alias]-} ]] || fail "post-loader retained an insecure alias mapping"
+          _alias_deleted && fail "deleted alias-digest function survived quarantine"
+          [[ -z ${DELETED_ALIAS_EXECUTED-} ]] || fail "deleted alias-digest code executed after quarantine"
+        fi
+      )
+    done
+  done
+done
+
 # Standalone zsh-tools must initialize completion and register mappings across
 # the runtime completion directories.
 (
@@ -40,8 +134,15 @@ trap 'rm -rf -- "$tmp_root"' EXIT
   prepare_home "$HOME"
   unfunction compdef compinit 2>/dev/null || true
 
+  fields=(owner-metadata)
+  reply=(owner-reply)
+  REPLY=owner-result
+
   source "$fpath_file"
   source "$completion_file"
+
+  [[ ${fields[*]} == owner-metadata && ${reply[*]} == owner-reply && $REPLY == owner-result ]] ||
+    fail "completion initialization clobbered owner metadata variables"
 
   [[ -v _comp_setup ]] || fail "standalone compinit did not initialize completion"
   [[ "${_comps[zshreloadcomp]-}" == "_zshreloadcomp" ]] ||
@@ -51,6 +152,42 @@ trap 'rm -rf -- "$tmp_root"' EXIT
   [[ "${_comps[runtime-bin-probe]-}" == "_runtime_bin_probe" ]] ||
     fail "standalone compinit did not register completion/bin"
 )
+
+# Standalone initialization must keep trusted helpers even when every managed
+# root passes compaudit and contains conflicting directory/digest helper files.
+for runtime_case in default custom; do
+  (
+    emulate -LR zsh
+    set -euo pipefail
+    HOME="$tmp_root/standalone-trusted-$runtime_case"
+    export HOME
+    unset ZSH_TOOLS_ROOT _comp_setup _comp_dumpfile
+    unfunction compdef compinit compaudit compdump compinstall 2>/dev/null || true
+    local runtime_root="$HOME/.zsh_scripts"
+    if [[ "$runtime_case" == custom ]]; then
+      ZSH_TOOLS_ROOT="$HOME/custom-runtime"
+      export ZSH_TOOLS_ROOT
+      runtime_root="$ZSH_TOOLS_ROOT"
+    fi
+    local helpers="$runtime_root/completion/helpers"
+    mkdir -p "$helpers" "$runtime_root/completion/"{functions,bin}
+    print -rl -- '#compdef trusted-init-probe' 'return 0' > "$helpers/_trusted_init_probe"
+    local helper
+    for helper in compinit compaudit compdump compinstall; do
+      print -rl -- 'typeset -g UNTRUSTED_HELPER_EXECUTED=yes' 'return 2' > "$helpers/$helper"
+    done
+    zcompile -Uz "$helpers.zwc" "$helpers/"{compinit,compaudit,compdump,compinstall}
+    source "$fpath_file"
+    source "$completion_file"
+    [[ ${_comps[trusted-init-probe]-} == _trusted_init_probe ]] || fail "standalone trusted initialization failed to register an audited completion"
+    [[ -z ${UNTRUSTED_HELPER_EXECUTED-} ]] || fail "standalone initialization executed a managed helper"
+    zmodload zsh/parameter
+    for helper in compinit compaudit compdump compinstall; do
+      [[ ${functions_source[$helper]-} != "$helpers/"* && ${functions_source[$helper]-} != "$helpers.zwc/"* ]] ||
+        fail "initialization left a helper pinned to a managed provider"
+    done
+  )
+done
 
 # With an existing owner, bounded registration must cover all runtime completion
 # directories. Existing mappings must win because it mirrors compinit's -n.
@@ -277,6 +414,84 @@ EOF
     fail "secure duplicate resolved to an earlier insecure file"
 )
 
+# An insecure access path must not poison an independently audited safe path
+# to the same source file. Quarantine cached code, then pin the secure duplicate.
+(
+  emulate -LR zsh
+  set -euo pipefail
+  HOME="$tmp_root/shared-source-duplicate"
+  export HOME
+  unset ZSH_TOOLS_ROOT _comp_setup _comp_dumpfile
+  local bin="$HOME/.zsh_scripts/completion/bin"
+  local function_dir="$HOME/.zsh_scripts/completion/functions"
+  mkdir -p "$bin" "$function_dir" "$HOME/.zsh_scripts/completion/helpers"
+  print -rl -- '#compdef shared-source-probe' 'typeset -g SHARED_SOURCE=safe' > "$function_dir/_shared_source"
+  ln -s "$function_dir/_shared_source" "$bin/_shared_source"
+  autoload -Uz compinit
+  compinit -D -i
+  source "$fpath_file"
+  autoload -Uz "$bin/_shared_source"
+  _shared_source
+  unset SHARED_SOURCE
+  _comps[shared-source-probe]=_shared_source
+  compaudit() {
+    _i_wdirs=("$bin")
+    _i_wfiles=()
+    return 1
+  }
+  source "$completion_file"
+  [[ ${_comps[shared-source-probe]-} == _shared_source ]] || fail "an insecure alias poisoned a secure duplicate's registration"
+  _shared_source
+  [[ ${SHARED_SOURCE-} == safe ]] || fail "an insecure alias poisoned a secure duplicate's autoload"
+)
+
+# File-level findings and loaded implementations may use different spellings.
+# Include companion links whose target basename differs from the source file.
+for finding_kind in file companion root; do
+  for finding_spelling in logical physical; do
+    (
+      emulate -LR zsh
+      set -euo pipefail
+      HOME="$tmp_root/file-alias-$finding_kind-$finding_spelling"
+      export HOME
+      unset ZSH_TOOLS_ROOT _comp_setup _comp_dumpfile
+      local helpers="$HOME/.zsh_scripts/completion/helpers"
+      local target="$HOME/elsewhere/_origin"
+      local companion="$HOME/elsewhere/compiled-cache.zwc"
+      mkdir -p "$helpers" "$HOME/.zsh_scripts/completion/"{functions,bin} "${target:h}"
+      print -rl -- '#compdef linked-probe' '_physical_alias() { typeset -g UNSAFE_ALIAS_EXECUTED=yes; }' > "$target"
+      ln -s "$target" "$helpers/_link_probe"
+      zcompile -Uz "$companion" "$helpers/_link_probe"
+      ln -s "$companion" "$helpers/_link_probe.zwc"
+      autoload -Uz compinit
+      compinit -D -i
+      source "$fpath_file"
+      source "$target"
+      _comps[physical-alias]=_physical_alias
+      _comps[linked-probe]=_link_probe
+      autoload -Uz "$helpers/_link_probe"
+      compaudit() {
+        _i_wdirs=()
+        _i_wfiles=()
+        case "$finding_kind" in
+          root) _i_wdirs=("$helpers") ;;
+          file) _i_wfiles=("$helpers/_link_probe") ;;
+          companion) _i_wfiles=("$helpers/_link_probe.zwc") ;;
+        esac
+        if [[ "$finding_spelling" == physical ]]; then
+          _i_wfiles=("${(@)_i_wfiles:A}")
+        fi
+        return 1
+      }
+      source "$completion_file"
+      [[ -z ${_comps[physical-alias]-} && -z ${_comps[linked-probe]-} ]] || fail "file identity filtering retained an insecure alias mapping"
+      _physical_alias && fail "a physical source alias escaped file/companion quarantine"
+      _link_probe && fail "a symlinked file/companion escaped quarantine"
+      [[ -z ${UNSAFE_ALIAS_EXECUTED-} ]] || fail "insecure symlink-target code executed"
+    )
+  done
+done
+
 # Parent and digest findings invalidate roots too. Audit failure must quarantine
 # all managed roots and cached state, rather than restore unsafe fpath entries.
 for audit_case in parent digest unavailable; do
@@ -321,6 +536,42 @@ for audit_case in parent digest unavailable; do
   )
 done
 
+# A real missing helper must not abort before quarantine. autoload -R aborts
+# command processing when lookup fails, unlike a resolved-or-deferred -r stub.
+for missing_owner in standalone external; do
+  (
+    emulate -LR zsh
+    set -euo pipefail
+    HOME="$tmp_root/missing-helper-$missing_owner"
+    export HOME
+    unset ZSH_TOOLS_ROOT _comp_setup _comp_dumpfile
+    local helpers="$HOME/.zsh_scripts/completion/helpers"
+    mkdir -p "$helpers" "$HOME/.zsh_scripts/completion/"{functions,bin}
+    print -r -- 'typeset -g MISSING_AUDIT_EXECUTED=yes' > "$helpers/_missing_audit_probe"
+    unfunction compdef compinit compaudit compdump compinstall 2>/dev/null || true
+    if [[ "$missing_owner" == external ]]; then
+      autoload -Uz compinit
+      compinit -D -i
+      _comps[missing-audit-probe]=_missing_audit_probe
+    fi
+    autoload -Uz "$helpers/_missing_audit_probe"
+    _missing_audit_probe
+    unset MISSING_AUDIT_EXECUTED
+    rm -- "$helpers/_missing_audit_probe"
+    unfunction compaudit compinit compdump compinstall 2>/dev/null || true
+    fpath=("$helpers")
+    local init_status=0
+    source "$completion_file" 2> "$HOME/init-error.log" || init_status=$?
+    if [[ "$missing_owner" == standalone ]]; then
+      (( init_status != 0 )) || fail "missing standalone compinit did not report an initialization error"
+    fi
+    (( ! fpath[(Ie)$helpers] )) || fail "a missing auditor restored unchecked fpath"
+    [[ -z ${_comps[missing-audit-probe]-} ]] || fail "a missing auditor left cached dispatch live"
+    _missing_audit_probe && fail "missing helper lookup aborted before loaded-function quarantine"
+    [[ -z ${MISSING_AUDIT_EXECUTED-} ]] || fail "unchecked code executed after missing helper lookup"
+  )
+done
+
 # Exercise upstream compaudit as well as deterministic mocked ownership results.
 # A world-writable managed root must be rejected for both initialization owners.
 for completion_owner in standalone external; do
@@ -335,7 +586,8 @@ for completion_owner in standalone external; do
     print -rl -- '#compdef writable-probe' 'typeset -g UNSAFE_EXECUTED=yes' > "$helpers/_writable_probe"
     unfunction compdef compinit compaudit 2>/dev/null || true
     if [[ "$completion_owner" == external ]]; then
-      source "$fpath_file"
+      # Reproduce a dump created by a previous startup before paths were deferred.
+      fpath=("$helpers" "$fpath[@]")
       autoload -Uz compinit
       compinit -d "$HOME/owner.dump" -i
       chmod 777 "$helpers"
@@ -519,6 +771,10 @@ EOF
   zmodload zsh/parameter
   [[ ${functions_source[_digest_refresh]:a:h} == "$default_functions.zwc" ]] || fail "fixture did not load a default-runtime digest function"
   unset DIGEST_REFRESH_SOURCE
+  print -rl -- '#compdef stale-default-only' 'typeset -g STALE_DEFAULT_EXECUTED=yes' > "$default_functions/_stale_default_only"
+  autoload -Uz "$default_functions/_stale_default_only"
+  _stale_default_only
+  unset STALE_DEFAULT_EXECUTED
 
   # Simulate stale default-runtime fpath entries left by earlier startup state.
   fpath=(
@@ -555,6 +811,9 @@ EOF
   [[ "${_comps[custom-root-probe]-}" == "_custom_root_probe" ]] ||
     fail "custom runtime #compdef was not registered"
 
+  [[ -z ${_comps[stale-default-only]-} ]] || fail "a default-only completion retained cached dispatch with a custom root"
+  _stale_default_only && fail "a default-only loaded function survived custom runtime selection"
+  [[ -z ${STALE_DEFAULT_EXECUTED-} ]] || fail "a default-only completion executed with a custom runtime"
   _digest_refresh
   [[ ${DIGEST_REFRESH_SOURCE-} == custom ]] || fail "custom runtime did not replace a loaded default-runtime digest function"
   unset CUSTOM_ROOT_PROBE_SOURCE
@@ -704,6 +963,56 @@ for retained in dump-types-sink dump-types-home/.zcompdump-fifo dump-types-zdot/
 done
 for removed in dump-types-sink.zwc dump-types-active dump-types-cache/zsh/compdump dump-types-home/.zcompdump-regular dump-types-zdot/.zcompdump-regular dump-types-home/.zcompdump-link-dir dump-types-zdot/.zcompdump-link-dangling; do
   [[ ! -e "$tmp_root/$removed" && ! -L "$tmp_root/$removed" ]] || fail "reload missed a file or symlink candidate"
+done
+
+# Relative dump/cache configuration has no reliable original working directory.
+# Validate the whole batch before deleting an absolute candidate or restarting.
+# The active-path case uses actual compinit -d followed by a directory change.
+for relative_source in active configured zdot cache; do
+  (
+    emulate -LR zsh
+    set -euo pipefail
+    HOME="$tmp_root/relative-$relative_source/home"
+    export HOME
+    unset ZDOTDIR ZSH_COMPDUMP XDG_CACHE_HOME _comp_dumpfile
+    local origin="$tmp_root/relative-$relative_source/origin"
+    local destination="$tmp_root/relative-$relative_source/destination"
+    mkdir -p "$HOME" "$origin" "$destination/cache/zsh" "$destination/zdot" "$destination/bin"
+    touch "$HOME/.zcompdump" "$origin/cache.dump" "$origin/cache.dump.zwc" "$destination/cache.dump" "$destination/cache.dump.zwc" "$destination/cache/zsh/compdump" "$destination/cache/zsh/compdump.zwc" "$destination/zdot/.zcompdump"
+    if [[ "$relative_source" == active ]]; then
+      cd "$origin"
+      autoload -Uz compinit
+      compinit -i -d cache.dump
+      [[ $_comp_dumpfile == cache.dump ]] || fail "fixture did not retain compinit's relative dump argument"
+    else
+      _comp_dumpfile="$HOME/.zcompdump"
+      case "$relative_source" in
+        configured) ZSH_COMPDUMP=cache.dump ;;
+        zdot) ZDOTDIR=zdot ;;
+        cache) XDG_CACHE_HOME=cache ;;
+      esac
+    fi
+    cd "$destination"
+    cat > "$destination/bin/zsh" <<'EOF'
+#!/bin/sh
+printf '%s\n' invoked > reload-invoked
+EOF
+    chmod +x "$destination/bin/zsh"
+    PATH="$destination/bin:$PATH"
+    source "$reload_file"
+    if zshreloadcomp 2> "$destination/error.log"; then
+      fail "reload accepted an ambiguous relative dump/cache path"
+    fi
+    [[ ! -e "$destination/reload-invoked" ]] || fail "relative path error replaced the shell"
+    [[ "$(< "$destination/error.log")" == *'relative dump path'* ]] || fail "relative path error did not explain its cause"
+    local retained=''
+    for retained in "$HOME/.zcompdump" "$origin/cache.dump" "$origin/cache.dump.zwc" "$destination/cache.dump" "$destination/cache.dump.zwc" "$destination/cache/zsh/compdump" "$destination/cache/zsh/compdump.zwc" "$destination/zdot/.zcompdump"; do
+      [[ -f "$retained" ]] || fail "relative path handling deleted a dump candidate"
+    done
+    touch "$destination/validated"
+  )
+  [[ -f "$tmp_root/relative-$relative_source/destination/validated" && ! -e "$tmp_root/relative-$relative_source/destination/reload-invoked" ]] ||
+    fail "relative path handling replaced the shell before validation"
 done
 
 # A real dump-file deletion failure must keep the current shell and return

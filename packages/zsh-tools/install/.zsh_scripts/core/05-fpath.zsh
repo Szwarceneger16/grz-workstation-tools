@@ -1,52 +1,33 @@
 # ~/.zsh_scripts/core/05-fpath.zsh
+source "${${(%):-%x}:A:h}/04-completion-paths.zsh" || return $?
 
 () {
   emulate -L zsh
-  local runtime_root="${ZSH_TOOLS_ROOT:-$HOME/.zsh_scripts}"
-  local default_root="$HOME/.zsh_scripts"
-  runtime_root="${runtime_root:a}"
-  default_root="${default_root:a}"
-  local dir managed
-  local -i skip
-  local -a runtime_completion_roots remove_roots remaining_fpath
+  setopt typesetsilent
+  local dir name source_file REPLY
+  local -a reply managed_paths remaining_fpath
+  __grz_completion_paths
+  managed_paths=("${reply[@]}")
 
-  runtime_completion_roots=(
-    "$runtime_root/completion/helpers"
-    "$runtime_root/completion/functions"
-    "$runtime_root/completion/bin"
-  )
-
-  remove_roots=(
-    "${runtime_completion_roots[@]}"
-    "$runtime_root/completion"
-    "$runtime_root/.completion"
-  )
-
-  # When a custom runtime root is selected, also remove the default zsh-tools
-  # completion paths from any pre-existing fpath. Otherwise a missing or stale
-  # function under the custom root could be autoloaded from the wrong runtime.
-  if [[ "$runtime_root" != "$default_root" ]]; then
-    remove_roots+=(
-      "$default_root/completion/helpers"
-      "$default_root/completion/functions"
-      "$default_root/completion/bin"
-      "$default_root/completion"
-      "$default_root/.completion"
-    )
-  fi
-
-  # Explicit directory digests bypass directory-based fpath filtering too.
+  # An external owner initializes between the pre- and post-loader. Keep every
+  # managed directory/digest (including aliases and stale default paths) out of
+  # that owner's autoload search until 90-completion_init audits them.
   for dir in "${fpath[@]}"; do
-    skip=0
-    for managed in "${remove_roots[@]}"; do
-      if [[ "${dir:a}" == "$managed" || "${dir:a}" == "$managed.zwc" ]]; then
-        skip=1
-        break
-      fi
-    done
-    (( skip )) || remaining_fpath+=("$dir")
+    __grz_completion_match_root "$dir" "${managed_paths[@]}" ||
+      remaining_fpath+=("$dir")
   done
-
   typeset -gaU fpath
-  fpath=("${runtime_completion_roots[@]}" "${remaining_fpath[@]}")
+  fpath=("${remaining_fpath[@]}")
+
+  # A previous autoload may already be pinned to a managed helper. Removing its
+  # fpath entry alone does not revoke that source. Keep explicit owner helpers
+  # outside the runtime; unpinned stubs will resolve through the cleaned fpath.
+  zmodload zsh/parameter
+  for name in compinit compaudit compdump compinstall; do
+    source_file="${functions_source[$name]-}"
+    [[ -n "$source_file" ]] || continue
+    if __grz_completion_match_helper_source "$source_file" "${managed_paths[@]}"; then
+      unfunction -- "$name"
+    fi
+  done
 }

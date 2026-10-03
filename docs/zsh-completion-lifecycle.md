@@ -15,6 +15,7 @@ The relevant source files are installed through GNU Stow at:
 
 | Repository source | Installed target |
 |---|---|
+| `packages/zsh-tools/install/.zsh_scripts/core/04-completion-paths.zsh` | `~/.zsh_scripts/core/04-completion-paths.zsh` |
 | `packages/zsh-tools/install/.zsh_scripts/core/05-fpath.zsh` | `~/.zsh_scripts/core/05-fpath.zsh` |
 | `packages/zsh-tools/install/.zsh_scripts/core/90-completion_init.zsh` | `~/.zsh_scripts/core/90-completion_init.zsh` |
 | `packages/zsh-tools/install/.zsh_scripts/core/11-cmdhelp.zsh` | `~/.zsh_scripts/core/11-cmdhelp.zsh` |
@@ -31,19 +32,28 @@ The runtime root is:
 ${ZSH_TOOLS_ROOT:-$HOME/.zsh_scripts}
 ```
 
-`05-fpath.zsh` and `90-completion_init.zsh` use that same root. The three
-managed completion directories are normalized to absolute paths and prepended
-to `fpath` in this order:
+`04-completion-paths.zsh` defines the shared managed-path list and identity
+comparison used by `05-fpath.zsh` and `90-completion_init.zsh`. The three selected
+completion directories are:
 
 1. `completion/helpers`
 2. `completion/functions`
 3. `completion/bin`
 
-If `ZSH_TOOLS_ROOT` points outside the default `$HOME/.zsh_scripts`,
-`05-fpath.zsh` also removes pre-existing default zsh-tools completion paths
-and their explicit directory digests (`path.zwc`) from `fpath`. This prevents a
-registered function from a custom runtime from being autoloaded from a stale
-or mismatched default-runtime copy.
+Logical absolute paths (`:a`) retain the selected installation spelling;
+physical paths (`:A`) identify symlink targets. Identity comparisons cover both
+a directory and its digest, symlink aliases to either, and an alias directory's
+separate implicit digest. Current/default runtime and legacy completion paths
+use the same comparison.
+
+The pre-loader removes all these paths from incoming `fpath` and revokes
+initialization helpers already pinned to them. It exposes no managed completion
+code before the external owner's initialization. The post-loader audits the
+selected directories before adding secure paths to `fpath`. With no owner
+ordering, it uses the three-directory order above; an owner's explicit managed
+directory order is retained using the selected audited paths. Alias spellings
+and explicit digests are not restored. Custom runtimes cannot fall back to
+stale default-runtime paths.
 
 `cmdhelp` and its completion use the same runtime root for help topics and
 managed function names. Explicit `__CMDHELP_ROOT`/`__CMDHELP_FUNCTIONS_ROOT`
@@ -54,26 +64,36 @@ explicit `ZSH_SCRIPTS_ROOT` override retains precedence.
 
 ## Initialization contract
 
-`05-fpath.zsh` exposes the public runtime completion directories before
-`90-completion_init.zsh` decides how to register them.
+The actual rc.d order is pre-loader → external completion owner (if present)
+→ post-loader. The pre-loader defers managed-path exposure until the post-loader
+has audited it. This prevents both plain directories and digests from supplying
+`compinit`, `compaudit`, `compdump` or `compinstall` before checking permissions.
+Owner implementations outside either runtime remain available. File-symlink
+helper sources are identified by their physical target too.
 
-The behavior is:
+The post-loader repeats identity filtering for paths inserted after the
+pre-loader, loads the four initialization helpers through the remaining trusted `fpath`,
+and audits
+the managed roots. Both logical installation paths and physical targets are
+checked, including their respective parents and digest companions.
 
-1. If `compdef` does not exist, no standard Zsh completion owner is available
-   yet. The package resolves initialization helpers outside the managed roots,
-   audits those roots, and runs `compinit -i`, keeping `grz-workstation-tools`
-   usable standalone. Cached managed mappings are reconciled afterwards too.
+1. If `compdef` does not exist, the package runs `compinit -i` on the trusted
+   search path to establish standard completion state. Managed paths remain
+   hidden throughout initialization, then secure paths are added and their
+   metadata is registered by the bounded scan.
 2. If `compdef` already exists, the package does **not** run another full
-   `compinit`. Instead it performs a bounded metadata scan of the same three
-   runtime directories exposed by `05-fpath.zsh`.
+   `compinit`. It adds only audited managed paths and performs the same bounded
+   metadata scan. Unrelated directories are not rescanned.
 
-Before registration, the managed roots are passed to `compaudit`. The audit's
-autoload search excludes those roots and explicit `root.zwc` entries, including
-entries an owner adds after fpath setup. All of compaudit's result forms matter:
-an insecure root, its parent directory, or its directory digest (`root.zwc`)
-removes that managed root and its explicit digest from live `fpath`. Insecure
-files and their `.zwc` companions are skipped. If the audit cannot run, all managed roots are
-quarantined instead of restoring their unchecked paths.
+All of compaudit's result forms matter: an insecure root, either parent, or a
+directory digest quarantines that root. Insecure files and compiled companions
+are associated through their logical and physical identities before scanning
+or reconciling loaded state. If the auditor is missing or fails, every managed
+root is quarantined. Missing initialization helpers still reach cleanup of
+unsafe loaded/cached state before returning an initialization error; a failed
+lookup must not abort command processing before quarantine. An unresolved
+missing helper receives a harmless definition, so later fpath exposure cannot
+redirect its lookup into managed code.
 
 Filtering new registrations alone is insufficient when an owner's dump already
 contains mappings. Normal, pattern, post-pattern, service and autoload metadata
@@ -83,7 +103,11 @@ retained widget/helper references from executing them. The inventory includes
 aliases defined by insecure source files and loaded functions from quarantined
 roots whose source files were deleted. Functions loaded through explicit
 directory digests have `root.zwc/function` source paths; these are associated
-with the same managed root for quarantine and runtime refresh.
+with the same managed root for quarantine and runtime refresh. File-level
+identity also covers aliases loaded directly from symlink targets, including
+compiled companions whose target basename differs from the source file. Loaded
+functions from non-selected default/legacy roots and unaudited alias-only
+digests are revoked even when the selected runtime itself is secure.
 
 Within the secure subset, files are processed in managed-`fpath` order and each
 basename is accepted only once, matching `compinit`'s `_i_test` shadowing
@@ -123,6 +147,13 @@ It considers:
 - legacy `.zcompdump*` files under `$HOME`,
 - the default XDG cache dump.
 
+All configured dump/cache paths must be absolute. A relative `_comp_dumpfile`
+from `compinit -d cache.dump` carries no record of the original working directory.
+If any active/configured/default path is relative, reload returns non-zero
+before deleting any candidate or replacing the shell. The same rule covers
+`ZSH_COMPDUMP`, `ZDOTDIR`, `XDG_CACHE_HOME` and HOME-derived paths, so changing
+directories cannot redirect cleanup to unrelated files.
+
 Regular dump files and symlinks are removed before restart. One policy covers
 explicit paths, their compiled companions, and both legacy globs. Each candidate
 is checked independently, including orphaned compiled files. Directories and
@@ -156,6 +187,13 @@ It can also be run directly from a repository checkout:
 GRZ_REPO_ROOT="$PWD" packages/zsh-tools/tests/completion-init.sh
 ```
 
+The regression executes the actual pre/post rc.d loaders with secure and
+insecure managed roots in all three directories, default/custom runtimes,
+Stow-like symlinks, writable physical/logical parents, helpers already pinned
+before the pre-loader and aliases reintroduced afterwards. It also checks
+logical/physical file and companion findings, real missing helper providers,
+and relative active/configured/ZDOTDIR/XDG paths after changing directories.
+
 The regression covers standalone initialization, bounded registration across
 the runtime completion directories, custom `ZSH_TOOLS_ROOT` fpath/autoload
 consistency, stale external dumps without a full `fpath` rescan, security
@@ -186,11 +224,13 @@ pre/post rc.d loaders. These related cases were fixed together:
 
 | Problem family | Related variants covered |
 |---|---|
-| Insecure completion state | Fresh registration, cached dispatch, loaded functions, widgets/helpers, parent and digest results, explicit digest fpath entries, deleted digest-loaded functions, failed audits |
+| Insecure completion state | Fresh registration, cached dispatch, loaded functions, widgets/helpers, parent and digest results, explicit digest fpath entries, deleted digest-loaded functions, real missing helper providers, failed audits |
+| Startup trust boundary | Actual pre/owner/post order, deferred managed fpath exposure, revocation of already pinned initialization helpers |
+| Path identity | Logical/physical directories and parents, aliases to directories/digests, alias-only digests, symlinked files/companions and loaded source aliases |
 | Autoload shadowing | Insecure earlier files, secure duplicates, reordered managed roots, pinned default-runtime functions, directory/digest source-path equivalence |
 | Custom runtime roots | fpath, completion registration, help core defaults, help completion/command fallbacks and explicit help-root overrides |
 | Owner overrides | Normal mappings, pattern/post-pattern mappings, command/service aliases, file-backed and source-less implementations, empty definitions versus unresolved autoload stubs, explicit outside-runtime autoload pins |
-| Dump cleanup | Active/configured/default paths, HOME/ZDOTDIR globs, independent `.zwc` companions, directories/FIFOs, dangling/directory symlinks |
+| Dump cleanup | Active/configured/default paths, HOME/ZDOTDIR globs, independent `.zwc` companions, directories/FIFOs, dangling/directory symlinks, absolute-path preflight for all configuration sources after cd |
 | Shell invocation | Login/non-login and interactive/noninteractive, including redirected stdin |
 | Executable regression coverage | Glob and `_pnpmls` syntax errors, all runtime/completion syntax, a test-local variable shadowing Zsh's special `functions` parameter, actual package-runner discovery in CI |
 

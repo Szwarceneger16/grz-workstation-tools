@@ -14,6 +14,16 @@ zshreloadcomp() {
   [[ -n ${ZSH_COMPDUMP:-} ]] && dumps+=("$ZSH_COMPDUMP")
   dumps+=("$zdotdir/.zcompdump" "$default_cache_dump")
 
+  # A relative path retains no record of compinit's original working directory.
+  # Validate every source before unlinking anything or expanding legacy globs.
+  for dump in "$HOME" "${dumps[@]}"; do
+    if [[ "$dump" != /* ]]; then
+      print -u2 -- "zshreloadcomp: cannot safely locate a relative dump path: $dump"
+      print -u2 -- 'Use absolute completion dump/cache paths before restarting.'
+      return 1
+    fi
+  done
+
   for dump in "${dumps[@]}"; do
     candidates+=("$dump" "$dump.zwc")
   done

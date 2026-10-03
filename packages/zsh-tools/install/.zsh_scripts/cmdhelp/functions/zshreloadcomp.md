@@ -21,6 +21,12 @@ shell startup, including:
 - legacy `$HOME/.zcompdump*` files when `ZDOTDIR` differs,
 - the default XDG cache dump under `${XDG_CACHE_HOME:-$HOME/.cache}/zsh/compdump`.
 
+Dump and cache paths must be absolute. If an active/configured/default path is
+relative, the command returns an error before removing any files or restarting.
+In particular, `compinit -d cache.dump` does not record its original directory;
+use an absolute dump path when configuring completion. This also applies to
+`ZSH_COMPDUMP`, `ZDOTDIR` and `XDG_CACHE_HOME`.
+
 Directories and non-file dump sinks such as `/dev/null` or FIFOs are skipped
 in every location, including compiled `.zwc` companions. Symlinks are unlinked
 without removing their targets; dangling symlinks are removed too.
