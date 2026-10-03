@@ -462,6 +462,45 @@ EOF
     fail "custom runtime completion autoloaded from the wrong root"
 )
 
+# Help and its completion must use the same custom runtime root, including the
+# completion's fallback when the core module has not been sourced. Explicit help
+# roots retain precedence over the runtime default.
+for help_case in core fallback override; do
+  (
+    emulate -LR zsh
+    set -euo pipefail
+    HOME="$tmp_root/cmdhelp-$help_case-home"
+    ZSH_TOOLS_ROOT="$tmp_root/cmdhelp-$help_case-runtime"
+    export HOME ZSH_TOOLS_ROOT
+    local selected_root="$ZSH_TOOLS_ROOT"
+    if [[ "$help_case" == override ]]; then
+      selected_root="$tmp_root/cmdhelp-explicit"
+      typeset -g __CMDHELP_ROOT="$selected_root/cmdhelp"
+      typeset -g __CMDHELP_FUNCTIONS_ROOT="$selected_root/functions"
+    fi
+    mkdir -p "$selected_root/cmdhelp/functions" "$selected_root/functions" "$HOME/.zsh_scripts/cmdhelp/functions"
+    touch "$selected_root/cmdhelp/functions/custom-topic.md" "$selected_root/functions/custom-entry.zsh" "$HOME/.zsh_scripts/cmdhelp/functions/default-topic.md"
+    if [[ "$help_case" != fallback ]]; then
+      source "$repo_root/packages/zsh-tools/install/.zsh_scripts/core/11-cmdhelp.zsh"
+      [[ $__CMDHELP_ROOT == "$selected_root/cmdhelp" && $__CMDHELP_FUNCTIONS_ROOT == "$selected_root/functions" ]] ||
+        fail "cmdhelp core ignored the selected help/runtime root"
+      [[ "$(__cmdhelp_collect_topic_names functions)" == custom-topic ]] || fail "cmdhelp read topics from the wrong runtime"
+    else
+      source "$repo_root/packages/zsh-tools/install/.zsh_scripts/functions/battery-ac-watch.zsh"
+      unset ZSH_SCRIPTS_ROOT
+      print -r -- runtime-battery-help > "$selected_root/cmdhelp/functions/battery-ac-watch.md"
+      [[ "$(battery-ac-watch --help)" == runtime-battery-help ]] || fail "command help fallback ignored the custom runtime"
+    fi
+    local -a words=(cmdhelp '')
+    local -i CURRENT=2
+    compadd() { typeset -ga CAPTURED_TOPICS=("${(@P)2}"); }
+    source "$repo_root/packages/zsh-tools/install/.zsh_scripts/completion/functions/_cmdhelp"
+    (( CAPTURED_TOPICS[(Ie)custom-topic] && CAPTURED_TOPICS[(Ie)custom-entry] )) ||
+      fail "cmdhelp completion missed custom runtime topics/entrypoints"
+    (( ! CAPTURED_TOPICS[(Ie)default-topic] )) || fail "cmdhelp completion used stale default topics"
+  )
+done
+
 # Successful reload removes the actual active dump, configured/default
 # alternatives, and dumps under a non-HOME ZDOTDIR before replacing the shell.
 (

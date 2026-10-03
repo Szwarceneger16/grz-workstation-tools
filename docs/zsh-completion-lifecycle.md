@@ -17,6 +17,9 @@ The relevant source files are installed through GNU Stow at:
 |---|---|
 | `packages/zsh-tools/install/.zsh_scripts/core/05-fpath.zsh` | `~/.zsh_scripts/core/05-fpath.zsh` |
 | `packages/zsh-tools/install/.zsh_scripts/core/90-completion_init.zsh` | `~/.zsh_scripts/core/90-completion_init.zsh` |
+| `packages/zsh-tools/install/.zsh_scripts/core/11-cmdhelp.zsh` | `~/.zsh_scripts/core/11-cmdhelp.zsh` |
+| `packages/zsh-tools/install/.zsh_scripts/completion/functions/_cmdhelp` | `~/.zsh_scripts/completion/functions/_cmdhelp` |
+| `packages/zsh-tools/install/.zsh_scripts/functions/battery-ac-watch.zsh` | `~/.zsh_scripts/functions/battery-ac-watch.zsh` |
 | `packages/zsh-tools/install/.zsh_scripts/functions/zshreloadcomp.zsh` | `~/.zsh_scripts/functions/zshreloadcomp.zsh` |
 | `packages/zsh-tools/install/.zsh_scripts/completion/functions/_zshreloadcomp` | `~/.zsh_scripts/completion/functions/_zshreloadcomp` |
 
@@ -40,6 +43,13 @@ If `ZSH_TOOLS_ROOT` points outside the default `$HOME/.zsh_scripts`,
 `05-fpath.zsh` also removes pre-existing default zsh-tools completion paths
 from `fpath`. This prevents a registered function from a custom runtime from
 being autoloaded from a stale or mismatched default-runtime copy.
+
+`cmdhelp` and its completion use the same runtime root for help topics and
+managed function names. Explicit `__CMDHELP_ROOT`/`__CMDHELP_FUNCTIONS_ROOT`
+overrides retain precedence, including when completion runs without the help
+core module. The binary root remains `~/.local/my-custom-bin`.
+The `battery-ac-watch` help fallback also honors `ZSH_TOOLS_ROOT`; its existing
+explicit `ZSH_SCRIPTS_ROOT` override retains precedence.
 
 ## Initialization contract
 
@@ -168,6 +178,7 @@ pre/post rc.d loaders. These related cases were fixed together:
 |---|---|
 | Insecure completion state | Fresh registration, cached dispatch, loaded functions, widgets/helpers, parent and digest results, failed audits |
 | Autoload shadowing | Insecure earlier files, secure duplicates, reordered managed roots, pinned default-runtime functions |
+| Custom runtime roots | fpath, completion registration, help core defaults, help completion/command fallbacks and explicit help-root overrides |
 | Owner overrides | Normal mappings, pattern/post-pattern mappings, command/service aliases |
 | Dump cleanup | Active/configured/default paths, HOME/ZDOTDIR globs, independent `.zwc` companions, directories/FIFOs, dangling/directory symlinks |
 | Shell invocation | Login/non-login and interactive/noninteractive, including redirected stdin |

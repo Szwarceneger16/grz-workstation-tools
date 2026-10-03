@@ -6,10 +6,10 @@
 #   everything prefixed with __
 
 if (( ! ${+__CMDHELP_ROOT} )); then
-  typeset -gr __CMDHELP_ROOT="${HOME}/.zsh_scripts/cmdhelp"
+  typeset -gr __CMDHELP_ROOT="${ZSH_TOOLS_ROOT:-$HOME/.zsh_scripts}/cmdhelp"
 fi
 if (( ! ${+__CMDHELP_FUNCTIONS_ROOT} )); then
-  typeset -gr __CMDHELP_FUNCTIONS_ROOT="${HOME}/.zsh_scripts/functions"
+  typeset -gr __CMDHELP_FUNCTIONS_ROOT="${ZSH_TOOLS_ROOT:-$HOME/.zsh_scripts}/functions"
 fi
 if (( ! ${+__CMDHELP_BIN_ROOT} )); then
   typeset -gr __CMDHELP_BIN_ROOT="${HOME}/.local/my-custom-bin"

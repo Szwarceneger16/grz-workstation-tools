@@ -3,7 +3,7 @@ battery-ac-watch() {
   setopt localoptions pipefail no_aliases
 
   local cmd_name='battery-ac-watch'
-  local cmd_root="${ZSH_SCRIPTS_ROOT:-$HOME/.zsh_scripts}"
+  local cmd_root="${ZSH_SCRIPTS_ROOT:-${ZSH_TOOLS_ROOT:-$HOME/.zsh_scripts}}"
   local help_file="$cmd_root/cmdhelp/functions/${cmd_name}.md"
 
   local interval='2'
