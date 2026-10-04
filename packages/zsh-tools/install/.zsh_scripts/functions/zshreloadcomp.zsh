@@ -4,11 +4,20 @@ zshreloadcomp() {
     return $?
   fi
 
-  local dump
+  local dump zsh_executable
   local zdotdir="${ZDOTDIR:-$HOME}"
   local default_cache_dump="${XDG_CACHE_HOME:-$HOME/.cache}/zsh/compdump"
   local -aU dumps candidates
   local -a shell_flags
+
+  # Resolve only an external interpreter, before removing any dump. A session
+  # function/alias called zsh must not take over exec and terminate the shell.
+  if ! zsh_executable="$(builtin whence -p 'zsh')" ||
+      [[ -z "$zsh_executable" || ! -f "$zsh_executable" || ! -x "$zsh_executable" ]]; then
+    print -u2 -- 'zshreloadcomp: cannot find an executable Zsh in PATH'
+    return 1
+  fi
+  zsh_executable="${zsh_executable:a}"
 
   [[ -n ${_comp_dumpfile:-} ]] && dumps+=("$_comp_dumpfile")
   [[ -n ${ZSH_COMPDUMP:-} ]] && dumps+=("$ZSH_COMPDUMP")
@@ -48,5 +57,5 @@ zshreloadcomp() {
   else
     shell_flags+=(+i)
   fi
-  exec zsh "${shell_flags[@]}"
+  builtin exec command -- "$zsh_executable" "${shell_flags[@]}"
 }

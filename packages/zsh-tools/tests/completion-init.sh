@@ -861,6 +861,83 @@ for help_case in core fallback override; do
   )
 done
 
+# Shell functions, path-named functions and aliases defined before/after source
+# must never intercept the external interpreter or its builtin lookup/exec.
+for shadow_kind in function path-function alias-before-source alias-after-source global-alias; do
+  (
+    emulate -LR zsh
+    set -euo pipefail
+    HOME="$tmp_root/shadow-$shadow_kind/session"
+    export HOME
+    unset ZDOTDIR ZSH_COMPDUMP XDG_CACHE_HOME _comp_dumpfile
+    local fake_bin="$HOME/bin"
+    mkdir -p "$fake_bin"
+    touch "$HOME/.zcompdump" "$HOME/.zcompdump.zwc"
+    cat > "$fake_bin/zsh" <<'EOF'
+#!/bin/sh
+printf '%s\n' external > "$HOME/replaced"
+EOF
+    chmod +x "$fake_bin/zsh"
+    PATH="$fake_bin:$PATH"
+    case "$shadow_kind" in
+      function)
+        zsh() { print -r -- intercepted > "$HOME/intercepted"; }
+        whence() { print -r -- intercepted > "$HOME/lookup-intercepted"; }
+        exec() { print -r -- intercepted > "$HOME/exec-intercepted"; }
+        ;;
+      path-function)
+        functions[$fake_bin/zsh]='print -r -- intercepted > "$HOME/intercepted"'
+        ;;
+      alias-before-source)
+        alias zsh='print -r -- intercepted > "$HOME/intercepted"'
+        ;;
+      global-alias)
+        alias -g zsh='print -r -- intercepted > "$HOME/intercepted"'
+        ;;
+    esac
+    source "$reload_file"
+    if [[ "$shadow_kind" == alias-after-source ]]; then
+      alias zsh='print -r -- intercepted > "$HOME/intercepted"'
+    fi
+    zshreloadcomp
+  )
+  [[ -f "$tmp_root/shadow-$shadow_kind/session/replaced" ]] || fail "a $shadow_kind intercepted shell replacement"
+  [[ ! -e "$tmp_root/shadow-$shadow_kind/session/intercepted" &&
+     ! -e "$tmp_root/shadow-$shadow_kind/session/lookup-intercepted" &&
+     ! -e "$tmp_root/shadow-$shadow_kind/session/exec-intercepted" ]] || fail "reload invoked a shadowing function/alias"
+  [[ ! -e "$tmp_root/shadow-$shadow_kind/session/.zcompdump" &&
+     ! -e "$tmp_root/shadow-$shadow_kind/session/.zcompdump.zwc" ]] || fail "external replacement skipped dump cleanup"
+done
+
+# Missing/non-executable interpreters must fail before clearing any dump. A
+# stale command hash must not count as proof that replacement can be started.
+for interpreter_kind in missing non-executable directory; do
+  (
+    emulate -LR zsh
+    set -euo pipefail
+    HOME="$tmp_root/no-interpreter-$interpreter_kind/session"
+    export HOME
+    unset ZDOTDIR ZSH_COMPDUMP XDG_CACHE_HOME _comp_dumpfile
+    local fake_bin="$HOME/bin"
+    mkdir -p "$fake_bin"
+    touch "$HOME/.zcompdump" "$HOME/.zcompdump.zwc"
+    case "$interpreter_kind" in
+      non-executable) print -r -- '#!/bin/sh' > "$fake_bin/zsh" ;;
+      directory) mkdir "$fake_bin/zsh" ;;
+    esac
+    PATH="$fake_bin"
+    hash zsh="$fake_bin/zsh"
+    source "$reload_file"
+    if zshreloadcomp 2> "$HOME/error.log"; then
+      fail "reload accepted a $interpreter_kind interpreter"
+    fi
+    [[ -f "$HOME/.zcompdump" && -f "$HOME/.zcompdump.zwc" ]] || fail "interpreter preflight deleted a dump"
+    [[ "$(< "$HOME/error.log")" == *'cannot find an executable Zsh'* ]] || fail "interpreter preflight did not explain failure"
+    print -r -- retained > "$HOME/session-retained"
+  )
+  [[ -f "$tmp_root/no-interpreter-$interpreter_kind/session/session-retained" ]] || fail "missing interpreter terminated the shell"
+done
+
 # Successful reload removes the actual active dump, configured/default
 # alternatives, and dumps under a non-HOME ZDOTDIR before replacing the shell.
 (

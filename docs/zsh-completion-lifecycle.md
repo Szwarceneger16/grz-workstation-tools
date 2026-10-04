@@ -163,7 +163,12 @@ symlinks to directories are unlinked without removing their targets.
 Dump cleanup is fail-closed: if a selected removable dump file cannot be
 removed, the command returns non-zero and does not replace the current shell.
 
-After successful cleanup it replaces the current shell with `exec zsh` and
+Before cleanup it resolves an executable Zsh from `PATH` using builtin external
+command lookup. Functions and aliases named `zsh` cannot intercept replacement,
+including a function named after the resolved executable path. A missing or
+non-executable interpreter returns an error without deleting dumps or exiting.
+
+After successful cleanup builtin `exec` starts the resolved external Zsh with
 explicit invocation flags. `-l` preserves login mode, `-i` preserves interactive
 mode even with redirected stdin, and `+i` keeps noninteractive shells
 noninteractive even with a terminal on stdin. Login and interactive modes are
@@ -231,7 +236,7 @@ pre/post rc.d loaders. These related cases were fixed together:
 | Custom runtime roots | fpath, completion registration, help core defaults, help completion/command fallbacks and explicit help-root overrides |
 | Owner overrides | Normal mappings, pattern/post-pattern mappings, command/service aliases, file-backed and source-less implementations, empty definitions versus unresolved autoload stubs, explicit outside-runtime autoload pins |
 | Dump cleanup | Active/configured/default paths, HOME/ZDOTDIR globs, independent `.zwc` companions, directories/FIFOs, dangling/directory symlinks, absolute-path preflight for all configuration sources after cd |
-| Shell invocation | Login/non-login and interactive/noninteractive, including redirected stdin |
+| Shell invocation | Login/non-login and interactive/noninteractive, including redirected stdin; external lookup/replacement bypasses functions and aliases; missing/non-executable interpreters retain dumps and the session |
 | Executable regression coverage | Glob and `_pnpmls` syntax errors, all runtime/completion syntax, a test-local variable shadowing Zsh's special `functions` parameter, actual package-runner discovery in CI |
 
 The PR intentionally does not modify `.github/workflows/`; repository policy

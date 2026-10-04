@@ -35,9 +35,13 @@ Every required file removal is fail-closed. If an existing dump file cannot be
 removed, `zshreloadcomp` returns an error and keeps the current shell instead
 of restarting into a state that could reuse the stale dump.
 
-After successful cleanup it replaces the current process with a new Zsh:
+Before removing dumps, the command finds an executable Zsh in `PATH`. It bypasses
+shell functions and aliases named `zsh`. If the interpreter is unavailable, it
+returns an error and leaves both the dumps and the current session intact.
 
-- an interactive Zsh uses `exec zsh -i`, including when stdin is redirected,
+After successful cleanup it replaces the current process with that external Zsh:
+
+- an interactive Zsh receives `-i`, including when stdin is redirected,
 - a login Zsh additionally receives `-l` so login-shell startup/logout semantics
   are preserved,
 - a noninteractive Zsh receives `+i` and stays noninteractive.
