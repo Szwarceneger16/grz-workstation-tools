@@ -3,6 +3,7 @@
 `scripts/rebind-user-package` discovers and transfers selected packages' user-layer
 symlinks from approved, still-existing checkouts to this checkout. An explicit
 recovery mode also accepts exact dangling links after a checkout was removed.
+An explicit `--force-links` mode can replace otherwise unproven symlink leaves.
 It is a separate
 optional Python helper; `run.sh` only routes arguments. Consumers may omit the
 helper from their selection manifest. Ordinary install/verify still work without
@@ -144,11 +145,64 @@ Rollback restores the original link text even if it remains dangling. Final
 success requires every current declared link to resolve to this checkout.
 
 This mode neither performs orphan cleanup nor enables a general force overwrite.
+Combining it with `--force-links` explicitly broadens eligible symlink leaves,
+as described below; the recovery flag alone retains its exact-link restrictions.
 It never copies system files, reads system secrets, runs hooks or activates
 services. Source reconstruction from Git, crash recovery and arbitrary writers
 remain outside the transaction guarantee.
 
-The normal inventory classifies current links, missing destinations, proven legacy
+## Explicit replacement of unproven leaf links
+
+Use `--force-links` when a current declared package path contains a symlink that
+normal rebind cannot prove belongs to an approved source layout. This is a
+deliberate override of leaf-link ownership, for a named package or `all-user`:
+
+```sh
+./run.sh verify --rebind --force-links --from-repo /path/to/source-checkout PACKAGE
+./run.sh install --rebind --force-links --from-repo /path/to/source-checkout --dry-run PACKAGE
+./run.sh install --rebind --force-links --from-repo /path/to/source-checkout --yes PACKAGE
+```
+
+Explicit `--from-repo` values are mandatory, including for inspection and
+dry-run. They bind the normal source inventories and residue checks; they do
+not prove that a forced link belongs to those roots. Source checkouts must
+remain valid in this mode. If they were removed, also select
+`--recover-dangling` and use missing roots under that mode's rules.
+
+The preview labels each override `force-link` and prints its old and proposed
+link text with JSON escaping. It also discloses that the unproven target and
+its payload are not inspected. A forced leaf may point to a healthy foreign
+file, a directory, an indirect link chain or a missing target; only the leaf
+symlink at the current declared destination is replaced. The target object
+and its data remain untouched. Without `--yes`, interactive approval requires
+the distinct literal `FORCE REBIND`. Inspection returns 3 when valid changes
+are needed and includes the force flag in its suggested preview command.
+
+Regular files, directories, special objects and linked parents remain hard
+conflicts. Control characters in forced link text are refused. Force does not
+bypass package mappings, source safety, Stow projection, selection metadata,
+overlapping plans, source/link revalidation or target locking. It does not
+scan undeclared paths or authorize removal of otherwise conflicting old rename
+paths or unmapped legacy residue. Proven renames retain normal rebind behavior.
+Current links remain unchanged. `--force` is not an alias and normal install,
+verify and uninstall do not acquire force behavior.
+
+The existing transaction records the force mode and each original link text
+in its owner-only journal. Handled failures restore only transaction-owned
+changes and verify the entire original package layout. Concurrent edits are
+preserved and reported as manual recovery. In `all-user`, a failed package
+does not undo successful packages or prevent later eligible packages from
+running; errors and rollback outcomes remain explicit. Lock contention or a
+persistent batch-journal failure still stops the series.
+
+This mode may intentionally replace a healthy link owned by another installer.
+Approval authorizes that exact link replacement and deployment of the current
+package payload; it cannot establish old payload equivalence or compatibility
+with the other installer. General file overwrite, system-file migration,
+service activation, secret handling and automatic crash recovery are separate
+work. Do not run competing installers against the same target.
+
+Without override flags, the inventory classifies current links, missing destinations, proven legacy
 links, mapped renames, unmapped legacy residue and unknown conflicts. A regular
 file, dangling/indirect/foreign link, linked parent directory, special source,
 source symlink or custom Stow ignore policy blocks the affected package before
@@ -257,9 +311,9 @@ intermediate state; SIGKILL, power loss and lost temporary journals still requir
 manual recovery. Ordinary install tools and external writers do not participate
 in the advisory lock. Mixed packages migrate user links only; the batch never
 copies system files, reads system secrets, runs hooks or activates services.
-Dangling links after loss of a source checkout remain conflicts unless the
-explicit recovery mode above accepts their exact text. Aggregate rebind does
-not enable a general force overwrite or orphan cleanup.
+Dangling links after loss of a source checkout remain conflicts unless an
+explicit mode above accepts them. Aggregate rebind does not implicitly enable
+force, general file overwrite or orphan cleanup.
 
 ## Renamed files
 

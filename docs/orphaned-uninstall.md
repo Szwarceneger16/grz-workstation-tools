@@ -235,6 +235,9 @@ guarantee against reactivation. The script performs none of this follow-up.
   If the entire source checkout was removed, rebind's explicit
   `--recover-dangling --from-repo /path/to/lost-checkout` mode can recover only
   exact declared leaves; it cannot discover arbitrary orphan leftovers.
+  Rebind also offers explicit `--force-links` for unproven current destination
+  symlinks. That override is separate from cleanup and does not overwrite plain
+  files or remove arbitrary orphan paths.
   Do not clean up source links before migration or run both operations concurrently.
 
 ## Validation with a throwaway target
