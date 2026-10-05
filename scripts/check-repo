@@ -428,6 +428,13 @@ check_trigger_directives() {
   typeset -A directive_by_type
   directive_by_type=(timer Unit path Unit socket Service)
 
+  # Type controls activation of timer-managed oneshots. Validate every
+  # service here, including templates, before lifecycle code can mutate units.
+  for f in "$unit_dir"/*.service(N.); do
+    systemd_directive_value Type "$f" >/dev/null ||
+      err "$package: invalid or ambiguous systemd contract in ${f:t}"
+  done
+
   for unit_type in timer path socket; do
     directive="${directive_by_type[$unit_type]}"
     for f in "$unit_dir"/*.$unit_type(N.); do

@@ -24,10 +24,14 @@ refused before root comparison, so they cannot bypass source/target overlap or
 live-root privilege checks.
 Root ancestry device/inode identities also bind the approved plan. Overlap in
 these directory identities is refused between offline targets and source roots,
-or between source roots. Installed leaves sharing an inode with any declared
-source are conflicts. These checks detect aliases present in root ancestry or
-declared-file identity evidence that lexical comparison alone cannot detect;
-the helper does not enumerate mount topology or perform mount operations.
+or between source roots. Every declared destination is also checked against
+whole current and admitted legacy checkouts, including a live `/` target:
+no leaf may equal, lie inside, or contain a checkout. Existing destination
+ancestry must not alias a checkout root's device/inode identity. Installed
+leaves sharing an inode with any declared source are conflicts. These checks
+detect aliases present in root ancestry or declared-file identity evidence that
+lexical comparison alone cannot detect; the helper does not enumerate mount
+topology or perform mount operations.
 
 The current source is `packages/PACKAGE/system-install/`, with metadata from
 `packages/PACKAGE/system-install.manifest`. The old checkout must contain the
@@ -68,14 +72,24 @@ paths selected by a manager's `SYSTEMD_UNIT_PATH` or build configuration are
 not discovered by this package contract.
 
 Contract directives are read only from their actual sections: `Timer.Unit`,
-`Path.Unit`, `Socket.Service` and `Socket.Accept`. Assignments before any
-section or under a different section are ignored, as systemd ignores them.
+`Path.Unit`, `Socket.Service`, `Socket.Accept` and `Service.Type`. Assignments
+before any section or under a different section are ignored, as systemd ignores
+them.
 Logical-line parsing consumes continuations on unrelated keys before looking
 for headers, so a physical `[Socket]` inside a continued description cannot
 authorize an accepting socket. Whole-line comments, CRLF, a single UTF-8 BOM
 and repeated section headers are handled; repeated or continued contract keys,
 malformed headers, NULs, ambiguous BOMs and invalid boolean values are refused.
 Inline `#`/`;` text is not stripped from boolean values.
+
+Repeated or continued `Service.Type` values are outside this runner contract,
+even when systemd can interpret them. `check-repo` validates service files in
+both layers, and the standalone system rebind gate performs the same check.
+System and user activation parse every declared service (including concrete
+instances backed by templates) before manager reloads or enable/start/restart
+operations. System activation caches this preflight value for deciding which
+timer-managed oneshots to run, so it cannot discover a Type parse failure after
+an earlier trigger has already been changed.
 
 Only `%i` and `%I` in targets of template/instance units are supported. Every
 other percent sequence, including `%%`, a dangling `%`, or instance specifiers

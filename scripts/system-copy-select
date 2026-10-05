@@ -872,6 +872,7 @@ activate_units() {
   local verify_failures=0
   local -A activation_bases    # service bases that should not be started directly
   local -A timer_managed_bases # subset owned by a .timer (safe to defer-start)
+  local -A service_types      # parsed before any manager mutation
   local -a deferred_oneshots   # timer-managed oneshots started after triggers are enabled
 
   load_units_metadata "$package"
@@ -881,6 +882,10 @@ activate_units() {
   unit_dir="$packages_dir/$package/system-install/etc/systemd/system"
   for unit in "${system_units[@]}"; do
     unit_file="$(resolve_unit_file_path "$unit_dir" "$unit")"
+    if [[ "$unit" == *.service ]]; then
+      service_types[$unit]="$(systemd_directive_value Type "$unit_file")" ||
+        die "invalid or ambiguous systemd contract: $unit"
+    fi
     # System unit files are plain-copied (not stow-symlinked), and content/
     # mode/owner identity for units this package actually ships is already
     # guaranteed before this runs. The one case that isn't covered: a
@@ -951,10 +956,9 @@ activate_units() {
           # treats whitespace around '=' and leading indentation as insignificant
           # (systemd.syntax), so `Type = oneshot` or an indented line must still
           # be recognized, otherwise the promised initial run is missed.
-          unit_file="$(resolve_unit_file_path "$unit_dir" "$unit")"
-          local service_type
-          service_type="$(systemd_directive_value Type "$unit_file")" || die "invalid or ambiguous systemd contract: $unit"
-          if [[ -n "${timer_managed_bases[${unit%.service}]+x}" && "$service_type" == oneshot ]]; then
+          # Use the approved preflight value; never discover a parse failure
+          # after daemon-reload or an earlier trigger mutation.
+          if [[ -n "${timer_managed_bases[${unit%.service}]+x}" && "${service_types[$unit]}" == oneshot ]]; then
             deferred_oneshots+=("$unit")
           else
             print -- "Skipping $unit (managed by a socket, path, or timer unit)"

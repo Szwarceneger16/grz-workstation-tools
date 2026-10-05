@@ -163,17 +163,23 @@ def plan(repo, target, package, roots, recover_dangling=False, force_links=False
     renames, mapping_state = mappings(repo, package, files)
     lost_sources = lost_source_state(roots) if recover_dangling else None
     legacy = {str(root): {} if recover_dangling else inventory(root, package) for root in roots}
+    source_roots = [repo, *roots]
+    source_root_ids = {entry[:2] for root in source_roots if (entry := identity(root))}
     rows = []
     parents = {}
     conflicts = []
     renamed_changes = {}
     for rel in sorted(set(files) | set(renames) | {p for values in legacy.values() for p in values}):
         dest = target / rel
+        require(not any(dest.is_relative_to(root) or root.is_relative_to(dest)
+                        for root in source_roots), 'destination overlaps source checkout')
         directories(dest.parent, missing=True)
         for parent in (target, *dest.parents):
             if parent != target and not parent.is_relative_to(target):
                 continue
             entry = identity(parent)
+            require(entry is None or entry[:2] not in source_root_ids,
+                    'destination physically overlaps a source checkout')
             parents[str(parent)] = entry[:3] if entry else None
         before = identity(dest)
         raw = os.readlink(dest) if before and stat.S_ISLNK(before[2]) else None

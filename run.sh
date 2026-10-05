@@ -766,6 +766,10 @@ activate_user_units() {
   activation_bases=()
   for unit in "${user_units[@]}"; do
     unit_file="$(resolve_unit_file_path "$unit_dir" "$unit")"
+    if [[ "$unit" == *.service ]]; then
+      systemd_directive_value Type "$unit_file" >/dev/null ||
+        die "invalid or ambiguous systemd contract: $unit"
+    fi
     # systemd resolves unit names through its own search path, so verify the
     # live stow link actually points at this package's file before mutating
     # anything by name (a stale link or a same-named unit elsewhere could

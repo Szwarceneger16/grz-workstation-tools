@@ -291,6 +291,13 @@ removed at boot, so their synchronization cannot guarantee reboot persistence.
 
 User target/source root arguments also refuse double-leading-slash Linux aliases
 such as `//tmp/checkout` and `//`, before traversal or root comparisons.
+Every planned leaf, including rename sources and legacy residue, must be
+outside the whole current and admitted old checkouts. A target may contain a
+checkout, but no declared leaf may equal, contain or lie within that checkout.
+Existing destination-parent device/inode identities must not alias a checkout
+root. The same preflight applies to normal rebind, forced links, recovery,
+batch planning and revalidation before writes; recovery still requires its
+selected legacy roots to be absent.
 
 Every batch prints a final result for each selected or excluded package, including
 when preflight fails, approval is cancelled or the target lock is busy. The result
