@@ -199,6 +199,10 @@ load_units_manifest() {
       err "unit name must not start with '-' at $manifest:$line_no: $unit"
       continue
     fi
+    if [[ "$unit" == *%* ]]; then
+      err "unit names must not contain literal specifiers at $manifest:$line_no: $unit"
+      continue
+    fi
     case "$unit" in
       *.mount)
         if [[ "$kind" == user ]]; then
@@ -242,24 +246,77 @@ unit_name_matches_template() {
 }
 
 systemd_directive_value() {
-  local key="$1" file="$2" value
-  value="$(
-    grep -m1 "^[[:space:]]*${key}[[:space:]]*=" "$file" 2>/dev/null |
-      sed "s/^[[:space:]]*${key}[[:space:]]*=[[:space:]]*//" || :
-  )"
-  value="${value%"${value##*[![:space:]]}"}"
-  print -r -- "$value"
+  local key="$1" file="$2" section
+  case "$key:${file:e}" in
+    Unit:timer) section=Timer ;;
+    Unit:path) section=Path ;;
+    Service:socket|Accept:socket) section=Socket ;;
+    Type:service) section=Service ;;
+    *) return 2 ;;
+  esac
+  # Parse logical lines before recognizing sections. Contract directives must
+  # be unambiguous scalars; unrelated continuations cannot forge a header.
+  LC_ALL=C awk -v wanted="$key" -v expected="$section" '
+    function trim(value) {
+      sub(/^[ \t\r]+/, "", value); sub(/[ \t\r]+$/, "", value)
+      return value
+    }
+    function consume(value, joined, key, position) {
+      value = trim(value)
+      if (substr(value, 1, 1) == "[") {
+        if (value !~ /^\[[^][]+\]$/) { bad = 1; return }
+        section = substr(value, 2, length(value) - 2)
+      } else if (section == expected && (position = index(value, "="))) {
+        key = trim(substr(value, 1, position - 1))
+        if (key == wanted || (expected == "Socket" && (key == "Service" || key == "Accept")) ||
+            ((expected == "Timer" || expected == "Path") && key == "Unit")) {
+          if (++seen[key] > 1 || joined) { bad = 1; return }
+          values[key] = trim(substr(value, position + 1))
+          if (key == "Accept" && tolower(values[key]) !~ /^(|1|yes|y|true|t|on|0|no|n|false|f|off)$/)
+            bad = 1
+        }
+      }
+    }
+    {
+      physical = $0
+      sub(/\r$/, "", physical)
+      if (index(physical, sprintf("%c", 0))) { bad = 1; exit 2 }
+      if (trim(physical) ~ /^[#;]/) next
+      if (index(physical, "\357\273\277")) {
+        if (bom_seen || pending != "" || index(physical, "\357\273\277") != 1) { bad = 1; exit 2 }
+        physical = substr(physical, 4); bom_seen = 1
+      }
+      value = pending physical
+      if (length(value) > 1048576) { bad = 1; exit 2 }
+      slashes = 0
+      for (i = length(value); i > 0 && substr(value, i, 1) == "\\"; i--) slashes++
+      if (slashes % 2) { pending = substr(value, 1, length(value) - 1) " "; continued = 1; next }
+      consume(value, continued)
+      pending = ""; continued = 0
+    }
+    END {
+      if (pending != "") consume(pending, 1)
+      if (bad) exit 2
+      print values[wanted]
+    }
+  ' "$file"
+}
+
+systemd_target_specifiers_supported() {
+  local unit="$1" value="$2" remainder
+  remainder="${value//\%i/}"
+  remainder="${remainder//\%I/}"
+  [[ "$remainder" != *%* ]] || return 1
+  [[ "$value" != *%[iI]* || "$unit" == *@*.* ]]
 }
 
 systemd_truthy_directive() {
   local key="$1" file="$2" value
-  value="$(systemd_directive_value "$key" "$file")"
-  value="${value%%#*}"
-  value="${value%%;*}"
+  value="$(systemd_directive_value "$key" "$file")" || return 2
   value="${value#"${value%%[![:space:]]*}"}"
   value="${value%"${value##*[![:space:]]}"}"
   case "${(L)value}" in
-    yes|true|1|on) return 0 ;;
+    yes|y|true|t|1|on) return 0 ;;
   esac
   return 1
 }
@@ -303,6 +360,14 @@ manifest_declares_unit() {
   return 1
 }
 
+# Trigger targets require exact concrete names. Template-file coverage above
+# does not select an instance, and Accept=yes uses its separate template gate.
+manifest_declares_concrete_target() {
+  local want="$1"
+  is_template_unit_name "$want" && return 1
+  [[ -n "${unit_names[$want]-}" ]]
+}
+
 # When $1 is a template unit file base (e.g. foo@.timer) and $2 is its
 # Unit=/Service= directive value (which may contain the %i/%I specifier),
 # verify the directive resolves to a manifest-declared unit for every
@@ -318,7 +383,7 @@ check_template_directive_instances() {
     inst_suffix_unescaped="$(systemd_unescape_instance "$inst_suffix")"
     resolved="${directive//\%i/$inst_suffix}"
     resolved="${resolved//\%I/$inst_suffix_unescaped}"
-    manifest_declares_unit "$resolved" ||
+    manifest_declares_concrete_target "$resolved" ||
       err "$package: $file_base references $directive_name=$directive which resolves to $resolved for instance $instance, not in $manifest_name"
   done
 }
@@ -326,6 +391,10 @@ check_template_directive_instances() {
 check_directive_target() {
   local file_base="$1" directive="$2" directive_name="$3" manifest_name="$4"
   local inst_suffix inst_suffix_unescaped resolved
+  if ! systemd_target_specifiers_supported "$file_base" "$directive"; then
+    err "$package: unsupported target specifier in $file_base; only instance %i/%I are supported"
+    return 0
+  fi
   if [[ "$directive" == *%[iI]* && "$file_base" == *@*.* ]]; then
     if is_template_unit_name "$file_base"; then
       check_template_directive_instances "$file_base" "$directive" "$directive_name" "$manifest_name"
@@ -334,11 +403,11 @@ check_directive_target() {
       inst_suffix_unescaped="$(systemd_unescape_instance "$inst_suffix")"
       resolved="${directive//\%i/$inst_suffix}"
       resolved="${resolved//\%I/$inst_suffix_unescaped}"
-      manifest_declares_unit "$resolved" ||
+      manifest_declares_concrete_target "$resolved" ||
         err "$package: $file_base references $directive_name=$directive which resolves to $resolved, not in $manifest_name"
     fi
   else
-    manifest_declares_unit "$directive" ||
+    manifest_declares_concrete_target "$directive" ||
       err "$package: $file_base references $directive_name=$directive which is not in $manifest_name"
   fi
 }
@@ -346,7 +415,7 @@ check_directive_target() {
 check_implicit_service_target() {
   local unit_dir="$1" base="$2" implicit_svc="$3" manifest_name="$4"
   if repo_unit_file_exists "$unit_dir" "$implicit_svc"; then
-    manifest_declares_unit "$implicit_svc" ||
+    manifest_declares_concrete_target "$implicit_svc" ||
       err "$package: $base implicitly requires $implicit_svc which is not in $manifest_name"
   else
     err "$package: $base implicitly requires $implicit_svc which has no repo unit file"
@@ -359,11 +428,21 @@ check_trigger_directives() {
   typeset -A directive_by_type
   directive_by_type=(timer Unit path Unit socket Service)
 
+  # Type controls activation of timer-managed oneshots. Validate every
+  # service here, including templates, before lifecycle code can mutate units.
+  for f in "$unit_dir"/*.service(N.); do
+    systemd_directive_value Type "$f" >/dev/null ||
+      err "$package: invalid or ambiguous systemd contract in ${f:t}"
+  done
+
   for unit_type in timer path socket; do
     directive="${directive_by_type[$unit_type]}"
     for f in "$unit_dir"/*.$unit_type(N.); do
       base="${f:t}"
-      custom_target="$(systemd_directive_value "$directive" "$f")"
+      custom_target="$(systemd_directive_value "$directive" "$f")" || {
+        err "$package: invalid or ambiguous systemd contract in $base"
+        continue
+      }
       if [[ -n "$custom_target" ]]; then
         if [[ "$unit_type" == "socket" ]]; then
           [[ "$custom_target" == *.service ]] ||
@@ -479,6 +558,7 @@ check_helper_parity() {
     is_template_unit_name \
     template_unit_name_for_instance \
     systemd_directive_value \
+    systemd_target_specifiers_supported \
     systemd_truthy_directive \
     systemd_unescape_instance; do
     check_function_parity "$run_script" "$system_script" "$fn"
@@ -499,6 +579,35 @@ check_helper_parity() {
     "s/manifest_declares_unit/UNIT_DECLARES_UNIT/; s/unit_names/UNIT_MAP/g"
 }
 
+# Classify complete standard system-manager load-directory families by path
+# components, not by unit suffix: drop-ins and future unit types must not pass
+# as ordinary system files. Do not query/execute the host or candidate code.
+is_system_unit_load_path() {
+  local rel="$1" index
+  local -a components
+  components=("${(@s:/:)rel}")
+  for (( index=1; index<${#components}; index++ )); do
+    [[ "${components[$index]}" == systemd ]] || continue
+    case "${components[$(( index + 1 ))]}" in
+      system|system.control|system.attached|transient|generator|generator.early|generator.late) return 0 ;;
+    esac
+  done
+  return 1
+}
+
+check_system_unit_install_location() {
+  local rel="$1" package="$2"
+  local -a components
+  is_system_unit_load_path "$rel" || return 0
+  components=("${(@s:/:)rel}")
+  if [[ "$rel" == etc/systemd/system/* && ${#components} == 4 ]]; then
+    case "${rel:e}" in
+      service|timer|path|socket|mount|target) return 0 ;;
+    esac
+  fi
+  err "$package: unsupported system unit location or suffix: $rel"
+}
+
 check_system_layer() {
   local package="$1"
   local sys_dir="$packages_dir/$package/system-install"
@@ -507,6 +616,20 @@ check_system_layer() {
   local config_manifest="$packages_dir/$package/system-config.manifest"
   local f rel base real_rel
   typeset -A install_paths install_modes config_paths unit_names accept_service_templates
+
+  # Config-only packages still need destination validation even without a
+  # system-install source tree.
+  load_4col_manifest "$config_manifest"
+  _check_config_manifest_security "$config_manifest" "$package"
+  config_paths=("${(@kv)manifest_paths}")
+  for rel in "${(@k)config_paths}"; do
+    # Unit payloads must be reviewable source, never out-of-band secret data.
+    is_system_unit_load_path "$rel" &&
+      err "$package: system config destination must not be a system unit load path: $rel"
+    _is_protected_rel_path "$rel" &&
+      err "$package: protected system path in system-config.manifest: $rel"
+  done
+
 
   [[ ! -L "$sys_dir" ]] || { err "$package: system-install must not be a symlink"; return 0; }
   [[ -d "$sys_dir" ]] || return 0
@@ -520,6 +643,7 @@ check_system_layer() {
   install_paths=("${(@kv)manifest_paths}")
   install_modes=("${(@kv)manifest_modes}")
   for rel in "${(@k)install_paths}"; do
+    check_system_unit_install_location "$rel" "$package"
     _is_protected_rel_path "$rel" &&
       err "$package: protected system path in system-install.manifest: $rel"
     # set-id/sticky (octal 7000 bits) is a privilege-escalation primitive and
@@ -576,13 +700,6 @@ check_system_layer() {
     fi
   done
 
-  load_4col_manifest "$config_manifest"
-  _check_config_manifest_security "$config_manifest" "$package"
-  config_paths=("${(@kv)manifest_paths}")
-  for rel in "${(@k)config_paths}"; do
-    _is_protected_rel_path "$rel" &&
-      err "$package: protected system path in system-config.manifest: $rel"
-  done
 
   # Check 3: every *.example config maps to a declared real destination.
   for f in "$sys_dir"/**/*.example(DN.); do

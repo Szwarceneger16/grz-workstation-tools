@@ -338,6 +338,8 @@ user_manager_reachable() { return 1; }
 resolve_unit_file_path() { print -r -- "$1/$2"; }
 verify_stow_link() { return 0; }
 activation_bases_for_unit() { return 0; }
+# This offline routing fixture models a valid service with no explicit Type.
+systemd_directive_value() { return 0; }
 unit_has_install_section() { return 0; }
 systemctl() { print -r -- "mock-systemctl:$*:offline=${SYSTEMD_OFFLINE:-0}"; }
 die() { print -u2 -- "$*"; exit 65; }

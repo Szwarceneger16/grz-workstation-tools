@@ -3,3 +3,4 @@
 docs/runner-rebind.md
 docs/runner-release-process.md
 docs/runner-sync.md
+docs/runner-system-rebind.md

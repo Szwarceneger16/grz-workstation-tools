@@ -60,7 +60,7 @@ def directories(path, missing=False):
 
 def absolute(value, missing=False):
     p = Path(value)
-    require(p.is_absolute() and str(p) == value and '..' not in p.parts and
+    require(p.is_absolute() and not value.startswith('//') and str(p) == value and '..' not in p.parts and
             not any(ord(c) < 32 or ord(c) == 127 for c in value), 'expected normalized absolute path')
     require(p != Path('/'), 'filesystem root is not a valid installation target')
     directories(p, missing=missing)
@@ -157,23 +157,47 @@ def source_unchanged(fresh, snapshot):
         fresh.get('force_links') == snapshot.get('force_links'))
 
 
+def safe_target_parents(target, path):
+    # Validate above the target too: otherwise a foreign account can move the
+    # approved root while a retained descendant fd still points into its tree.
+    for parent in reversed(path.parents):
+        try:
+            info = parent.lstat()
+        except FileNotFoundError:
+            break  # Plan may create missing descendants only after approval.
+        inside = parent.is_relative_to(target)
+        require(stat.S_ISDIR(info.st_mode) and
+                (info.st_uid == os.geteuid() if inside else info.st_uid in {0, os.geteuid()}) and
+                (not stat.S_IMODE(info.st_mode) & 0o022 or
+                 not inside and info.st_mode & stat.S_ISVTX),
+                'user target ancestry has unsafe ownership or write permissions')
+
+
 def plan(repo, target, package, roots, recover_dangling=False, force_links=False):
     directories(target)
+    safe_target_parents(target, target / '.runner-root-proof')
     files = inventory(repo, package)
     renames, mapping_state = mappings(repo, package, files)
     lost_sources = lost_source_state(roots) if recover_dangling else None
     legacy = {str(root): {} if recover_dangling else inventory(root, package) for root in roots}
+    source_roots = [repo, *roots]
+    source_root_ids = {entry[:2] for root in source_roots if (entry := identity(root))}
     rows = []
     parents = {}
     conflicts = []
     renamed_changes = {}
     for rel in sorted(set(files) | set(renames) | {p for values in legacy.values() for p in values}):
         dest = target / rel
+        require(not any(dest.is_relative_to(root) or root.is_relative_to(dest)
+                        for root in source_roots), 'destination overlaps source checkout')
         directories(dest.parent, missing=True)
+        safe_target_parents(target, dest)
         for parent in (target, *dest.parents):
             if parent != target and not parent.is_relative_to(target):
                 continue
             entry = identity(parent)
+            require(entry is None or entry[:2] not in source_root_ids,
+                    'destination physically overlaps a source checkout')
             parents[str(parent)] = entry[:3] if entry else None
         before = identity(dest)
         raw = os.readlink(dest) if before and stat.S_ISLNK(before[2]) else None
@@ -434,8 +458,9 @@ def parent_fd(target, rel, created):
                 child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
             except FileNotFoundError:
                 with mutation_record():
-                    os.mkdir(name, dir_fd=fd)
+                    os.mkdir(name, 0o755, dir_fd=fd)
                     created.append((current, identity(current)))
+                    os.fsync(fd)
                 child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
             os.close(fd)
             fd = child
@@ -623,10 +648,9 @@ def apply_locked(repo, target, package, roots, snapshot, on_journal=None, on_com
     try:
         require(refresh_plan(repo, target, package, roots, snapshot) == snapshot,
                 'candidate changed after approval; rerun')
-        journal = Path(tempfile.mkdtemp(prefix='runner-rebind-journal-', dir='/tmp')) / 'before.json'
-        journal.write_text(json.dumps({'repository': str(repo), 'target': str(target), 'package': package,
-                                       'snapshot': snapshot}, indent=2) + '\n')
-        journal.chmod(0o600)
+        journal = new_journal('runner-rebind-journal-') / 'before.json'
+        write_record(journal, {'repository': str(repo), 'target': str(target), 'package': package,
+                               'snapshot': snapshot})
         print(f'Rollback journal: {journal}', flush=True)
         if on_journal:
             on_journal(journal)
@@ -668,7 +692,10 @@ def apply_locked(repo, target, package, roots, snapshot, on_journal=None, on_com
                         os.unlink(p.name, dir_fd=parent)
                         changed.append((row, None))
             finally:
-                os.close(parent)
+                try:
+                    os.fsync(parent)
+                finally:
+                    os.close(parent)
         fresh = refresh_plan(repo, target, package, roots, snapshot)
         check_parents(snapshot, created)
         require(source_unchanged(fresh, snapshot),
@@ -736,21 +763,28 @@ def rollback_package(target, snapshot, changed, created, journal):
                 require((now is None if own is None else now is not None and now[:2] == own and
                          p.is_symlink() and os.readlink(p) == row['new']), 'rollback ownership lost')
             still_owned()
-            if row['old'] is None:
-                p.unlink()
-            else:
-                temp = p.with_name('.runner-rebind-rollback-' + uuid.uuid4().hex)
+            parent = os.open(p.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                if row['old'] is None:
+                    p.unlink()
+                else:
+                    temp = p.with_name('.runner-rebind-rollback-' + uuid.uuid4().hex)
+                    try:
+                        temp.symlink_to(row['old'])
+                        check_parents(snapshot, created, p)
+                        still_owned()
+                        if own is None:
+                            os.link(temp, p, follow_symlinks=False)
+                        else:
+                            os.replace(temp, p)
+                    finally:
+                        if temp.is_symlink():
+                            temp.unlink()
+            finally:
                 try:
-                    temp.symlink_to(row['old'])
-                    check_parents(snapshot, created, p)
-                    still_owned()
-                    if own is None:
-                        os.link(temp, p, follow_symlinks=False)
-                    else:
-                        os.replace(temp, p)
+                    os.fsync(parent)
                 finally:
-                    if temp.is_symlink():
-                        temp.unlink()
+                    os.close(parent)
         except (OSError, Refusal):
             errors.add(row['path'])
             print(f'Manual rollback required: {p}; journal: {journal}', file=sys.stderr)
@@ -759,14 +793,30 @@ def rollback_package(target, snapshot, changed, created, journal):
             current = identity(directory)
             if current and current[:2] == own[:2] and stat.S_ISDIR(current[2]):
                 directory.rmdir()  # Empty directories created by this transaction only.
+                sync_directory(directory.parent)
         except OSError:
-            pass
+            errors.add(str(directory.relative_to(target)))
     conflicts = sorted(errors | set(original_state_conflicts(target, snapshot, changed)))
     outcome = {'status': 'manual-recovery' if conflicts else 'rolled-back' if changed else 'not-started',
                'retained_changes': None if conflicts else 0,
                'verification': 'unverified' if conflicts else 'original', 'recovery_paths': conflicts}
     record_forced_links(target, outcome, changed)
     return outcome
+
+
+def sync_directory(path):
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def new_journal(prefix):
+    journal = Path(tempfile.mkdtemp(prefix=prefix, dir='/tmp'))
+    sync_directory(journal)
+    sync_directory(journal.parent)
+    return journal
 
 
 def write_record(path, progress):
@@ -776,7 +826,10 @@ def write_record(path, progress):
         with os.fdopen(fd, 'w', encoding='utf-8') as handle:
             json.dump(progress, handle, indent=2)
             handle.write('\n')
+            handle.flush()
+            os.fsync(handle.fileno())
         os.replace(temporary, path)
+        sync_directory(path.parent)
     finally:
         if temporary.exists():
             temporary.unlink()
@@ -820,7 +873,7 @@ def apply_batch(repo, target, selection, prepared, failures=None):
             except (Refusal, OSError, ValueError, subprocess.SubprocessError) as error:
                 progress['packages'][package].update(state='failed', error=str(error), outcome={
                     'status': 'not-started', 'retained_changes': 0})
-        journal = Path(tempfile.mkdtemp(prefix='runner-rebind-batch-', dir='/tmp')) / 'progress.json'
+        journal = new_journal('runner-rebind-batch-') / 'progress.json'
         progress['stage'] = 'packages'
         write_progress(journal, progress)
         print(f'Batch recovery journal: {journal}', flush=True)

@@ -13,6 +13,7 @@
 /tests/** @Szwarceneger16
 /docs/runner-sync.md @Szwarceneger16
 /docs/runner-rebind.md @Szwarceneger16
+/docs/runner-system-rebind.md @Szwarceneger16
 /packages/*/rebind-paths.manifest @Szwarceneger16
 /docs/runner-release-process.md @Szwarceneger16
 /docs/runner-release-ci.md @Szwarceneger16

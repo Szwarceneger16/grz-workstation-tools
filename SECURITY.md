@@ -207,6 +207,16 @@ The selected-package checks are expected to reject, among other things:
   current static check;
 - unsafe special permission bits unless explicitly allowed.
 
+The optional system rebind helper validates the selected current package's
+system-unit declarations, template coverage, trigger targets and Service.Type
+parsing internally, including direct privileged invocation. It binds the current
+unit manifest to the approval snapshot and repeats this validation before
+publication boundaries and final acceptance. It does not execute an input checkout's checker or hooks.
+This internal gate is limited to the system rebind data contract; it is not a
+claim that all user-layer/hook checks from `check-repo` ran. Unsupported systemd
+system load locations and drop-in layouts are refused by this helper. See
+`docs/runner-system-rebind.md` for its exact scope.
+
 The current hook scan is a heuristic, not a proof that a hook cannot obtain or
 invoke privilege indirectly. For example, constructing `sudo` through a
 variable or another executable path can evade a simple textual match. The
@@ -215,17 +225,20 @@ otherwise escalating privilege, but indirect privilege use must be prevented by
 review and by keeping privileged behavior in the declarative system layer; it
 must not be described as something `check-repo` can prove exhaustively.
 
-On current `main`, system-unit declaration checks do not enumerate every
-systemd load directory. A unit-like file placed under another load directory,
-such as `usr/lib/systemd/system/` or `usr/local/lib/systemd/system/`, can be
-declared as an ordinary system file without being required in
-`system-units.manifest`.
+The system rebind gate and `check-repo` reserve the standard system-manager
+load-directory families (`system`, `system.control`, `system.attached`,
+`transient`, `generator`, `generator.early`, `generator.late`) immediately
+below any `systemd` path component. Only top-level supported unit files under
+`etc/systemd/system/` may be installed; their declarations and trigger targets
+are validated. Alternate load trees, nested drop-ins and unsupported suffixes
+are refused even when listed as ordinary system files. System-config
+manifest destinations in these load trees are refused by `check-repo`, so
+out-of-band payloads cannot substitute for reviewable unit source.
 
-Those alternate systemd load directories are therefore outside the supported
-package contract and must not be used for package-supplied unit files unless
-the repository validation is first extended to cover them. The policy must not
-treat the current `check-repo` implementation as proof that every loadable
-systemd unit is declared.
+This static package contract does not query the host's unit search path or
+promise to discover arbitrary custom paths selected by `SYSTEMD_UNIT_PATH`
+or a nonstandard manager build. Such deployment customization needs its own
+reviewed policy; it must not be treated as covered by these checks.
 
 ## System paths
 

@@ -30,6 +30,8 @@ trap finish_run_sudo_session EXIT
 
 usage() {
   print -u2 -- "usage: $script_name install [--verbose] [--verify] [--test] all|all-user|all-system|<package>"
+  print -u2 -- "       $script_name install --rebind-system --from-repo PATH [--dry-run|--yes] [--system-root PATH] <package>"
+  print -u2 -- "       $script_name verify --rebind-system --from-repo PATH [--system-root PATH] <package>"
   print -u2 -- "       $script_name install --rebind [--recover-dangling] [--force-links] [--from-repo <checkout>] [--dry-run] [-y] <package>|all-user"
   print -u2 -- "       $script_name verify --rebind [--recover-dangling] [--force-links] [--from-repo <checkout>] <package>|all-user"
   print -u2 -- "       $script_name uninstall [--verbose] all|all-user|all-system|<package>"
@@ -476,24 +478,77 @@ unit_name_matches_template() {
 }
 
 systemd_directive_value() {
-  local key="$1" file="$2" value
-  value="$(
-    grep -m1 "^[[:space:]]*${key}[[:space:]]*=" "$file" 2>/dev/null |
-      sed "s/^[[:space:]]*${key}[[:space:]]*=[[:space:]]*//" || :
-  )"
-  value="${value%"${value##*[![:space:]]}"}"
-  print -r -- "$value"
+  local key="$1" file="$2" section
+  case "$key:${file:e}" in
+    Unit:timer) section=Timer ;;
+    Unit:path) section=Path ;;
+    Service:socket|Accept:socket) section=Socket ;;
+    Type:service) section=Service ;;
+    *) return 2 ;;
+  esac
+  # Parse logical lines before recognizing sections. Contract directives must
+  # be unambiguous scalars; unrelated continuations cannot forge a header.
+  LC_ALL=C awk -v wanted="$key" -v expected="$section" '
+    function trim(value) {
+      sub(/^[ \t\r]+/, "", value); sub(/[ \t\r]+$/, "", value)
+      return value
+    }
+    function consume(value, joined, key, position) {
+      value = trim(value)
+      if (substr(value, 1, 1) == "[") {
+        if (value !~ /^\[[^][]+\]$/) { bad = 1; return }
+        section = substr(value, 2, length(value) - 2)
+      } else if (section == expected && (position = index(value, "="))) {
+        key = trim(substr(value, 1, position - 1))
+        if (key == wanted || (expected == "Socket" && (key == "Service" || key == "Accept")) ||
+            ((expected == "Timer" || expected == "Path") && key == "Unit")) {
+          if (++seen[key] > 1 || joined) { bad = 1; return }
+          values[key] = trim(substr(value, position + 1))
+          if (key == "Accept" && tolower(values[key]) !~ /^(|1|yes|y|true|t|on|0|no|n|false|f|off)$/)
+            bad = 1
+        }
+      }
+    }
+    {
+      physical = $0
+      sub(/\r$/, "", physical)
+      if (index(physical, sprintf("%c", 0))) { bad = 1; exit 2 }
+      if (trim(physical) ~ /^[#;]/) next
+      if (index(physical, "\357\273\277")) {
+        if (bom_seen || pending != "" || index(physical, "\357\273\277") != 1) { bad = 1; exit 2 }
+        physical = substr(physical, 4); bom_seen = 1
+      }
+      value = pending physical
+      if (length(value) > 1048576) { bad = 1; exit 2 }
+      slashes = 0
+      for (i = length(value); i > 0 && substr(value, i, 1) == "\\"; i--) slashes++
+      if (slashes % 2) { pending = substr(value, 1, length(value) - 1) " "; continued = 1; next }
+      consume(value, continued)
+      pending = ""; continued = 0
+    }
+    END {
+      if (pending != "") consume(pending, 1)
+      if (bad) exit 2
+      print values[wanted]
+    }
+  ' "$file"
+}
+
+systemd_target_specifiers_supported() {
+  local unit="$1" value="$2" remainder
+  remainder="${value//\%i/}"
+  remainder="${remainder//\%I/}"
+  [[ "$remainder" != *%* ]] || return 1
+  [[ "$value" != *%[iI]* || "$unit" == *@*.* ]]
 }
 
 systemd_truthy_directive() {
   local key="$1" file="$2" value
-  value="$(systemd_directive_value "$key" "$file")"
-  value="${value%%#*}"
-  value="${value%%;*}"
+  value="$(systemd_directive_value "$key" "$file")" || return 2
   value="${value#"${value%%[![:space:]]*}"}"
   value="${value%"${value##*[![:space:]]}"}"
   case "${(L)value}" in
-    yes|true|1|on) return 0 ;;
+    yes|y|true|t|1|on) return 0 ;;
   esac
   return 1
 }
@@ -624,20 +679,24 @@ activation_bases_for_unit() {
 
   case "$unit" in
     *.timer|*.path)
-      managed_target="$(systemd_directive_value Unit "$unit_file")"
+      managed_target="$(systemd_directive_value Unit "$unit_file")" || die "invalid or ambiguous systemd contract: $unit"
+      systemd_target_specifiers_supported "$unit" "$managed_target" || die "unsupported target specifier: $unit"
       if [[ -n "$managed_target" ]]; then
         [[ -n "$unit_instance" ]] && managed_target="${managed_target//\%i/$unit_instance}"
         [[ -n "$unit_instance" ]] && managed_target="${managed_target//\%I/$unit_instance_unescaped}"
+        is_template_unit_name "$managed_target" && die "uninstantiated template trigger target: $unit -> $managed_target"
         print -r -- "${managed_target%.service}"
       else
         print -r -- "${unit%.*}"
       fi
       ;;
     *.socket)
-      managed_target="$(systemd_directive_value Service "$unit_file")"
+      managed_target="$(systemd_directive_value Service "$unit_file")" || die "invalid or ambiguous systemd contract: $unit"
+      systemd_target_specifiers_supported "$unit" "$managed_target" || die "unsupported target specifier: $unit"
       if [[ -n "$managed_target" ]]; then
         [[ -n "$unit_instance" ]] && managed_target="${managed_target//\%i/$unit_instance}"
         [[ -n "$unit_instance" ]] && managed_target="${managed_target//\%I/$unit_instance_unescaped}"
+        is_template_unit_name "$managed_target" && die "uninstantiated template trigger target: $unit -> $managed_target"
         print -r -- "${managed_target%.service}"
       elif systemd_truthy_directive Accept "$unit_file"; then
         # Accept=yes sockets instantiate the template service per connection;
@@ -707,6 +766,10 @@ activate_user_units() {
   activation_bases=()
   for unit in "${user_units[@]}"; do
     unit_file="$(resolve_unit_file_path "$unit_dir" "$unit")"
+    if [[ "$unit" == *.service ]]; then
+      systemd_directive_value Type "$unit_file" >/dev/null ||
+        die "invalid or ambiguous systemd contract: $unit"
+    fi
     # systemd resolves unit names through its own search path, so verify the
     # live stow link actually points at this package's file before mutating
     # anything by name (a stale link or a same-named unit elsewhere could
@@ -725,7 +788,9 @@ activate_user_units() {
     fi
     verify_stow_link "$unit_file" "$target/.config/systemd/user/$dest_name" ".config/systemd/user/$dest_name" ||
       verify_failures=$(( verify_failures + 1 ))
-    for base in "${(@f)$(activation_bases_for_unit "$unit_dir" "$unit")}"; do
+    local selected_bases
+    selected_bases="$(activation_bases_for_unit "$unit_dir" "$unit")" || die "failed to resolve trigger targets: $unit"
+    for base in "${(@f)selected_bases}"; do
       [[ -n "$base" ]] && activation_bases[$base]=1
     done
   done
@@ -882,7 +947,9 @@ deactivate_user_units() {
   done
   activation_bases=()
   for unit in "${user_units[@]}"; do
-    for base in "${(@f)$(activation_bases_for_unit "$unit_dir" "$unit")}"; do
+    local selected_bases
+    selected_bases="$(activation_bases_for_unit "$unit_dir" "$unit")" || die "failed to resolve trigger targets: $unit"
+    for base in "${(@f)selected_bases}"; do
       [[ -n "$base" ]] && activation_bases[$base]=1
     done
   done
@@ -1576,10 +1643,19 @@ run_user_rebind() {
   python3 -I "$helper" --target "$target" "$@"
 }
 
+run_system_rebind() {
+  local helper="$repo_root/scripts/rebind-system-package"
+  [[ -f "$helper" && ! -L "$helper" ]] || \
+    die "optional system rebind helper is not installed: scripts/rebind-system-package"
+  python3 -I "$helper" --repo "$repo_root" "$@"
+}
+
 parse_verify() {
   local selector=""
   local verbose=0
   local rebind=0
+  local system_rebind=0
+  local system_options=0
   local -a legacy_roots
   legacy_roots=()
 
@@ -1590,6 +1666,15 @@ parse_verify() {
         ;;
       --rebind)
         rebind=1
+        ;;
+      --rebind-system)
+        system_rebind=1
+        ;;
+      --system-root)
+        (( $# >= 2 )) || die "$1 requires an absolute path"
+        legacy_roots+=(--system-root "$2")
+        system_options=1
+        shift
         ;;
       --recover-dangling)
         legacy_roots+=(--recover-dangling)
@@ -1621,6 +1706,12 @@ parse_verify() {
 
   [[ -n "$selector" ]] || { usage; exit 64; }
 
+  if (( system_rebind )); then
+    (( ! rebind )) || die "user and system rebind must be separate operations"
+    run_system_rebind --inspect --package "$selector" "${legacy_roots[@]}"
+    return
+  fi
+  (( ! system_options )) || die "--system-root requires --rebind-system"
   if (( rebind )); then
     run_user_rebind --inspect --package "$selector" "${legacy_roots[@]}"
     return
@@ -1811,6 +1902,8 @@ parse_install() {
   local do_verify=0
   local do_test=0
   local rebind=0
+  local system_rebind=0
+  local system_options=0
   local -a rebind_args
   rebind_args=()
 
@@ -1827,6 +1920,15 @@ parse_install() {
         ;;
       --rebind)
         rebind=1
+        ;;
+      --rebind-system)
+        system_rebind=1
+        ;;
+      --system-root|--journal-dir)
+        (( $# >= 2 )) || die "$1 requires an absolute path"
+        rebind_args+=("$1" "$2")
+        system_options=1
+        shift
         ;;
       --dry-run|-n)
         rebind_args+=(--dry-run)
@@ -1876,6 +1978,13 @@ parse_install() {
     exit 64
   }
 
+  if (( system_rebind )); then
+    (( ! rebind && ! do_verify && ! do_test )) || \
+      die "system rebind is separate from user rebind and --verify/--test hooks"
+    run_system_rebind --package "$selector" "${rebind_args[@]}"
+    return
+  fi
+  (( ! system_options )) || die "--system-root/--journal-dir require --rebind-system"
   if (( rebind )); then
     (( ! do_verify && ! do_test )) || die "--rebind verifies links itself; --verify/--test hooks are not allowed"
     run_user_rebind --package "$selector" "${rebind_args[@]}"
