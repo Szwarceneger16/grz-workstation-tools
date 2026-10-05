@@ -170,8 +170,8 @@ remain valid in this mode. If they were removed, also select
 `--recover-dangling` and use missing roots under that mode's rules.
 
 The preview labels each override `force-link` and prints its old and proposed
-link text with JSON escaping. It also discloses that the unproven target and
-its payload are not inspected. A forced leaf may point to a healthy foreign
+link text with JSON escaping. It also discloses that the unproven target's
+payload is not read or compared. A forced leaf may point to a healthy foreign
 file, a directory, an indirect link chain or a missing target; only the leaf
 symlink at the current declared destination is replaced. The target object
 and its data remain untouched. Without `--yes`, interactive approval requires
@@ -194,6 +194,25 @@ preserved and reported as manual recovery. In `all-user`, a failed package
 does not undo successful packages or prevent later eligible packages from
 running; errors and rollback outcomes remain explicit. Lock contention or a
 persistent batch-journal failure still stops the series.
+
+After actual forced replacements, a final follow-up list groups detached
+target references by their old directory and deduplicates each target within
+that directory. Entries identify the package, installed link path and current
+package/link result. Fully restored links and unattempted changes are omitted.
+Package `result.json` saves that package's terminal observation. Batch
+`progress.json` and the final console report recheck the references after all
+packages finish, including after partial failure and final-state uncertainty.
+
+The follow-up uses metadata-only `stat` to check whether each old target still
+exists. That OS lookup can follow target symlinks; it does not read contents,
+enumerate directories, resolve a path for ownership proof or remove anything.
+Only targets confirmed missing (`ENOENT`/`ENOTDIR`) are omitted. Permission
+errors, link loops and unsafe installed parents produce an `unknown` entry
+requiring manual inspection. The displayed path is the direct old reference,
+not a resolved payload location. Noncanonical link text is preserved rather
+than collapsing interior `..` through an unknown symlink. Existence is a
+point-in-time observation and may change after the report. This is a checklist
+for the owner, not a claim that the old target is unused or safe to delete.
 
 This mode may intentionally replace a healthy link owned by another installer.
 Approval authorizes that exact link replacement and deployment of the current

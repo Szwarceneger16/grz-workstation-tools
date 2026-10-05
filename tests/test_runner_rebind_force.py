@@ -58,7 +58,7 @@ class ForceLinkTests(unittest.TestCase):
         result = self.cli('--dry-run')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('force-link: ' + self.files[0], result.stdout)
-        self.assertIn('targets and payload are not inspected', result.stdout)
+        self.assertIn('their payload is not read or compared', result.stdout)
         self.assertIn(json.dumps(str(self.foreign)), result.stdout)
         self.assertIn('replace link text:', result.stdout)
         self.assertEqual(self.state(), before)

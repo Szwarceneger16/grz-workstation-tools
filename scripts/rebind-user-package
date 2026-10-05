@@ -299,7 +299,8 @@ def prepare(repo, target, package, explicit_roots, recover_dangling=False, force
               'approval uses exact link text and the selected missing roots only.')
     if force_links:
         print('Forced link replacement: unproven leaf links may be replaced; '
-              'their targets and payload are not inspected. Regular files remain conflicts.')
+              'their payload is not read or compared. Target existence is checked '
+              'for final follow-up. Regular files remain conflicts.')
     for root in roots:
         label = 'Selected source repository' if explicit_roots else 'Detected source candidate'
         print(f'{label}: {root}')
@@ -503,6 +504,91 @@ def original_state_conflicts(target, snapshot, changed):
     return conflicts
 
 
+def probe_detached_target(reference):
+    try:
+        os.stat(reference)  # Existence only; never read target contents.
+        return 'exists'
+    except (FileNotFoundError, NotADirectoryError):
+        return 'missing'
+    except OSError:
+        return 'unknown'  # Permission errors and loops are not proof of absence.
+
+
+def update_detached_targets(target, outcome):
+    """Metadata-only follow-up for actually changed forced leaves, never cleanup."""
+    if not outcome.get('forced_links'):
+        return
+    checks = []
+    missing = 0
+    for row in outcome['forced_links']:
+        installed = target / row['path']
+        reference = os.path.join(str(installed.parent), row['old'])
+        # Leading relative '..' is safe to normalize through validated parents.
+        # Preserve noncanonical spellings: collapsing interior '..' through an
+        # unknown symlink would describe a different target.
+        location = (os.path.abspath(reference) if os.path.normpath(row['old']) == row['old']
+                    else reference)
+        link_state = 'unverified'
+        target_state = 'unknown'
+        try:
+            directories(installed.parent)
+            entry = identity(installed)
+            if entry and stat.S_ISLNK(entry[2]):
+                raw = os.readlink(installed)
+                if raw == row['old']:
+                    continue  # Rollback (or another writer) restored the reference.
+                if raw == row['new']:
+                    link_state = 'replaced'
+            target_state = probe_detached_target(reference)
+            if target_state == 'missing':
+                missing += 1
+                continue
+        except (OSError, Refusal):
+            pass  # Unsafe/changed parents: retain an explicitly uncertain check.
+        checks.append({'old_target': location, 'installed_path': str(installed),
+                       'link_state': link_state, 'target_state': target_state})
+    outcome['detached_targets'] = checks
+    outcome['omitted_missing_targets'] = missing
+
+
+def record_forced_links(target, outcome, changed):
+    rows = [{'path': row['path'], 'old': row['old'], 'new': row['new']}
+            for row, _ in changed if row['state'] == 'force-link']
+    if rows:
+        outcome['forced_links'] = rows
+        update_detached_targets(target, outcome)
+
+
+def refresh_batch_target_reports(target, packages):
+    for result in packages.values():
+        update_detached_targets(target, result.get('outcome', {}))
+
+
+def print_detached_targets(outcomes):
+    if not any(outcome.get('forced_links') for outcome in outcomes.values()):
+        return
+    groups = {}
+    missing = sum(outcome.get('omitted_missing_targets', 0) for outcome in outcomes.values())
+    for package, outcome in outcomes.items():
+        for row in outcome.get('detached_targets', []):
+            location = row['old_target']
+            group = groups.setdefault(str(Path(location).parent), {})
+            group.setdefault(location, []).append((package, row, outcome['status']))
+    print('Detached forced targets to inspect (grouped by directory; no cleanup performed):', flush=True)
+    for directory, targets in sorted(groups.items()):
+        print('  Directory: ' + json.dumps(directory, ensure_ascii=True), flush=True)
+        for location, rows in sorted(targets.items()):
+            state = 'unknown' if any(row['target_state'] == 'unknown' for _, row, _ in rows) else 'exists'
+            print('    Target: ' + json.dumps(location, ensure_ascii=True) + f' [{state}]', flush=True)
+            for package, row, status in sorted(rows, key=lambda item: (item[0], item[1]['installed_path'])):
+                print(f'      {package}: ' + json.dumps(row['installed_path'], ensure_ascii=True) +
+                      f' [{row["link_state"]}; {status}]', flush=True)
+    if not groups:
+        print('  No detached targets requiring a check.', flush=True)
+    if missing:
+        print(f'  Confirmed missing targets omitted: {missing}', flush=True)
+
+
 def print_package_result(package, outcome):
     retained = outcome.get('retained_changes')
     count = str(retained) if retained is not None else 'unknown'
@@ -587,6 +673,7 @@ def apply_locked(repo, target, package, roots, snapshot, on_journal=None, on_com
                    'retained_changes': len(changed), 'verification': 'current'}
         result = {'journal': str(journal), 'created': created, 'outcome': outcome}
         with mutation_record():
+            record_forced_links(target, outcome, changed)
             write_record(journal.with_name('result.json'), outcome)
             if on_complete:
                 on_complete(result)
@@ -594,6 +681,7 @@ def apply_locked(repo, target, package, roots, snapshot, on_journal=None, on_com
             print('Rebind verified; hooks, system files and service state were not touched.')
             if on_complete is None:
                 print_package_result(package, outcome)
+                print_detached_targets({package: outcome})
         return result
     except BaseException:
         if complete:
@@ -610,6 +698,7 @@ def apply_locked(repo, target, package, roots, snapshot, on_journal=None, on_com
                 on_failure(outcome)
             else:
                 print_package_result(package, outcome)
+                print_detached_targets({package: outcome})
         raise
 
 
@@ -651,9 +740,11 @@ def rollback_package(target, snapshot, changed, created, journal):
         except OSError:
             pass
     conflicts = sorted(errors | set(original_state_conflicts(target, snapshot, changed)))
-    return {'status': 'manual-recovery' if conflicts else 'rolled-back' if changed else 'not-started',
-            'retained_changes': None if conflicts else 0,
-            'verification': 'unverified' if conflicts else 'original', 'recovery_paths': conflicts}
+    outcome = {'status': 'manual-recovery' if conflicts else 'rolled-back' if changed else 'not-started',
+               'retained_changes': None if conflicts else 0,
+               'verification': 'unverified' if conflicts else 'original', 'recovery_paths': conflicts}
+    record_forced_links(target, outcome, changed)
+    return outcome
 
 
 def write_record(path, progress):
@@ -768,11 +859,13 @@ def apply_batch(repo, target, selection, prepared, failures=None):
                 raise
             except (Refusal, OSError, ValueError, subprocess.SubprocessError) as error:
                 result['error'] = str(error)
-                result['outcome'] = {'status': 'final-state-unverified', 'verification': 'unverified',
+                result['outcome'] = {**result.get('outcome', {}),
+                                     'status': 'final-state-unverified', 'verification': 'unverified',
                                      'retained_changes': None}
         errors = [name for name, result in progress['packages'].items() if result.get('error')]
         progress['state'] = 'failed' if errors else 'completed'
         progress['stage'] = 'complete'
+        refresh_batch_target_reports(target, progress['packages'])
         write_progress(journal, progress)
         if errors:
             raise Refusal('batch completed with package failures: ' + ', '.join(errors))
@@ -794,8 +887,10 @@ def apply_batch(repo, target, selection, prepared, failures=None):
                     verify_result(target, repo, package, snapshot)
                 except (Refusal, OSError, ValueError, subprocess.SubprocessError) as error:
                     result['error'] = str(error)
-                    result['outcome'] = {'status': 'final-state-unverified', 'verification': 'unverified',
+                    result['outcome'] = {**result.get('outcome', {}),
+                                         'status': 'final-state-unverified', 'verification': 'unverified',
                                          'retained_changes': None}
+            refresh_batch_target_reports(target, progress['packages'])
             if journal is not None:
                 try:
                     with mutation_record():
@@ -810,6 +905,8 @@ def apply_batch(repo, target, selection, prepared, failures=None):
                     names = [name for name, result in progress['packages'].items() if result['state'] == state]
                     print(f'Batch {state} packages: ' + (', '.join(names) or '(none)'), flush=True)
                 print_batch_results(selection, progress['packages'])
+                print_detached_targets({name: result.get('outcome', {})
+                                        for name, result in progress['packages'].items()})
                 print(f'Batch status: {progress["state"]}; stage: {progress["stage"]}', flush=True)
                 if journal is not None:
                     print(f'Batch recovery journal: {journal}', flush=True)
