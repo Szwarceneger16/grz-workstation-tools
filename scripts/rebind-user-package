@@ -146,18 +146,18 @@ def lost_source_state(roots):
 
 
 def refresh_plan(repo, target, package, roots, snapshot):
-    if snapshot.get('recover_dangling'):
-        return plan(repo, target, package, roots, recover_dangling=True)
-    return plan(repo, target, package, roots)
+    modes = {key: True for key in ('recover_dangling', 'force_links') if snapshot.get(key)}
+    return plan(repo, target, package, roots, **modes)
 
 
 def source_unchanged(fresh, snapshot):
     keys = ('files', 'legacy', 'mapping', 'renames')
     return all(fresh[key] == snapshot[key] for key in keys) and (
-        fresh.get('lost_sources') == snapshot.get('lost_sources'))
+        fresh.get('lost_sources') == snapshot.get('lost_sources') and
+        fresh.get('force_links') == snapshot.get('force_links'))
 
 
-def plan(repo, target, package, roots, recover_dangling=False):
+def plan(repo, target, package, roots, recover_dangling=False, force_links=False):
     directories(target)
     files = inventory(repo, package)
     renames, mapping_state = mappings(repo, package, files)
@@ -219,6 +219,10 @@ def plan(repo, target, package, roots, recover_dangling=False):
             state = 'recover-dangling'
         elif owner:
             state = 'rebind' if rel in files else 'rename' if rel in renames else 'legacy-residue'
+        elif force_links and raw is not None and rel in files:
+            require(not any(ord(c) < 32 or ord(c) == 127 for c in raw),
+                    f'unsafe link text at declared destination: {rel}')
+            state = 'force-link'
         else:
             state = 'conflict'
         if state in {'legacy-residue', 'conflict'}:
@@ -240,6 +244,8 @@ def plan(repo, target, package, roots, recover_dangling=False):
               'rows': rows, 'conflicts': conflicts}
     if recover_dangling:
         result.update(recover_dangling=True, lost_sources=lost_sources)
+    if force_links:
+        result['force_links'] = True
     return result
 
 
@@ -270,11 +276,13 @@ def discover_sources(repo, target, package):
     return sorted(roots)
 
 
-def prepare(repo, target, package, explicit_roots, recover_dangling=False):
+def prepare(repo, target, package, explicit_roots, recover_dangling=False, force_links=False):
     require(re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]*', package) and
             package not in {'all', 'all-user', 'all-system'}, 'select exactly one explicit package')
     require(not recover_dangling or explicit_roots,
             '--recover-dangling requires explicit --from-repo values')
+    require(not force_links or explicit_roots,
+            '--force-links requires explicit --from-repo values')
     roots = explicit_roots if explicit_roots else discover_sources(repo, target, package)
     require(len(set(roots)) == len(roots) and repo not in roots,
             'supply distinct source checkouts, never the current checkout')
@@ -282,12 +290,17 @@ def prepare(repo, target, package, explicit_roots, recover_dangling=False):
             'installation target cannot be inside a source checkout')
     require(not recover_dangling or not any(r.is_relative_to(target) for r in roots),
             'recovery source cannot be inside the installation target')
-    snapshot = plan(repo, target, package, roots, recover_dangling=True) if recover_dangling else (
-        plan(repo, target, package, roots))
+    modes = {key: True for key, enabled in (
+        ('recover_dangling', recover_dangling), ('force_links', force_links)) if enabled}
+    snapshot = plan(repo, target, package, roots, **modes)
     print(f'Repository: {repo}\nTarget: {target}\nPackage: {package}')
     if recover_dangling:
         print('Dangling-link recovery: old payload and ownership cannot be verified; '
               'approval uses exact link text and the selected missing roots only.')
+    if force_links:
+        print('Forced link replacement: unproven leaf links may be replaced; '
+              'their payload is not read or compared. Target existence is checked '
+              'for final follow-up. Regular files remain conflicts.')
     for root in roots:
         label = 'Selected source repository' if explicit_roots else 'Detected source candidate'
         print(f'{label}: {root}')
@@ -296,6 +309,9 @@ def prepare(repo, target, package, explicit_roots, recover_dangling=False):
     for row in snapshot['rows']:
         detail = ' (payload differs)' if row['content_changed'] else ''
         print(f'{row["state"]}: {row["path"]}{detail}')
+        if row['state'] == 'force-link':
+            print('  replace link text: ' + json.dumps(row['old'], ensure_ascii=True) +
+                  ' -> ' + json.dumps(row['new'], ensure_ascii=True))
         if row['from_repo'] is not None:
             print(f'  from repository: {row["from_repo"]}')
     require(not snapshot['conflicts'], 'conflicts or unmapped legacy residue; no changes made')
@@ -303,14 +319,14 @@ def prepare(repo, target, package, explicit_roots, recover_dangling=False):
     return roots, snapshot
 
 
-def inspect_all(repo, target, explicit_roots, recover_dangling=False):
+def inspect_all(repo, target, explicit_roots, recover_dangling=False, force_links=False):
     directories(repo / 'stow')
     packages = sorted(path.name for path in (repo / 'stow').iterdir())
     require(packages, 'no user packages to inspect')
     failures = pending = 0
     for package in packages:
         try:
-            _, snapshot = prepare(repo, target, package, explicit_roots, recover_dangling)
+            _, snapshot = prepare(repo, target, package, explicit_roots, recover_dangling, force_links)
             pending += any(row['state'] not in {'current', 'absent-legacy'} for row in snapshot['rows'])
         except (Refusal, OSError, ValueError, subprocess.SubprocessError) as error:
             failures += 1
@@ -350,7 +366,7 @@ def batch_selection(repo):
             'entries': entries, 'policy': policy_state}
 
 
-def prepare_batch(repo, target, explicit_roots, recover_dangling=False):
+def prepare_batch(repo, target, explicit_roots, recover_dangling=False, force_links=False):
     selection = batch_selection(repo)
     print('Selected user packages: ' + ', '.join(selection['selected']))
     print('Excluded user packages: ' + (', '.join(selection['excluded']) or '(none)'))
@@ -358,7 +374,7 @@ def prepare_batch(repo, target, explicit_roots, recover_dangling=False):
     try:
         for package in selection['selected']:
             try:
-                roots, snapshot = prepare(repo, target, package, explicit_roots, recover_dangling)
+                roots, snapshot = prepare(repo, target, package, explicit_roots, recover_dangling, force_links)
                 prepared[package] = (roots, snapshot)
             except Interrupted:
                 raise
@@ -488,6 +504,95 @@ def original_state_conflicts(target, snapshot, changed):
     return conflicts
 
 
+def probe_detached_target(reference):
+    try:
+        os.stat(reference)  # Existence only; never read target contents.
+        return 'exists'
+    except (FileNotFoundError, NotADirectoryError):
+        return 'missing'
+    except OSError:
+        return 'unknown'  # Permission errors and loops are not proof of absence.
+
+
+def update_detached_targets(target, outcome, probe=True):
+    """Metadata-only follow-up for actually changed forced leaves, never cleanup."""
+    if not outcome.get('forced_links'):
+        return
+    checks = []
+    missing = 0
+    for row in outcome['forced_links']:
+        installed = target / row['path']
+        reference = os.path.join(str(installed.parent), row['old'])
+        # Leading relative '..' is safe to normalize through validated parents.
+        # Preserve noncanonical spellings: collapsing interior '..' through an
+        # unknown symlink would describe a different target.
+        location = (os.path.abspath(reference) if os.path.normpath(row['old']) == row['old']
+                    else reference)
+        link_state = 'unverified'
+        target_state = 'unknown'
+        try:
+            directories(installed.parent)
+            entry = identity(installed)
+            if entry and stat.S_ISLNK(entry[2]):
+                raw = os.readlink(installed)
+                if raw == row['old']:
+                    continue  # Rollback (or another writer) restored the reference.
+                if raw == row['new']:
+                    link_state = 'replaced'
+            if probe:
+                target_state = probe_detached_target(reference)
+            if target_state == 'missing':
+                missing += 1
+                continue
+        except Interrupted:
+            raise
+        except (OSError, Refusal):
+            pass  # Unsafe/changed parents: retain an explicitly uncertain check.
+        checks.append({'old_target': location, 'installed_path': str(installed),
+                       'link_state': link_state, 'target_state': target_state})
+    outcome['detached_targets'] = checks
+    outcome['omitted_missing_targets'] = missing
+
+
+def record_forced_links(target, outcome, changed):
+    rows = [{'path': row['path'], 'old': row['old'], 'new': row['new']}
+            for row, _ in changed if row['state'] == 'force-link']
+    if rows:
+        outcome['forced_links'] = rows
+        # Persist conservative evidence before any potentially blocking lookup.
+        update_detached_targets(target, outcome, probe=False)
+
+
+def refresh_batch_target_reports(target, packages, probe=True):
+    for result in packages.values():
+        update_detached_targets(target, result.get('outcome', {}), probe=probe)
+
+
+def print_detached_targets(outcomes):
+    if not any(outcome.get('forced_links') for outcome in outcomes.values()):
+        return
+    groups = {}
+    missing = sum(outcome.get('omitted_missing_targets', 0) for outcome in outcomes.values())
+    for package, outcome in outcomes.items():
+        for row in outcome.get('detached_targets', []):
+            location = row['old_target']
+            group = groups.setdefault(str(Path(location).parent), {})
+            group.setdefault(location, []).append((package, row, outcome['status']))
+    print('Detached forced targets to inspect (grouped by directory; no cleanup performed):', flush=True)
+    for directory, targets in sorted(groups.items()):
+        print('  Directory: ' + json.dumps(directory, ensure_ascii=True), flush=True)
+        for location, rows in sorted(targets.items()):
+            state = 'unknown' if any(row['target_state'] == 'unknown' for _, row, _ in rows) else 'exists'
+            print('    Target: ' + json.dumps(location, ensure_ascii=True) + f' [{state}]', flush=True)
+            for package, row, status in sorted(rows, key=lambda item: (item[0], item[1]['installed_path'])):
+                print(f'      {package}: ' + json.dumps(row['installed_path'], ensure_ascii=True) +
+                      f' [{row["link_state"]}; {status}]', flush=True)
+    if not groups:
+        print('  No detached targets requiring a check.', flush=True)
+    if missing:
+        print(f'  Confirmed missing targets omitted: {missing}', flush=True)
+
+
 def print_package_result(package, outcome):
     retained = outcome.get('retained_changes')
     count = str(retained) if retained is not None else 'unknown'
@@ -514,6 +619,7 @@ def apply_locked(repo, target, package, roots, snapshot, on_journal=None, on_com
     changed, created = [], []
     journal = None
     complete = False
+    reported = False
     try:
         require(refresh_plan(repo, target, package, roots, snapshot) == snapshot,
                 'candidate changed after approval; rerun')
@@ -572,16 +678,28 @@ def apply_locked(repo, target, package, roots, snapshot, on_journal=None, on_com
                    'retained_changes': len(changed), 'verification': 'current'}
         result = {'journal': str(journal), 'created': created, 'outcome': outcome}
         with mutation_record():
+            record_forced_links(target, outcome, changed)
             write_record(journal.with_name('result.json'), outcome)
             if on_complete:
                 on_complete(result)
             complete = True
+        try:
+            if outcome.get('forced_links'):
+                update_detached_targets(target, outcome)
+                with mutation_record():
+                    write_record(journal.with_name('result.json'), outcome)
+        finally:
+            reported = True
             print('Rebind verified; hooks, system files and service state were not touched.')
             if on_complete is None:
                 print_package_result(package, outcome)
+                print_detached_targets({package: outcome})
         return result
-    except BaseException:
+    except BaseException as error:
         if complete:
+            if not reported and on_complete is None:
+                print_package_result(package, outcome)
+                print_detached_targets({package: outcome})
             raise  # Already committed and durably reported to a batch caller.
         # A second handled signal must not interrupt rollback halfway through.
         with mutation_record():
@@ -593,8 +711,16 @@ def apply_locked(repo, target, package, roots, snapshot, on_journal=None, on_com
                     print(f'Could not record package result; journal: {journal}', file=sys.stderr)
             if on_failure:
                 on_failure(outcome)
-            else:
+        try:
+            if outcome.get('forced_links') and not isinstance(error, (Interrupted, KeyboardInterrupt)):
+                update_detached_targets(target, outcome)
+                if journal is not None:
+                    with mutation_record():
+                        write_record(journal.with_name('result.json'), outcome)
+        finally:
+            if on_failure is None:
                 print_package_result(package, outcome)
+                print_detached_targets({package: outcome})
         raise
 
 
@@ -636,9 +762,11 @@ def rollback_package(target, snapshot, changed, created, journal):
         except OSError:
             pass
     conflicts = sorted(errors | set(original_state_conflicts(target, snapshot, changed)))
-    return {'status': 'manual-recovery' if conflicts else 'rolled-back' if changed else 'not-started',
-            'retained_changes': None if conflicts else 0,
-            'verification': 'unverified' if conflicts else 'original', 'recovery_paths': conflicts}
+    outcome = {'status': 'manual-recovery' if conflicts else 'rolled-back' if changed else 'not-started',
+               'retained_changes': None if conflicts else 0,
+               'verification': 'unverified' if conflicts else 'original', 'recovery_paths': conflicts}
+    record_forced_links(target, outcome, changed)
+    return outcome
 
 
 def write_record(path, progress):
@@ -753,15 +881,17 @@ def apply_batch(repo, target, selection, prepared, failures=None):
                 raise
             except (Refusal, OSError, ValueError, subprocess.SubprocessError) as error:
                 result['error'] = str(error)
-                result['outcome'] = {'status': 'final-state-unverified', 'verification': 'unverified',
+                result['outcome'] = {**result.get('outcome', {}),
+                                     'status': 'final-state-unverified', 'verification': 'unverified',
                                      'retained_changes': None}
         errors = [name for name, result in progress['packages'].items() if result.get('error')]
         progress['state'] = 'failed' if errors else 'completed'
         progress['stage'] = 'complete'
+        refresh_batch_target_reports(target, progress['packages'])
         write_progress(journal, progress)
         if errors:
             raise Refusal('batch completed with package failures: ' + ', '.join(errors))
-    except BaseException:
+    except BaseException as failure:
         with mutation_record():
             progress['state'] = 'failed'
             if current is not None and progress['packages'][current]['state'] != 'completed':
@@ -779,14 +909,24 @@ def apply_batch(repo, target, selection, prepared, failures=None):
                     verify_result(target, repo, package, snapshot)
                 except (Refusal, OSError, ValueError, subprocess.SubprocessError) as error:
                     result['error'] = str(error)
-                    result['outcome'] = {'status': 'final-state-unverified', 'verification': 'unverified',
+                    result['outcome'] = {**result.get('outcome', {}),
+                                         'status': 'final-state-unverified', 'verification': 'unverified',
                                          'retained_changes': None}
+            refresh_batch_target_reports(target, progress['packages'], probe=False)
             if journal is not None:
                 try:
                     with mutation_record():
                         write_progress(journal, progress)
                 except OSError:
                     print(f'Could not update batch recovery journal: {journal}', file=sys.stderr)
+        # No foreign target lookup may run in the signal-masked recovery path.
+        # An interrupted report must not retry the same potentially stuck lookup.
+        if not isinstance(failure, (Interrupted, KeyboardInterrupt)) and any(
+                result.get('outcome', {}).get('forced_links') for result in progress['packages'].values()):
+            refresh_batch_target_reports(target, progress['packages'])
+            if journal is not None:
+                with mutation_record():
+                    write_progress(journal, progress)
         raise
     finally:
         try:
@@ -795,6 +935,8 @@ def apply_batch(repo, target, selection, prepared, failures=None):
                     names = [name for name, result in progress['packages'].items() if result['state'] == state]
                     print(f'Batch {state} packages: ' + (', '.join(names) or '(none)'), flush=True)
                 print_batch_results(selection, progress['packages'])
+                print_detached_targets({name: result.get('outcome', {})
+                                        for name, result in progress['packages'].items()})
                 print(f'Batch status: {progress["state"]}; stage: {progress["stage"]}', flush=True)
                 if journal is not None:
                     print(f'Batch recovery journal: {journal}', flush=True)
@@ -810,17 +952,21 @@ def main():
     parser.add_argument('--dry-run', action='store_true')
     parser.add_argument('--inspect', action='store_true')
     parser.add_argument('--recover-dangling', action='store_true')
+    parser.add_argument('--force-links', action='store_true')
     parser.add_argument('--yes', action='store_true')
     args = parser.parse_args()
     repo = absolute(str(Path(__file__).absolute().parent.parent))
     target = absolute(args.target)
     require(not args.recover_dangling or args.from_repo,
             '--recover-dangling requires explicit --from-repo values')
+    require(not args.force_links or args.from_repo,
+            '--force-links requires explicit --from-repo values')
     explicit_roots = [absolute(value, missing=args.recover_dangling) for value in args.from_repo]
     if args.inspect and args.package == 'all-user':
-        return inspect_all(repo, target, explicit_roots, args.recover_dangling)
+        return inspect_all(repo, target, explicit_roots, args.recover_dangling, args.force_links)
     if args.package == 'all-user':
-        selection, prepared, failures = prepare_batch(repo, target, explicit_roots, args.recover_dangling)
+        selection, prepared, failures = prepare_batch(repo, target, explicit_roots,
+                                                     args.recover_dangling, args.force_links)
         if args.dry_run:
             print_batch_results(selection, {package: {'state': 'unattempted', 'outcome': {
                 'status': 'blocked' if package in failures else 'preview-only', 'retained_changes': 0},
@@ -835,7 +981,8 @@ def main():
             raise
         apply_batch(repo, target, selection, prepared, failures)
         return 0
-    roots, snapshot = prepare(repo, target, args.package, explicit_roots, args.recover_dangling)
+    roots, snapshot = prepare(repo, target, args.package, explicit_roots,
+                              args.recover_dangling, args.force_links)
     if args.dry_run or args.inspect:
         print('Read-only preflight complete; no installed paths changed.')
         if roots and any(row['state'] not in {'current', 'absent-legacy'} for row in snapshot['rows']):
@@ -843,6 +990,8 @@ def main():
                        '--target', str(target), '--package', args.package]
             if args.recover_dangling:
                 command += ['--recover-dangling']
+            if args.force_links:
+                command += ['--force-links']
             for root in roots:
                 command += ['--from-repo', str(root)]
             print('Review explicit dry-run: ' + shlex.join(command + ['--dry-run']))
@@ -857,7 +1006,8 @@ def approve(args, explicit_roots):
             '--yes requires explicit --from-repo values; discovered sources require interactive approval')
     if not args.yes:
         require(sys.stdin.isatty(), 'interactive approval required; review dry-run, then specify --from-repo and --yes')
-        require(input(f'Rebind user links for {args.package}? Type REBIND: ') == 'REBIND', 'cancelled')
+        phrase = 'FORCE REBIND' if args.force_links else 'REBIND'
+        require(input(f'Rebind user links for {args.package}? Type {phrase}: ') == phrase, 'cancelled')
 
 
 if __name__ == '__main__':

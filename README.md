@@ -45,6 +45,9 @@ migrations intact and allows the remaining eligible packages to proceed.
 After losing the entire old checkout, the explicit `--recover-dangling` mode
 requires its missing path via `--from-repo` and accepts only exact declared
 dangling links. Review the recovery boundaries and dry-run in the same guide.
+For an unproven symlink at a current declared destination, `--force-links`
+explicitly authorizes replacing that leaf after preview and approval. It keeps
+package rollback and refuses ordinary files; see the same guide for boundaries.
 
 ### Orphaned links
 

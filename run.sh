@@ -30,8 +30,8 @@ trap finish_run_sudo_session EXIT
 
 usage() {
   print -u2 -- "usage: $script_name install [--verbose] [--verify] [--test] all|all-user|all-system|<package>"
-  print -u2 -- "       $script_name install --rebind [--recover-dangling] [--from-repo <checkout>] [--dry-run] [-y] <package>|all-user"
-  print -u2 -- "       $script_name verify --rebind [--recover-dangling] [--from-repo <checkout>] <package>|all-user"
+  print -u2 -- "       $script_name install --rebind [--recover-dangling] [--force-links] [--from-repo <checkout>] [--dry-run] [-y] <package>|all-user"
+  print -u2 -- "       $script_name verify --rebind [--recover-dangling] [--force-links] [--from-repo <checkout>] <package>|all-user"
   print -u2 -- "       $script_name uninstall [--verbose] all|all-user|all-system|<package>"
   print -u2 -- "       $script_name uninstall --orphaned [--dry-run] [-y] <package>"
   print -u2 -- "       $script_name activate all|all-user|all-system|<package>"
@@ -1594,6 +1594,9 @@ parse_verify() {
       --recover-dangling)
         legacy_roots+=(--recover-dangling)
         ;;
+      --force-links)
+        legacy_roots+=(--force-links)
+        ;;
       --from-repo|--legacy-root)
         (( $# >= 2 )) || die "$1 requires an absolute checkout path"
         legacy_roots+=(--from-repo "$2")
@@ -1622,7 +1625,7 @@ parse_verify() {
     run_user_rebind --inspect --package "$selector" "${legacy_roots[@]}"
     return
   fi
-  (( ${#legacy_roots[@]} == 0 )) || die "--from-repo/--legacy-root and --recover-dangling require --rebind"
+  (( ${#legacy_roots[@]} == 0 )) || die "--from-repo/--legacy-root, --recover-dangling and --force-links require --rebind"
   run_verify "$selector" standalone "$verbose"
 }
 
@@ -1800,6 +1803,9 @@ parse_install() {
       --recover-dangling)
         rebind_args+=(--recover-dangling)
         ;;
+      --force-links)
+        rebind_args+=(--force-links)
+        ;;
       --yes|-y)
         rebind_args+=(--yes)
         ;;
@@ -1844,7 +1850,7 @@ parse_install() {
     run_user_rebind --package "$selector" "${rebind_args[@]}"
     return
   fi
-  (( ${#rebind_args[@]} == 0 )) || die "--from-repo/--legacy-root, --recover-dangling, --dry-run and --yes require --rebind"
+  (( ${#rebind_args[@]} == 0 )) || die "--from-repo/--legacy-root, --recover-dangling, --force-links, --dry-run and --yes require --rebind"
 
   select_install_hook_packages "$selector"
   run_check_repo_for_packages "${hook_packages[@]}"
