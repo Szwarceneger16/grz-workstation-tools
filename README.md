@@ -34,6 +34,36 @@ Installs all packages (from `stow/`) as symlinks into `$HOME` using GNU Stow.
 
 Override install target: `GRZ_STOW_TARGET=/path ./run.sh install all`
 
+### Orphaned links
+
+If a package was removed from this checkout after it had been installed, use the
+orphaned-cleanup path to inspect and remove only the stale symlinks that still
+belong to that package:
+
+```sh
+./run.sh uninstall --orphaned --dry-run <package>
+./run.sh uninstall --orphaned <package>
+./run.sh uninstall --orphaned -y <package>
+```
+
+`--reap` is an alias for `--orphaned`; `--dry-run`/`-n` previews the candidates
+and `-y`/`--yes` skips confirmations. This path is deliberately limited to
+links anchored in this checkout's own Stow/package tree. It is not a general
+force-overwrite switch for files or symlinks owned by another checkout. See the
+[orphaned-cleanup guide](docs/orphaned-uninstall.md) for the scan boundaries,
+user-unit behavior, and a throwaway-target example.
+
+To transfer installed links from another checkout whose package tree still
+exists, use the separate [user-package rebind workflow](docs/runner-rebind.md).
+
+`verify` performs the corresponding positive check: for every package file it
+requires an installed symlink and compares its resolved target with the
+resolved source under this checkout. Run `./run.sh verify <package>` (or
+`./run.sh verify all-user`) after a migration; a link left by another checkout
+is reported as "installed symlink points elsewhere" with both paths. A plain
+`install` does not run this check; use `./run.sh install --verify <package>`
+when verification should be part of the same invocation.
+
 ## Adding a user package
 
 1. Create `packages/<name>/install/` with files mirroring their `$HOME` paths.
