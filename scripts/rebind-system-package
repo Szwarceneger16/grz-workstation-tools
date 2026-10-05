@@ -434,6 +434,18 @@ def matches(state, entry):
             info[3:5] == [entry['uid'], entry['gid']])
 
 
+def safe_target_ancestry(target):
+    # A pinned descendant fd does not preserve its named location when an
+    # untrusted account can rename the offline root from an ancestor.
+    for parent in (*reversed(target.parents), target):
+        with directory(parent) as fd:
+            info = os.fstat(fd)
+            require(info.st_uid in {0, os.geteuid()} and
+                    (not stat.S_IMODE(info.st_mode) & 0o022 or
+                     parent != target and info.st_mode & stat.S_ISVTX),
+                    'system target ancestry has unsafe ownership or write permissions')
+
+
 def safe_target_parents(target, path):
     owner = 0 if target == Path('/') else os.geteuid()
     for parent in reversed(path.parents):
@@ -455,6 +467,7 @@ def prepare(repo, target, package, roots):
     for path in [repo, target, *roots]:
         with directory(path):
             pass
+    safe_target_ancestry(target)
     bindings = {str(path): parents(path / '.runner-root-proof') for path in [repo, target, *roots]}
     def overlaps(left, right):
         left_chain, right_chain = bindings[str(left)], bindings[str(right)]

@@ -259,7 +259,15 @@ refused. These require a separate migration design. Symlinks, FIFOs, directories
 ambiguous metadata and source/target lookup failures never become migration proof.
 Every existing destination parent inside the chosen root must be owned by root
 for live migration, or by the executing account for an offline root, with no
-group/world write permission. System paths through conventional directory
+group/world write permission. The complete named ancestry above an offline
+root is checked too: each directory must be owned by root or the executing
+account, and group/world-writable ancestors require a sticky bit. A trusted
+sticky `/tmp` is supported; foreign-owned ancestors, even private or sticky
+ones, are refused. The target root itself must have no group/world write bits.
+This preflight is repeated after approval and during publication revalidation,
+so a retained destination descriptor cannot authorize writing into a tree
+relocated through an untrusted ancestor. Directory identities still bind the
+approved plan and rollback paths. System paths through conventional directory
 symlinks are also refused; use separately reviewed normalized manifest paths.
 
 For disposable tests or offline images, `--system-root PATH` substitutes an

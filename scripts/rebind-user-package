@@ -157,8 +157,25 @@ def source_unchanged(fresh, snapshot):
         fresh.get('force_links') == snapshot.get('force_links'))
 
 
+def safe_target_parents(target, path):
+    # Validate above the target too: otherwise a foreign account can move the
+    # approved root while a retained descendant fd still points into its tree.
+    for parent in reversed(path.parents):
+        try:
+            info = parent.lstat()
+        except FileNotFoundError:
+            break  # Plan may create missing descendants only after approval.
+        inside = parent.is_relative_to(target)
+        require(stat.S_ISDIR(info.st_mode) and
+                (info.st_uid == os.geteuid() if inside else info.st_uid in {0, os.geteuid()}) and
+                (not stat.S_IMODE(info.st_mode) & 0o022 or
+                 not inside and info.st_mode & stat.S_ISVTX),
+                'user target ancestry has unsafe ownership or write permissions')
+
+
 def plan(repo, target, package, roots, recover_dangling=False, force_links=False):
     directories(target)
+    safe_target_parents(target, target / '.runner-root-proof')
     files = inventory(repo, package)
     renames, mapping_state = mappings(repo, package, files)
     lost_sources = lost_source_state(roots) if recover_dangling else None
@@ -174,6 +191,7 @@ def plan(repo, target, package, roots, recover_dangling=False, force_links=False
         require(not any(dest.is_relative_to(root) or root.is_relative_to(dest)
                         for root in source_roots), 'destination overlaps source checkout')
         directories(dest.parent, missing=True)
+        safe_target_parents(target, dest)
         for parent in (target, *dest.parents):
             if parent != target and not parent.is_relative_to(target):
                 continue
@@ -440,7 +458,7 @@ def parent_fd(target, rel, created):
                 child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
             except FileNotFoundError:
                 with mutation_record():
-                    os.mkdir(name, dir_fd=fd)
+                    os.mkdir(name, 0o755, dir_fd=fd)
                     created.append((current, identity(current)))
                     os.fsync(fd)
                 child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)

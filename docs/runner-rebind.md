@@ -299,6 +299,18 @@ root. The same preflight applies to normal rebind, forced links, recovery,
 batch planning and revalidation before writes; recovery still requires its
 selected legacy roots to be absent.
 
+User rebind validates the complete target ancestry before planning. Directories
+above the target must be owned by root or the executing account; writable
+ancestors require a sticky bit, so a trusted sticky `/tmp` remains supported.
+Foreign-owned ancestors are refused even when private or sticky. The target
+and existing destination parents inside it must be owned by the executing
+account with no group/world write bits. This applies to normal, forced,
+recovery and batch plans and their revalidation before writes. It protects the
+named target tree from relocation by another account while a descendant
+file descriptor remains open. Missing destination parents are still created
+only by the approved user transaction, with mode 0755 further restricted by
+the caller's umask; a permissive umask cannot make them group/world-writable.
+
 Every batch prints a final result for each selected or excluded package, including
 when preflight fails, approval is cancelled or the target lock is busy. The result
 distinguishes actual link changes from a package that was already current:
