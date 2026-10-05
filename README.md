@@ -42,6 +42,9 @@ for the selected user batch. See [user-package rebind](docs/runner-rebind.md) fo
 approval, aggregate exclusions, explicit per-package results and verified
 package rollback after handled failures. A package failure leaves successful
 migrations intact and allows the remaining eligible packages to proceed.
+After losing the entire old checkout, the explicit `--recover-dangling` mode
+requires its missing path via `--from-repo` and accepts only exact declared
+dangling links. Review the recovery boundaries and dry-run in the same guide.
 
 ### Orphaned links
 
