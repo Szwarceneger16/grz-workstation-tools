@@ -60,7 +60,7 @@ def directories(path, missing=False):
 
 def absolute(value, missing=False):
     p = Path(value)
-    require(p.is_absolute() and str(p) == value and '..' not in p.parts and
+    require(p.is_absolute() and not value.startswith('//') and str(p) == value and '..' not in p.parts and
             not any(ord(c) < 32 or ord(c) == 127 for c in value), 'expected normalized absolute path')
     require(p != Path('/'), 'filesystem root is not a valid installation target')
     directories(p, missing=missing)

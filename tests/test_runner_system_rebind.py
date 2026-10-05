@@ -29,7 +29,7 @@ class SystemRebindTests(unittest.TestCase):
         self.base = Path(temporary.name)
         self.repo, self.old, self.target = [self.base / name for name in ('new checkout', 'old checkout', 'system')]
         self.journals = self.base / 'journals'
-        self.journals.mkdir()
+        self.journals.mkdir(mode=0o700)
         self.paths = ['etc/demo/a', 'etc/demo/b']
         self.ids = f'{os.geteuid()} {os.getegid()}'
         for repo, content in ((self.repo, 'new'), (self.old, 'old')):

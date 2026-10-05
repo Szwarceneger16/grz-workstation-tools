@@ -18,6 +18,17 @@ Repeat `--from-repo` to admit additional old sources. Duplicate, nested, missing
 symlinked and current-source roots are refused. No old root is auto-discovered.
 `--legacy-root` remains a routing alias for `--from-repo`.
 
+Every root argument uses a normalized absolute Linux path with one leading
+slash. Double-leading-slash aliases (including `//`) and control characters are
+refused before root comparison, so they cannot bypass source/target overlap or
+live-root privilege checks.
+Root ancestry device/inode identities also bind the approved plan. Overlap in
+these directory identities is refused between offline targets and source roots,
+or between source roots. Installed leaves sharing an inode with any declared
+source are conflicts. These checks detect aliases present in root ancestry or
+declared-file identity evidence that lexical comparison alone cannot detect;
+the helper does not enumerate mount topology or perform mount operations.
+
 The current source is `packages/PACKAGE/system-install/`, with metadata from
 `packages/PACKAGE/system-install.manifest`. The old checkout must contain the
 same package layout and its own manifest. Each installed file normally lives
@@ -70,6 +81,22 @@ Each package gets a fresh owner-only directory named
 `/tmp/runner-system-rebind-*/`. Its mode is 0700; `progress.json` and payload
 backups are 0600 and owned by the executing account (root for live writes).
 `--journal-dir PATH` selects another existing, normalized, non-symlink directory.
+The whole journal ancestry must be owned by root or the executing account. For
+privileged execution, this means root-owned ancestry only. Group/world-writable
+components require the sticky bit as well as a trusted owner; ordinary shared
+directories and foreign-owned sticky directories are refused. A root-owned
+sticky `/tmp` remains supported. Do not select a directory inside another user's
+home for privileged recovery, even if the final directory itself is root-owned.
+
+Creation, backup writes and progress updates use anchored directory descriptors.
+The helper retains the journal and parent descriptors, checks their identities
+and the complete named ancestry before writes, and never reopens backup files
+through an unverified replacement directory. A moved/replaced journal, changed
+ancestry or changed permissions stops forward work. Bounded target rollback is
+still attempted if the journal is no longer reachable under its reported path;
+concurrent changes by the trusted operator/root can require locating the retained
+original journal manually. The helper does not provide containment against a
+hostile root process or the executing account itself.
 JSON records the approved manifests/policies, hashes, file and parent identities,
 staging names, progress, and paths needing manual recovery. Payload contents are
 never printed. Backups deliberately use 0600; original installation metadata is
@@ -124,6 +151,12 @@ sudo, systemctl or shell reloads. Exclusions from current and admitted legacy
 package declarations both apply before source/destination payload inspection.
 
 Current protected-path and exact set-id policies apply to both manifests.
+Policy entries preserve raw LF-separated text, with only empty lines and
+column-zero `#` comments skipped, matching the authoritative Zsh readers.
+Surrounding whitespace, CRLF entries and alternative Unicode line separators
+cannot become exact set-id approvals; invalid entries fail closed. System
+install/config declarations similarly accept only LF rows and ASCII space/tab
+field separators, with no indented-comment or Unicode-separator normalization.
 Protected patterns accept literal ASCII letters/digits, `/`, `.`, `_`, `-`,
 single `*`, `?`, and positive bracket sets of ASCII letters/digits with ascending
 ranges inside `a-z`, `A-Z` or `0-9` (for example `[a-cx-z]`). Everything outside
@@ -160,7 +193,11 @@ parent/source/target/policy races, publication conflicts, rollback, signals,
 contention, journals, CLI isolation and optional-helper refusal. Additional
 durability tests trace synchronization order and inject storage/progress errors,
 including journal-parent, publication and rollback failures. These are disposable
-filesystem tests, not physical power-loss acceptance. Ordinary
+filesystem tests, not physical power-loss acceptance. Boundary regressions compare
+set-id policy decisions with `check-repo`, reject root aliases, and exercise
+untrusted ancestors, descriptor-relative creation and journal replacement/moves.
+These ownership tests need the host's real filesystem metadata; a sandbox that
+maps root ownership to another UID is not an equivalent test environment. Ordinary
 install/verify remain usable when a consumer omits this helper; requesting
 `--rebind-system` then fails clearly. Public release, consumer admission, trusted
 consumer CI, and separately authorized live acceptance remain later milestones.

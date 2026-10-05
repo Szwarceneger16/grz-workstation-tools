@@ -289,6 +289,9 @@ synchronization is reported as manual recovery. This does not provide automatic
 crash replay or package-wide atomicity. The `/tmp` journals may be volatile or
 removed at boot, so their synchronization cannot guarantee reboot persistence.
 
+User target/source root arguments also refuse double-leading-slash Linux aliases
+such as `//tmp/checkout` and `//`, before traversal or root comparisons.
+
 Every batch prints a final result for each selected or excluded package, including
 when preflight fails, approval is cancelled or the target lock is busy. The result
 distinguishes actual link changes from a package that was already current:

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Proof-based regular-file migration for one explicit system package."""
 import argparse
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 import ctypes
 import fcntl
 import fnmatch
@@ -15,7 +15,7 @@ import re
 import signal
 import stat
 import sys
-import tempfile
+import uuid
 
 LIMIT = 16 * 1024 * 1024
 
@@ -38,7 +38,9 @@ def relative(value):
 
 
 def absolute(value):
-    require(value.startswith('/') and os.path.normpath(value) == value,
+    require(value.startswith('/') and not value.startswith('//') and
+            os.path.normpath(value) == value and
+            not any(ord(character) < 32 or ord(character) == 127 for character in value),
             'root must be a normalized absolute path')
     return Path(value)
 
@@ -125,9 +127,23 @@ def read(path, *, optional=False, single=False):
 
 def policy(repo, name):
     state, data = read(repo / 'manifests' / name, optional=True)
-    entries = [] if data is None else [line.strip() for line in data.decode().splitlines()
-                                     if line.strip() and not line.lstrip().startswith('#')]
+    # Match the authoritative Zsh readers: LF-separated raw entries, empty
+    # lines and column-zero comments only. Never trim privilege approvals or
+    # interpret CR/Unicode separators as an authorization boundary.
+    entries = [] if data is None else raw_lines(data)
     return state, entries
+
+
+def raw_lines(data):
+    return [line for line in data.decode().split('\n') if line and not line.startswith('#')]
+
+
+def declaration_rows(data):
+    for line in raw_lines(data):
+        require(not any((character.isspace() and character not in ' \t') or
+                        (ord(character) < 32 and character != '\t') or ord(character) == 127
+                        for character in line), 'unsupported system manifest separator')
+        yield line.split()
 
 
 def protected_glob(pattern):
@@ -173,11 +189,9 @@ def config_paths(repo, package):
     state, data = read(repo / 'packages' / package / 'system-config.manifest', optional=True)
     result = set()
     if data is not None:
-        for line in data.decode().splitlines():
-            if line.strip() and not line.lstrip().startswith('#'):
-                fields = line.split()
-                require(len(fields) == 4, 'invalid system config declaration')
-                result.add(relative(fields[0]))
+        for fields in declaration_rows(data):
+            require(len(fields) == 4, 'invalid system config declaration')
+            result.add(relative(fields[0]))
     return state, result
 
 
@@ -185,10 +199,7 @@ def manifest(repo, package, protected, allowed, excluded):
     base = repo / 'packages' / package
     state, data = read(base / 'system-install.manifest')
     entries = {}
-    for line in data.decode().splitlines():
-        if not line.strip() or line.lstrip().startswith('#'):
-            continue
-        fields = line.split()
+    for fields in declaration_rows(data):
         require(len(fields) == 4, 'system manifest requires path mode owner group')
         path, mode, owner, group = fields
         relative(path)
@@ -258,14 +269,21 @@ def prepare(repo, target, package, roots):
     for path in [repo, target, *roots]:
         with directory(path):
             pass
+    bindings = {str(path): parents(path / '.runner-root-proof') for path in [repo, target, *roots]}
+    def overlaps(left, right):
+        left_chain, right_chain = bindings[str(left)], bindings[str(right)]
+        return (left_chain[-1][1:3] in [item[1:3] for item in right_chain] or
+                right_chain[-1][1:3] in [item[1:3] for item in left_chain])
     require(target == Path('/') or all(not target.is_relative_to(root) and not root.is_relative_to(target)
+                                      and not overlaps(target, root)
                                       for root in [repo, *roots]),
             'offline system root overlaps a source checkout')
     require(len(set(roots)) == len(roots), 'duplicate source root')
     for index, root in enumerate(roots):
         require(root != repo and not root.is_relative_to(repo) and not repo.is_relative_to(root),
                 'old/current source roots overlap')
-        require(all(not root.is_relative_to(other) and not other.is_relative_to(root)
+        require(not overlaps(root, repo), 'old/current source roots physically overlap')
+        require(all(not root.is_relative_to(other) and not other.is_relative_to(root) and not overlaps(root, other)
                     for other in roots[:index]), 'legacy source roots overlap')
     protected_state, protected = policy(repo, 'protected-system-paths.txt')
     allowed_state, allowed = policy(repo, 'allow-setid-system-paths.txt')
@@ -284,6 +302,8 @@ def prepare(repo, target, package, roots):
         manifest_state, entries = manifest(root, package, protected, allowed, excluded)
         old_manifests[str(root)] = manifest_state
         legacy[str(root)] = entries
+    source_ids = {tuple(entry['source']['identity'][:2])
+                  for entries in [current, *legacy.values()] for entry in entries.values()}
     rows, conflicts = [], []
     for path, entry in sorted(current.items()):
         destination = target / path
@@ -293,6 +313,8 @@ def prepare(repo, target, package, roots):
         try:
             safe_target_parents(target, destination)
             before, _ = read(destination, optional=True, single=True)
+            require(before is None or tuple(before['identity'][:2]) not in source_ids,
+                    'destination physically aliases a declared package source')
             found = [root for root, entries in legacy.items()
                      if path in entries and before and matches(before, entries[path])]
             classification = ('MISSING' if before is None else 'CURRENT' if matches(before, entry)
@@ -307,6 +329,7 @@ def prepare(repo, target, package, roots):
                      'desired': entry, 'legacy_roots': found})
     residue = sorted(set().union(*(set(entries) for entries in legacy.values())) - set(current))
     return {'repo': str(repo), 'root': str(target), 'package': package,
+            'root_bindings': bindings,
             'roots': [str(root) for root in roots], 'current_manifest': current_state,
             'old_manifests': old_manifests, 'legacy': legacy, 'configs': configs,
             'policies': [protected_state, allowed_state], 'rows': rows,
@@ -332,11 +355,91 @@ def print_plan(snapshot):
         print(f'RESIDUE (unverified, untouched): {path!r}')
 
 
+def directory_identity(info):
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_gid)
+
+
+def trusted_journal_component(info):
+    require(info.st_uid in {0, os.geteuid()} and
+            (not stat.S_IMODE(info.st_mode) & 0o022 or info.st_mode & stat.S_ISVTX),
+            'journal ancestry has unsafe ownership or write permissions')
+
+
+@contextmanager
+def trusted_journal_parent(path):
+    """Anchor and check the complete ancestry, including shared sticky parents."""
+    path = absolute(str(path))
+    fd = os.open('/', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    chain = []
+    try:
+        for component in (None, *path.parts[1:]):
+            if component is not None:
+                child = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                os.close(fd)
+                fd = child
+            info = os.fstat(fd)
+            trusted_journal_component(info)
+            chain.append(directory_identity(info))
+        yield fd, chain
+    finally:
+        os.close(fd)
+
+
+class RecoveryJournal:
+    def __init__(self, path, fd, parent_fd, chain):
+        self.path, self.fd, self.parent_fd, self.chain = path, fd, parent_fd, chain
+        self.identity = directory_identity(os.fstat(fd))
+
+    def __str__(self):
+        return str(self.path)
+
+    def __fspath__(self):
+        return str(self.path)
+
+    def __truediv__(self, name):
+        return self.path / name
+
+    @property
+    def name(self):
+        return self.path.name
+
+    def check(self):
+        info = os.fstat(self.fd)
+        require(directory_identity(info) == self.identity and info.st_uid == os.geteuid() and
+                stat.S_IMODE(info.st_mode) == 0o700,
+                'recovery journal identity, ownership or permissions changed')
+        with trusted_journal_parent(self.path.parent) as (parent_fd, chain):
+            require(chain == self.chain and directory_identity(os.fstat(self.parent_fd)) == chain[-1],
+                    'recovery journal ancestry changed')
+            named = os.stat(self.name, dir_fd=parent_fd, follow_symlinks=False)
+            require(directory_identity(named) == self.identity, 'recovery journal path changed')
+
+
+@contextmanager
+def new_journal(parent):
+    with trusted_journal_parent(parent) as (parent_fd, chain):
+        # Create and open relative to the same anchored descriptor we synchronize.
+        # No path-based mkdtemp/open gap can bind creation to another parent.
+        name = 'runner-system-rebind-' + uuid.uuid4().hex
+        fd = None
+        try:
+            with mutation():
+                os.mkdir(name, 0o700, dir_fd=parent_fd)
+                fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
+            journal = RecoveryJournal(parent / name, fd, parent_fd, chain)
+            journal.check()
+            os.fsync(fd)
+            os.fsync(parent_fd)
+            yield journal
+        finally:
+            if fd is not None:
+                os.close(fd)
+
+
 def save(journal, record):
-    with directory(journal) as fd:
-        info = os.fstat(fd)
-        require(info.st_uid == os.geteuid() and stat.S_IMODE(info.st_mode) == 0o700,
-                'recovery journal must remain account-owned and mode 0700')
+    journal.check()
+    fd = journal.fd
+    with mutation():
         name = 'progress.json.new'
         opened = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600,
                          dir_fd=fd)
@@ -502,19 +605,14 @@ def apply(repo, target, package, roots, snapshot, journal_parent):
     require(not snapshot['conflicts'] and
             not any(row['class'] == 'MISSING' for row in snapshot['rows']),
             'full preflight failed; missing/foreign files require separate installation or resolution')
-    with directory(target) as root_fd:
+    with directory(target) as root_fd, ExitStack() as resources:
         fcntl.flock(root_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         require(prepare(repo, target, package, roots) == snapshot, 'approved plan changed')
         selected = [row for row in snapshot['rows'] if row['class'] == 'REBINDABLE']
         if not selected:
             print('System package already current; no writes')
             return
-        with directory(journal_parent) as journal_parent_fd:
-            journal = Path(tempfile.mkdtemp(prefix='runner-system-rebind-', dir=journal_parent))
-            with directory(journal) as journal_fd:
-                os.fsync(journal_fd)
-            # Sync the new directory entry before any installed-path mutation.
-            os.fsync(journal_parent_fd)
+        journal = resources.enter_context(new_journal(journal_parent))
         record = {'status': 'prepared', 'snapshot': snapshot, 'changes': [], 'recovery': []}
         print(f'System recovery journal: {journal / "progress.json"}', flush=True)
         save(journal, record)
@@ -532,8 +630,8 @@ def apply(repo, target, package, roots, snapshot, journal_parent):
                     source = repo / 'packages' / package / 'system-install' / row['path']
                     source_state, data = read(source)
                     require(source_state == row['desired']['source'], 'source changed at write boundary')
-                    with directory(journal) as journal_fd:
-                        write_at(journal_fd, f'{index}.before', old, 0o600, os.geteuid(), os.getegid())
+                    journal.check()
+                    write_at(journal.fd, f'{index}.before', old, 0o600, os.geteuid(), os.getegid())
                     change = {'path': row['path'], 'parents': row['before']['parents'],
                               'stage': f'.runner-system-{journal.name}-{index}.new',
                               'quarantine': f'.runner-system-{journal.name}-{index}.old',
