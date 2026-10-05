@@ -30,7 +30,7 @@ trap finish_run_sudo_session EXIT
 
 usage() {
   print -u2 -- "usage: $script_name install [--verbose] [--verify] [--test] all|all-user|all-system|<package>"
-  print -u2 -- "       $script_name install --rebind [--from-repo <checkout>] [--dry-run] [-y] <package>"
+  print -u2 -- "       $script_name install --rebind [--from-repo <checkout>] [--dry-run] [-y] <package>|all-user"
   print -u2 -- "       $script_name verify --rebind [--from-repo <checkout>] <package>|all-user"
   print -u2 -- "       $script_name uninstall [--verbose] all|all-user|all-system|<package>"
   print -u2 -- "       $script_name uninstall --orphaned [--dry-run] [-y] <package>"
@@ -1938,17 +1938,20 @@ confirm_reap() {
 # dangling link. Matching is anchored to $repo_root so a package reinstalled
 # from a different stow-based checkout of the same name is left alone.
 #
-# Only symlinks whose target matches the package marker are ever removed; real
-# files and directories are never touched. The scan is bounded to the known
-# stow-managed subtrees. system-install files copied to "/" are out of scope.
+# The package-tree pass removes marker-matched symlinks, not regular files or
+# directories. Unit cleanup has wider systemd and same-name enablement effects.
+# The scan roots are bounded, but symlinked ancestors can redirect their physical
+# locations. system-install files copied to "/" are out of scope.
 #
 # A package that was only ever enabled via `systemctl --user enable`, without
 # shipping a unit file in its own stow tree, leaves no marker-matched link at
 # all -- its only trace is a dangling systemd "*.wants/<unit>" enablement
 # link. Such units are additionally detected by naming convention ("$package"
 # or "$package-*") plus brokenness (the link must already be dangling); this
-# heuristic pass only ever feeds unit deactivation, never the removed-symlinks
-# report above, and never touches a live, healthy unit.
+# heuristic selects unit names for best-effort deactivation, not ownership.
+# A dangling link can select a name also used by a healthy unit from another
+# checkout; disable --now and direct same-name enablement unlinking can affect
+# that unit. Those effects are not included in the package-link removal count.
 reap_orphaned_package() {
   local package="$1"
   local dry_run="$2"
@@ -2025,9 +2028,9 @@ reap_orphaned_package() {
   # a link's own target ("../<unit>") one-hop-resolves to a path under $target,
   # never under $repo_root, so it can never appear in found_links above; naming
   # convention ("$package" or "$package-*") plus brokenness is the only signal
-  # left once the package tree is gone. Only a *dangling* link counts, so a
-  # live, healthy unit is never swept just because its name happens to start
-  # with the package name. `enable` places the link under .wants/, .requires/,
+  # left once the package tree is gone. Only a *dangling* link selects a name;
+  # this does not prove the selected name lacks a healthy definition or other
+  # valid enablement links. `enable` places links under .wants/, .requires/,
   # or .upholds/ per the unit's WantedBy=/RequiredBy=/UpheldBy= (systemd.unit(5)),
   # so all three enablement dirs are scanned.
   wants_only_units=()

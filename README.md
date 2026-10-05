@@ -34,6 +34,15 @@ Installs all packages (from `stow/`) as symlinks into `$HOME` using GNU Stow.
 
 Override install target: `GRZ_STOW_TARGET=/path ./run.sh install all`
 
+### Migrating user links between checkouts
+
+To transfer existing user links from another valid checkout, preview a named
+package with `./run.sh install --rebind --dry-run PACKAGE`, or use `all-user`
+for the selected user batch. See [user-package rebind](docs/runner-rebind.md) for source
+approval, aggregate exclusions, explicit per-package results and verified
+package rollback after handled failures. A package failure leaves successful
+migrations intact and allows the remaining eligible packages to proceed.
+
 ### Orphaned links
 
 If a package was removed from this checkout after it had been installed, use the
@@ -71,8 +80,9 @@ The manual follow-up includes a successful manager reload after link removal
 and checks of concrete template instances and activation sources. The orphaned
 command does not provide those checks itself.
 
-To transfer installed links from another checkout whose package tree still
-exists, use the separate [user-package rebind workflow](docs/runner-rebind.md).
+For a package still available in an approved source checkout, use the
+[migration workflow above](#migrating-user-links-between-checkouts). Orphaned
+cleanup removes leftovers anchored in this checkout; it does not transfer them.
 
 For managed user-install files, excluding Stow metadata, `verify` requires
 an installed symlink and compares its resolved target with the

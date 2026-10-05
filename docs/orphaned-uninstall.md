@@ -226,9 +226,14 @@ guarantee against reactivation. The script performs none of this follow-up.
   and earlier removals are not undone after a later failure.
 - This is not a general `--force` or `--override` operation. It will not
   replace an existing link that points into a different checkout. For a
-  migration between checkouts, use the separate
-  [user-package rebind workflow](runner-rebind.md), starting with its read-only
-  preview and explicit source approval.
+  migration between checkouts while both package trees remain available, run
+  the separate [user-package rebind workflow](runner-rebind.md) from the
+  destination checkout, starting with its read-only preview and source approval.
+  Rebind accepts a named package or `all-user`, preserves successful package
+  migrations, and attempts later eligible packages after a package error.
+  Its package rollback and target lock do not apply to orphaned cleanup.
+  Missing-source dangling-link recovery is not provided by rebind. Do not clean
+  up source links before migration or run both operations concurrently.
 
 ## Validation with a throwaway target
 

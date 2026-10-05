@@ -116,8 +116,8 @@ class RebindTests(unittest.TestCase):
         self.assertTrue(journal.parent.name.startswith("runner-rebind-journal-"))
         self.addCleanup(shutil.rmtree, journal.parent)
 
-    def test_rejects_bulk_and_flags_on_normal_install(self):
-        for selector in ("all", "all-user", "all-system", "..", "-invalid"):
+    def test_rejects_combined_system_selectors_and_flags_on_normal_install(self):
+        for selector in ("all", "all-system", "..", "-invalid"):
             result = self.command("install", "--rebind", "--legacy-root", str(self.old), selector)
             self.assertNotEqual(result.returncode, 0)
         for flag in ("--dry-run", "--yes", "--legacy-root", "--from-repo"):
@@ -373,6 +373,100 @@ class RebindTests(unittest.TestCase):
         self.assertEqual([row["old"] for row in recorded["snapshot"]["rows"]],
                          [row["old"] for row in snapshot["rows"]])
         self.assertEqual(journal.stat().st_mode & 0o777, 0o600)
+
+    def package_result(self):
+        paths = list(self.base.glob("runner-rebind-journal-*/result.json"))
+        self.assertEqual(len(paths), 1)
+        self.assertEqual(paths[0].stat().st_mode & 0o777, 0o600)
+        return json.loads(paths[0].read_text())
+
+    def test_success_reports_verified_result_and_unchanged_repeat(self):
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            result = engine.apply(self.repo, self.target, "demo", [self.old], self.snapshot())
+        self.assertEqual(self.package_result(), result['outcome'])
+        self.assertEqual(result['outcome'], {'status': 'rebound', 'retained_changes': 2,
+                                             'verification': 'current'})
+        self.assertIn('Package result: demo: rebound; retained link changes: 2', output.getvalue())
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            result = engine.apply(self.repo, self.target, "demo", [self.old], self.snapshot())
+        self.assertEqual(result['outcome']['status'], 'unchanged')
+        self.assertIn('Package result: demo: unchanged; retained link changes: 0', output.getvalue())
+
+    def test_failed_package_restores_multiple_directories_missing_paths_and_rename(self):
+        oldrel, newrel = '.config/example/old.conf', '.config/example/new.conf'
+        for root, rel in ((self.old, oldrel), (self.repo, newrel),
+                          (self.repo, '.zsh_scripts/new/nested')):
+            p = root / 'packages/demo/install' / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text('fixture')
+        self.link(oldrel)
+        (self.repo / 'packages/demo/rebind-paths.manifest').write_text(oldrel + ' ' + newrel + '\n')
+        before = self.state()
+        with mock.patch.object(engine, 'verify_result', side_effect=engine.Refusal('injected')):
+            with self.assertRaises(engine.Refusal):
+                self.apply()
+        self.assertEqual(self.state(), before)
+        self.assertFalse((self.target / '.zsh_scripts').exists())
+        self.assertFalse(list(self.target.rglob('.runner-rebind-*')))
+        self.assertEqual(self.package_result(), {'status': 'rolled-back', 'retained_changes': 0,
+                                               'verification': 'original', 'recovery_paths': []})
+
+    def test_failed_rollback_reports_uncertain_retained_links_and_exact_path(self):
+        original = engine.os.replace
+        def fail_restore(src, dst, *args, **kwargs):
+            if isinstance(src, Path) and src.name.startswith('.runner-rebind-rollback-') and dst.name == 'alpha':
+                raise OSError('injected rollback I/O failure')
+            return original(src, dst, *args, **kwargs)
+        with mock.patch.object(engine.os, 'replace', side_effect=fail_restore), \
+                mock.patch.object(engine, 'verify_result', side_effect=engine.Refusal('injected')), \
+                contextlib.redirect_stdout(io.StringIO()) as output, contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(engine.Refusal):
+                engine.apply(self.repo, self.target, 'demo', [self.old], self.snapshot())
+        outcome = self.package_result()
+        self.assertEqual(outcome['status'], 'manual-recovery')
+        self.assertIsNone(outcome['retained_changes'])
+        self.assertEqual(outcome['recovery_paths'], ['.local/bin/alpha'])
+        self.assertIn('Manual recovery check: .local/bin/alpha', output.getvalue())
+        self.assertEqual((self.target / self.files[0]).resolve(), self.repo / 'packages/demo/install' / self.files[0])
+        self.assertEqual((self.target / self.files[1]).resolve(), self.old / 'packages/demo/install' / self.files[1])
+
+    def test_rollback_verifies_unchanged_package_paths_too(self):
+        untouched = self.target / self.files[0]
+        untouched.unlink()
+        self.link(self.files[0], self.repo)
+        def concurrent(*args):
+            untouched.unlink()
+            untouched.write_text('owner edit')
+            raise engine.Refusal('injected')
+        with mock.patch.object(engine, 'verify_result', side_effect=concurrent), self.assertRaises(engine.Refusal):
+            self.apply()
+        self.assertEqual(untouched.read_text(), 'owner edit')
+        self.assertEqual(self.package_result()['recovery_paths'], [self.files[0]])
+
+    def test_second_handled_signal_waits_until_entire_rollback_and_result_record(self):
+        before = self.state()
+        original = engine.os.replace
+        sent = False
+        def interrupt_restore(src, dst, *args, **kwargs):
+            nonlocal sent
+            result = original(src, dst, *args, **kwargs)
+            if isinstance(src, Path) and src.name.startswith('.runner-rebind-rollback-') and not sent:
+                sent = True
+                os.kill(os.getpid(), signal.SIGTERM)
+            return result
+        def handler(signum, frame):
+            raise engine.Refusal('second signal')
+        previous = signal.signal(signal.SIGTERM, handler)
+        try:
+            with mock.patch.object(engine.os, 'replace', side_effect=interrupt_restore), \
+                    mock.patch.object(engine, 'verify_result', side_effect=engine.Refusal('first failure')):
+                with self.assertRaises(engine.Refusal):
+                    self.apply()
+        finally:
+            signal.signal(signal.SIGTERM, previous)
+        self.assertTrue(sent)
+        self.assertEqual(self.state(), before)
+        self.assertEqual(self.package_result()['status'], 'rolled-back')
 
     def test_multiple_explicit_roots(self):
         second = self.base / "another-old"
