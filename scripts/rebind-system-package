@@ -130,6 +130,37 @@ def policy(repo, name):
     return state, entries
 
 
+def protected_glob(pattern):
+    """Accept only syntax with the same meaning in Zsh and fnmatch.
+
+    A blacklist is insufficient: nested/POSIX classes and malformed brackets
+    can otherwise be silently interpreted as literal text by fnmatch.
+    """
+    require(pattern and all(part not in {'', '.', '..'} for part in pattern.split('/')),
+            'invalid protected-path glob')
+    index = 0
+    while index < len(pattern):
+        character = pattern[index]
+        if character == '[':
+            end = pattern.find(']', index + 1)
+            require(end != -1, 'unsupported protected-path glob; no migration is allowed')
+            members = pattern[index + 1:end]
+            require(re.fullmatch(r'(?:[A-Za-z0-9](?:-[A-Za-z0-9])?)+', members),
+                    'unsupported protected-path glob; no migration is allowed')
+            for start, finish in re.findall(r'([A-Za-z0-9])-([A-Za-z0-9])', members):
+                require(start <= finish and any(start in alphabet and finish in alphabet
+                        for alphabet in ('0123456789', 'abcdefghijklmnopqrstuvwxyz',
+                                         'ABCDEFGHIJKLMNOPQRSTUVWXYZ')),
+                        'unsupported protected-path glob; no migration is allowed')
+            index = end + 1
+        else:
+            require(character in '/._-*?' or character.isascii() and character.isalnum(),
+                    'unsupported protected-path glob; no migration is allowed')
+            require(not pattern.startswith('**', index),
+                    'unsupported protected-path glob; no migration is allowed')
+            index += 1
+
+
 def numeric(value, group=False):
     require(re.fullmatch(r'[0-9]+|[A-Za-z_][A-Za-z0-9_-]*', value), 'invalid owner/group')
     number = (int(value) if value.isdigit() else
@@ -239,10 +270,7 @@ def prepare(repo, target, package, roots):
     protected_state, protected = policy(repo, 'protected-system-paths.txt')
     allowed_state, allowed = policy(repo, 'allow-setid-system-paths.txt')
     for pattern in protected:
-        require(not any(character in pattern for character in '(){}^#~\\'),
-                'unsupported protected-path glob; no migration is allowed')
-        require(not pattern.startswith('/') and '..' not in pattern.split('/'),
-                'invalid protected-path glob')
+        protected_glob(pattern)
     for path in allowed:
         relative(path)
     configs, excluded = {}, set()
@@ -388,6 +416,15 @@ def owned_at(fd, name, expected):
 
 
 def restore(fd, row):
+    # Even a failed no-clobber restore can have moved owned staging names.
+    # Persist all such transitions before recording success or recovery needs.
+    try:
+        restore_at(fd, row)
+    finally:
+        os.fsync(fd)
+
+
+def restore_at(fd, row):
     """Never replace an occupied name, including one created by another writer."""
     leaf = Path(row['path']).name
     quarantine, stage = row['quarantine'], row['stage']
@@ -416,7 +453,47 @@ def restore(fd, row):
         raise
     if owned_at(fd, stage, row['new']):
         os.unlink(stage, dir_fd=fd)
-    os.fsync(fd)
+
+
+def rollback(target, snapshot, journal, record):
+    # A second handled signal must not interrupt recovery or its outcome write.
+    with mutation():
+        record['status'] = 'rolling-back'
+        try:
+            save(journal, record)
+        except (OSError, Refusal) as error:
+            # Failure to update progress must not prevent restoring owned files.
+            record['recovery'].append({'path': str(journal), 'reason': str(error)})
+        for change in reversed(record['changes']):
+            path = target / change['path']
+            try:
+                assert_parents(path, change['parents'])
+                with directory(path.parent) as fd:
+                    restore(fd, change)
+                    try:
+                        os.stat(change['stage'], dir_fd=fd, follow_symlinks=False)
+                    except FileNotFoundError:
+                        pass
+                    else:
+                        require(change.get('new') and owned_at(fd, change['stage'], change['new']),
+                                'unfinished or changed stage retained for manual recovery')
+                        os.unlink(change['stage'], dir_fd=fd)
+                        os.fsync(fd)
+            except (OSError, Refusal) as error:
+                record['recovery'].append({'path': change['path'], 'reason': str(error)})
+        # A vanished quarantine or changes to untouched rows cannot prove that
+        # rollback restored the approved installation. Never report success then.
+        for row in snapshot['rows']:
+            path = target / row['path']
+            try:
+                assert_parents(path, row['before']['parents'])
+                state, _ = read(path, single=True)
+                require(state == row['before'], 'original destination was not restored')
+            except (OSError, Refusal) as error:
+                record['recovery'].append({'path': row['path'], 'reason': str(error)})
+        record['status'] = 'recovery-required' if record['recovery'] else 'rolled-back'
+        save(journal, record)
+        print(f'System result: {record["status"]}', file=sys.stderr)
 
 
 def apply(repo, target, package, roots, snapshot, journal_parent):
@@ -432,9 +509,12 @@ def apply(repo, target, package, roots, snapshot, journal_parent):
         if not selected:
             print('System package already current; no writes')
             return
-        with directory(journal_parent):
-            pass
-        journal = Path(tempfile.mkdtemp(prefix='runner-system-rebind-', dir=journal_parent))
+        with directory(journal_parent) as journal_parent_fd:
+            journal = Path(tempfile.mkdtemp(prefix='runner-system-rebind-', dir=journal_parent))
+            with directory(journal) as journal_fd:
+                os.fsync(journal_fd)
+            # Sync the new directory entry before any installed-path mutation.
+            os.fsync(journal_parent_fd)
         record = {'status': 'prepared', 'snapshot': snapshot, 'changes': [], 'recovery': []}
         print(f'System recovery journal: {journal / "progress.json"}', flush=True)
         save(journal, record)
@@ -463,10 +543,12 @@ def apply(repo, target, package, roots, snapshot, journal_parent):
                     desired = row['desired']
                     change['new'] = write_at(fd, change['stage'], data, desired['mode'], desired['uid'], desired['gid'])
                     require(owned_at(fd, change['stage'], change['new']), 'prepared stage changed')
+                    os.fsync(fd)
                     save(journal, record)
                     assert_parents(path, row['before']['parents'])
                     with mutation():
                         move(fd, path.name, change['quarantine'])
+                        os.fsync(fd)
                         save(journal, record)
                     displaced, _ = read_at(fd, change['quarantine'], single=True)
                     require(displaced == before, 'destination raced with quarantine; restoring without overwrite')
@@ -474,35 +556,15 @@ def apply(repo, target, package, roots, snapshot, journal_parent):
                     with mutation():
                         move(fd, change['stage'], path.name)
                         change['published'] = True
-                        save(journal, record)
                         os.fsync(fd)
+                        save(journal, record)
             revalidate(repo, target, package, roots, snapshot, record['changes'])
             record['status'] = 'committed'
             save(journal, record)
         except BaseException:
             # Persist recovery state before attempting bounded rollback. SIGKILL
             # or power loss still requires manual reconciliation from this record.
-            record['status'] = 'rolling-back'
-            save(journal, record)
-            for change in reversed(record['changes']):
-                path = target / change['path']
-                try:
-                    assert_parents(path, change['parents'])
-                    with directory(path.parent) as fd, mutation():
-                        restore(fd, change)
-                        try:
-                            os.stat(change['stage'], dir_fd=fd, follow_symlinks=False)
-                        except FileNotFoundError:
-                            pass
-                        else:
-                            require(change.get('new') and owned_at(fd, change['stage'], change['new']),
-                                    'unfinished or changed stage retained for manual recovery')
-                            os.unlink(change['stage'], dir_fd=fd)
-                except (OSError, Refusal) as error:
-                    record['recovery'].append({'path': change['path'], 'reason': str(error)})
-            record['status'] = 'recovery-required' if record['recovery'] else 'rolled-back'
-            save(journal, record)
-            print(f'System result: {record["status"]}', file=sys.stderr)
+            rollback(target, snapshot, journal, record)
             raise
         # Completed transaction is durable before old staging names are removed.
         for change in record['changes']:

@@ -436,6 +436,7 @@ def parent_fd(target, rel, created):
                 with mutation_record():
                     os.mkdir(name, dir_fd=fd)
                     created.append((current, identity(current)))
+                    os.fsync(fd)
                 child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
             os.close(fd)
             fd = child
@@ -623,10 +624,9 @@ def apply_locked(repo, target, package, roots, snapshot, on_journal=None, on_com
     try:
         require(refresh_plan(repo, target, package, roots, snapshot) == snapshot,
                 'candidate changed after approval; rerun')
-        journal = Path(tempfile.mkdtemp(prefix='runner-rebind-journal-', dir='/tmp')) / 'before.json'
-        journal.write_text(json.dumps({'repository': str(repo), 'target': str(target), 'package': package,
-                                       'snapshot': snapshot}, indent=2) + '\n')
-        journal.chmod(0o600)
+        journal = new_journal('runner-rebind-journal-') / 'before.json'
+        write_record(journal, {'repository': str(repo), 'target': str(target), 'package': package,
+                               'snapshot': snapshot})
         print(f'Rollback journal: {journal}', flush=True)
         if on_journal:
             on_journal(journal)
@@ -668,7 +668,10 @@ def apply_locked(repo, target, package, roots, snapshot, on_journal=None, on_com
                         os.unlink(p.name, dir_fd=parent)
                         changed.append((row, None))
             finally:
-                os.close(parent)
+                try:
+                    os.fsync(parent)
+                finally:
+                    os.close(parent)
         fresh = refresh_plan(repo, target, package, roots, snapshot)
         check_parents(snapshot, created)
         require(source_unchanged(fresh, snapshot),
@@ -736,21 +739,28 @@ def rollback_package(target, snapshot, changed, created, journal):
                 require((now is None if own is None else now is not None and now[:2] == own and
                          p.is_symlink() and os.readlink(p) == row['new']), 'rollback ownership lost')
             still_owned()
-            if row['old'] is None:
-                p.unlink()
-            else:
-                temp = p.with_name('.runner-rebind-rollback-' + uuid.uuid4().hex)
+            parent = os.open(p.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                if row['old'] is None:
+                    p.unlink()
+                else:
+                    temp = p.with_name('.runner-rebind-rollback-' + uuid.uuid4().hex)
+                    try:
+                        temp.symlink_to(row['old'])
+                        check_parents(snapshot, created, p)
+                        still_owned()
+                        if own is None:
+                            os.link(temp, p, follow_symlinks=False)
+                        else:
+                            os.replace(temp, p)
+                    finally:
+                        if temp.is_symlink():
+                            temp.unlink()
+            finally:
                 try:
-                    temp.symlink_to(row['old'])
-                    check_parents(snapshot, created, p)
-                    still_owned()
-                    if own is None:
-                        os.link(temp, p, follow_symlinks=False)
-                    else:
-                        os.replace(temp, p)
+                    os.fsync(parent)
                 finally:
-                    if temp.is_symlink():
-                        temp.unlink()
+                    os.close(parent)
         except (OSError, Refusal):
             errors.add(row['path'])
             print(f'Manual rollback required: {p}; journal: {journal}', file=sys.stderr)
@@ -759,14 +769,30 @@ def rollback_package(target, snapshot, changed, created, journal):
             current = identity(directory)
             if current and current[:2] == own[:2] and stat.S_ISDIR(current[2]):
                 directory.rmdir()  # Empty directories created by this transaction only.
+                sync_directory(directory.parent)
         except OSError:
-            pass
+            errors.add(str(directory.relative_to(target)))
     conflicts = sorted(errors | set(original_state_conflicts(target, snapshot, changed)))
     outcome = {'status': 'manual-recovery' if conflicts else 'rolled-back' if changed else 'not-started',
                'retained_changes': None if conflicts else 0,
                'verification': 'unverified' if conflicts else 'original', 'recovery_paths': conflicts}
     record_forced_links(target, outcome, changed)
     return outcome
+
+
+def sync_directory(path):
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def new_journal(prefix):
+    journal = Path(tempfile.mkdtemp(prefix=prefix, dir='/tmp'))
+    sync_directory(journal)
+    sync_directory(journal.parent)
+    return journal
 
 
 def write_record(path, progress):
@@ -776,7 +802,10 @@ def write_record(path, progress):
         with os.fdopen(fd, 'w', encoding='utf-8') as handle:
             json.dump(progress, handle, indent=2)
             handle.write('\n')
+            handle.flush()
+            os.fsync(handle.fileno())
         os.replace(temporary, path)
+        sync_directory(path.parent)
     finally:
         if temporary.exists():
             temporary.unlink()
@@ -820,7 +849,7 @@ def apply_batch(repo, target, selection, prepared, failures=None):
             except (Refusal, OSError, ValueError, subprocess.SubprocessError) as error:
                 progress['packages'][package].update(state='failed', error=str(error), outcome={
                     'status': 'not-started', 'retained_changes': 0})
-        journal = Path(tempfile.mkdtemp(prefix='runner-rebind-batch-', dir='/tmp')) / 'progress.json'
+        journal = new_journal('runner-rebind-batch-') / 'progress.json'
         progress['stage'] = 'packages'
         write_progress(journal, progress)
         print(f'Batch recovery journal: {journal}', flush=True)

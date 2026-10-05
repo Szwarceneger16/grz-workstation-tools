@@ -215,10 +215,31 @@ class SystemRebindTests(unittest.TestCase):
             path.unlink() if original is None else path.write_bytes(original)
 
     def test_protected_paths_and_unsupported_globs_fail_closed(self):
-        for pattern in ('etc/demo', 'etc/demo/*', 'etc/(demo|other)/*'):
+        for pattern in ('etc/demo', 'etc/demo/*', 'etc/(demo|other)/*',
+                        'etc/account[[:digit:]]', 'etc/[=a=]', 'etc/[[.a.]]',
+                        'etc/<1-9>', 'etc/demo(#qN)', 'etc/demo~other',
+                        'etc/{demo,other}', 'etc/[!a]', 'etc/[^a]', 'etc/[',
+                        'etc/demo]', 'etc/[z-a]', 'etc/[0-z]', 'etc/**/demo',
+                        'etc//demo', 'etc/./demo', 'etc/demo\\*'):
             (self.repo / 'manifests/protected-system-paths.txt').write_text(pattern + '\n')
             with self.assertRaises(engine.Refusal):
                 self.plan()
+
+    @unittest.skipUnless(shutil.which('zsh'), 'Zsh is required for policy equivalence')
+    def test_supported_globs_match_zsh_policy_semantics(self):
+        patterns = ('etc/demo/*', 'etc/demo/?', 'etc/demo/[ab]', 'etc/demo/[a-z]',
+                    'etc/demo/[A-Z0-9]', 'etc/demo/[a-cx-z]', 'etc/demo/a')
+        values = ('etc/demo/a', 'etc/demo/b', 'etc/demo/d', 'etc/demo/z',
+                  'etc/demo/5', 'etc/demo/Z', 'etc/demo/ab', 'etc/demo/a/b')
+        for pattern in patterns:
+            engine.protected_glob(pattern)
+            for value in values:
+                with self.subTest(pattern=pattern, value=value):
+                    zsh = subprocess.run(['zsh', '-fc',
+                        'pattern=$1; value=$2; [[ "$value" == ${~pattern} ]]',
+                        'policy-test', pattern, value], timeout=10)
+                    self.assertIn(zsh.returncode, (0, 1))
+                    self.assertEqual(engine.fnmatch.fnmatchcase(value, pattern), zsh.returncode == 0)
 
     def test_setid_requires_current_exact_approval_for_old_and_new_modes(self):
         self.write_manifest(self.repo, '4640')
@@ -291,7 +312,7 @@ class SystemRebindTests(unittest.TestCase):
             self.apply()
         self.assertEqual((self.target / self.paths[0]).read_text(), 'concurrent owner contents')
         self.assertEqual((self.target / self.paths[1]).read_bytes(), self.source(self.old, self.paths[1]).read_bytes())
-        self.assertEqual(self.result()[1]['status'], 'rolled-back')
+        self.assertEqual(self.result()[1]['status'], 'recovery-required')
 
     def test_no_clobber_publication_preserves_writer_and_displaced_backup(self):
         original = engine.move

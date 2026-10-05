@@ -280,6 +280,15 @@ replacement. The journal contains metadata and content digests, never copied
 payloads. Final verification checks every selected package and unchanged source
 inventories, including packages completed earlier in the batch.
 
+Package and batch journal creation synchronizes both the new directory and its
+parent before link changes. Each JSON update flushes and synchronizes the file
+before atomic replacement, then synchronizes its directory. Installed-link and
+created-directory changes, including rollback, synchronize the affected parent
+before reporting an outcome. Storage errors stop normal progress; failed rollback
+synchronization is reported as manual recovery. This does not provide automatic
+crash replay or package-wide atomicity. The `/tmp` journals may be volatile or
+removed at boot, so their synchronization cannot guarantee reboot persistence.
+
 Every batch prints a final result for each selected or excluded package, including
 when preflight fails, approval is cancelled or the target lock is busy. The result
 distinguishes actual link changes from a package that was already current:

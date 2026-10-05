@@ -75,6 +75,22 @@ staging names, progress, and paths needing manual recovery. Payload contents are
 never printed. Backups deliberately use 0600; original installation metadata is
 recorded separately rather than granting execution or set-id rights to backups.
 
+Before any installed-path mutation, the helper synchronizes the new journal
+directory and its parent. Backup files and their directory entries are flushed
+before quarantine. Each stage, quarantine, publication, restore and cleanup
+transition is synchronized in the destination directory before a progress or
+terminal outcome can claim it completed. A synchronization failure stops forward
+work; bounded rollback still runs if recording `rolling-back` itself fails.
+`rolled-back` additionally requires every approved destination to match its
+original identity, content and metadata. Lost quarantines and changes to untouched
+files produce `recovery-required`, while preserving concurrent writers.
+
+These guarantees depend on storage honoring `fsync`. Use `--journal-dir` on a
+persistent filesystem when recovery evidence must survive reboot or power loss:
+the default `/tmp` can be memory-backed or cleaned at boot. Synchronizing it
+cannot make volatile storage persistent. Keep backups on reliable storage and
+retain incomplete stages if a storage failure prevents a durable outcome record.
+
 For each proven old destination, the helper creates a new sibling stage,
 revalidates the source and parent chain, and moves the installed file to a unique
 quarantine name with Linux `renameat2(RENAME_NOREPLACE)`. It checks the displaced
@@ -108,8 +124,13 @@ sudo, systemctl or shell reloads. Exclusions from current and admitted legacy
 package declarations both apply before source/destination payload inspection.
 
 Current protected-path and exact set-id policies apply to both manifests.
-Protected patterns support ordinary `*`, `?` and bracket globs. More complex Zsh
-patterns fail closed rather than using a weaker interpretation. Protected
+Protected patterns accept literal ASCII letters/digits, `/`, `.`, `_`, `-`,
+single `*`, `?`, and positive bracket sets of ASCII letters/digits with ascending
+ranges inside `a-z`, `A-Z` or `0-9` (for example `[a-cx-z]`). Everything outside
+this explicit subset fails closed, including POSIX/collating/equivalence classes,
+negated or malformed brackets, recursive `**`, numeric ranges, escapes and
+extended Zsh patterns. Supported patterns are checked against Zsh in tests;
+unsupported patterns stop the entire operation before payload inspection. Protected
 directory ancestors also exclude descendants. Unsupported destination hard
 links, extended attributes/ACLs/capabilities and files larger than 16 MiB are
 refused. These require a separate migration design. Symlinks, FIFOs, directories,
@@ -136,7 +157,10 @@ RUNNER_SYNC_EXPECTED_ROLE=source RUNNER_SYNC_WRITE=0 ./scripts/sync-runner check
 
 Tests exercise proof/classification, metadata transitions, config exclusions,
 parent/source/target/policy races, publication conflicts, rollback, signals,
-contention, journals, CLI isolation and optional-helper refusal. Ordinary
+contention, journals, CLI isolation and optional-helper refusal. Additional
+durability tests trace synchronization order and inject storage/progress errors,
+including journal-parent, publication and rollback failures. These are disposable
+filesystem tests, not physical power-loss acceptance. Ordinary
 install/verify remain usable when a consumer omits this helper; requesting
 `--rebind-system` then fails clearly. Public release, consumer admission, trusted
 consumer CI, and separately authorized live acceptance remain later milestones.
