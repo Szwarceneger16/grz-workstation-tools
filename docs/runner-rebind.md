@@ -1,6 +1,6 @@
 # Optional user-package rebind (WP-5)
 
-`scripts/rebind-user-package` discovers and transfers one package's user-layer
+`scripts/rebind-user-package` discovers and transfers selected packages' user-layer
 symlinks from approved, still-existing checkouts to this checkout. It is a separate
 optional Python helper; `run.sh` only routes arguments. Consumers may omit the
 helper from their selection manifest. Ordinary install/verify still work without
@@ -26,6 +26,8 @@ From the destination checkout:
 ./run.sh verify --rebind PACKAGE
 ./run.sh install --rebind --dry-run PACKAGE
 ./run.sh install --rebind PACKAGE
+./run.sh install --rebind --dry-run all-user
+./run.sh install --rebind all-user
 ```
 
 Discovery reads link metadata only at exact destinations declared by the selected
@@ -64,8 +66,9 @@ python3 -I scripts/rebind-user-package --target /path/to/target \
 Exit codes: 0 means a valid dry-run or completed/unchanged installation; 3 from
 `verify --rebind` means an otherwise valid migration is needed; 1 means refusal
 or execution failure (argument parsing errors may return 2).
-Publication allows only one named package. Bulk installation and `--verify`/`--test`
-hook execution are refused. Normal install flags do not implicitly select rebind.
+Publication accepts one named package or the user-only `all-user` selector.
+Combined `all`, `all-system` and `--verify`/`--test` hook execution are refused.
+Normal install flags do not implicitly select rebind.
 The read-only `verify --rebind all-user` enumerates package names under the
 repository's `stow/`, including packages excluded from ordinary `install all`,
 and performs the same exact-path inspection for each. It continues after package
@@ -80,6 +83,61 @@ source symlink, invalid package mapping or custom Stow ignore policy blocks the
 operation before mutation. Source content/mode differences are disclosed; a
 rebind can therefore also deploy a reviewed payload change, not merely move a
 path. The old checkout must remain available for proof.
+
+## Aggregate user rebind
+
+`install --rebind all-user` selects package names in sorted order from `stow/`,
+honoring `manifests/ignore-all-install.txt`. It prints both selected and excluded
+packages. Each Stow link must have the declared package/install mapping; selected
+packages must have safe, nonempty inventories. Read-only `verify --rebind all-user`
+continues to inspect excluded packages too. A named package can be migrated
+separately after reviewing its plan. An empty aggregate selection is refused.
+
+```sh
+./run.sh install --rebind --from-repo /path/to/source-checkout --dry-run all-user
+./run.sh install --rebind --from-repo /path/to/source-checkout --yes all-user
+```
+
+The helper preflights every selected package before any installed write and
+refuses the entire batch if a package fails, or destinations overlap across
+packages. This includes rename destinations, legacy paths and ancestor/child
+collisions. Explicit source-root restrictions apply to every package: each root
+must contain a valid source package for each selected name. Discovery may find
+different roots for different packages; those roots require one interactive
+`REBIND` approval of the complete printed plan. Bare `--yes` remains invalid
+for discovered roots. No source checkout's hooks or programs run.
+
+One nonblocking target-directory lock covers the entire batch. Under that lock,
+the helper revalidates the complete approved selection, exclusion-policy identity,
+source inventories, destination links and parent-directory identities before the
+first write. It repeats selection and package checks before each transaction,
+and parent/link checks at publication. Directories created by an earlier
+completed package are tracked as batch-owned additions. Arbitrary new or replaced
+parents do not become approved simply because another package finished.
+
+Each package retains its own conservative transaction and rollback journal.
+The batch also records plans, package journal paths, progress and execution stage
+in an owner-only `/tmp/runner-rebind-batch-*/progress.json`, updated by atomic
+replacement. The journal contains metadata and content digests, never copied
+payloads. Final verification checks every selected package and unchanged source
+inventories, including packages completed earlier in the batch.
+
+On a handled failure, execution stops and reports **completed**, **failed** and
+**unattempted** packages. Only the failed package attempts rollback of its own
+changes; completed packages remain migrated. Concurrent edits can require manual
+rollback, using the printed package journal. If the aggregate final verification
+fails, the batch reports failure at `final-verification` even though its individual
+transactions completed. Retain both batch and package journals, investigate the
+reported state, and run a new full dry-run before resuming. Journals are evidence,
+not an executable replay or automatic-resume facility.
+
+A batch is not atomic across packages. Other applications may observe its
+intermediate state; SIGKILL, power loss and lost temporary journals still require
+manual recovery. Ordinary install tools and external writers do not participate
+in the advisory lock. Mixed packages migrate user links only; the batch never
+copies system files, reads system secrets, runs hooks or activates services.
+Dangling links after loss of a source checkout remain conflicts. Aggregate rebind
+does not enable a force overwrite, missing-source repair or orphan cleanup.
 
 ## Renamed files
 
@@ -139,7 +197,7 @@ Ordinary `verify all` keeps its previous behavior. System-managed files are
 copies, not Stow links, and are outside this helper's inspection and mutation.
 
 ```sh
-PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_runner_rebind.py' -v
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_runner_rebind*.py' -v
 zsh -n run.sh
 ./scripts/check-repo
 RUNNER_SYNC_EXPECTED_ROLE=source RUNNER_SYNC_WRITE=0 ./scripts/sync-runner check

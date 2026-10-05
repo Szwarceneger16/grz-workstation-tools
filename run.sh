@@ -30,7 +30,7 @@ trap finish_run_sudo_session EXIT
 
 usage() {
   print -u2 -- "usage: $script_name install [--verbose] [--verify] [--test] all|all-user|all-system|<package>"
-  print -u2 -- "       $script_name install --rebind [--from-repo <checkout>] [--dry-run] [-y] <package>"
+  print -u2 -- "       $script_name install --rebind [--from-repo <checkout>] [--dry-run] [-y] <package>|all-user"
   print -u2 -- "       $script_name verify --rebind [--from-repo <checkout>] <package>|all-user"
   print -u2 -- "       $script_name uninstall [--verbose] all|all-user|all-system|<package>"
   print -u2 -- "       $script_name uninstall --orphaned [--dry-run] [-y] <package>"

@@ -34,6 +34,13 @@ Installs all packages (from `stow/`) as symlinks into `$HOME` using GNU Stow.
 
 Override install target: `GRZ_STOW_TARGET=/path ./run.sh install all`
 
+### Migrating user links between checkouts
+
+To transfer existing user links from another valid checkout, preview a named
+package with `./run.sh install --rebind --dry-run PACKAGE`, or use `all-user`
+for the selected user batch. See [user-package rebind](docs/runner-rebind.md) for source
+approval, aggregate exclusions and partial-failure recovery.
+
 ### Orphaned links
 
 If a package was removed from this checkout after it had been installed, use the

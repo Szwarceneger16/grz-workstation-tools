@@ -116,8 +116,8 @@ class RebindTests(unittest.TestCase):
         self.assertTrue(journal.parent.name.startswith("runner-rebind-journal-"))
         self.addCleanup(shutil.rmtree, journal.parent)
 
-    def test_rejects_bulk_and_flags_on_normal_install(self):
-        for selector in ("all", "all-user", "all-system", "..", "-invalid"):
+    def test_rejects_combined_system_selectors_and_flags_on_normal_install(self):
+        for selector in ("all", "all-system", "..", "-invalid"):
             result = self.command("install", "--rebind", "--legacy-root", str(self.old), selector)
             self.assertNotEqual(result.returncode, 0)
         for flag in ("--dry-run", "--yes", "--legacy-root", "--from-repo"):
