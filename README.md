@@ -39,7 +39,9 @@ Override install target: `GRZ_STOW_TARGET=/path ./run.sh install all`
 To transfer existing user links from another valid checkout, preview a named
 package with `./run.sh install --rebind --dry-run PACKAGE`, or use `all-user`
 for the selected user batch. See [user-package rebind](docs/runner-rebind.md) for source
-approval, aggregate exclusions and partial-failure recovery.
+approval, aggregate exclusions, explicit per-package results and verified
+package rollback after handled failures. A package failure leaves successful
+migrations intact and allows the remaining eligible packages to proceed.
 
 ### Orphaned links
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Explicit user-link handoff for one package or all-user. No hooks/system actions."""
 import argparse
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 import fcntl
 import hashlib
 import json
@@ -20,6 +20,10 @@ import uuid
 
 class Refusal(Exception):
     pass
+
+
+class Interrupted(Refusal):
+    """An explicit interruption stops the batch after the current rollback."""
 
 
 def require(ok, message):
@@ -302,23 +306,32 @@ def prepare_batch(repo, target, explicit_roots):
     selection = batch_selection(repo)
     print('Selected user packages: ' + ', '.join(selection['selected']))
     print('Excluded user packages: ' + (', '.join(selection['excluded']) or '(none)'))
-    prepared, failures, owned = {}, [], {}
-    for package in selection['selected']:
-        try:
-            roots, snapshot = prepare(repo, target, package, explicit_roots)
-            prepared[package] = (roots, snapshot)
+    prepared, failures, owned = {}, {}, {}
+    try:
+        for package in selection['selected']:
+            try:
+                roots, snapshot = prepare(repo, target, package, explicit_roots)
+                prepared[package] = (roots, snapshot)
+            except Interrupted:
+                raise
+            except (Refusal, OSError, ValueError, subprocess.SubprocessError) as error:
+                failures[package] = str(error)
+                print(f'Batch preflight failed for {package!r}: {error}', file=sys.stderr)
+        # Overlapping plans cannot establish independent package transactions.
+        for package, (_, snapshot) in prepared.items():
             for row in snapshot['rows']:
                 path = Path(row['path'])
                 for other, owner in owned.items():
                     require(path != other and not path.is_relative_to(other) and not other.is_relative_to(path),
                             f'overlapping batch destinations: {owner}, {package}: {path}')
                 owned[path] = package
-        except (Refusal, OSError, ValueError, subprocess.SubprocessError) as error:
-            failures.append(package)
-            print(f'Batch preflight failed for {package!r}: {error}', file=sys.stderr)
-    require(batch_selection(repo) == selection, 'batch selection changed during preflight')
-    require(not failures, 'batch preflight failed; no installed paths changed')
-    return selection, prepared
+        require(batch_selection(repo) == selection, 'batch selection changed during preflight')
+    except BaseException:
+        print_batch_results(selection, {name: {'state': 'failed' if name in failures else 'unattempted',
+                            'outcome': {'status': 'blocked' if name in failures else 'not-started',
+                                        'retained_changes': 0}} for name in selection['selected']})
+        raise
+    return selection, prepared, failures
 
 
 def stow_projection(repo, package, files):
@@ -395,15 +408,60 @@ def apply(repo, target, package, roots, snapshot):
         return apply_locked(repo, target, package, roots, snapshot)
 
 
-def check_parents(snapshot, created):
+def check_parents(snapshot, created, leaf=None):
     owned = {str(path): entry[:3] for path, entry in created}
     for path, expected in snapshot['parents'].items():
+        if leaf is not None and not leaf.parent.is_relative_to(Path(path)):
+            continue
         now = identity(Path(path))
         require((now[:3] if now else None) == owned.get(path, expected),
                 f'parent changed after approval: {path}')
 
 
-def apply_locked(repo, target, package, roots, snapshot, on_journal=None, on_complete=None):
+def original_state_conflicts(target, snapshot, changed):
+    """Verify the whole package's link state after rollback, without resolving links."""
+    conflicts = []
+    replaced = {row['path'] for row, _ in changed}
+    for row in snapshot['rows']:
+        path = target / row['path']
+        try:
+            check_parents(snapshot, [], path)
+            now = identity(path)
+            if row['before'] is None:
+                require(now is None, 'originally missing path now exists')
+            else:
+                require(now is not None and stat.S_ISLNK(now[2]) and
+                        now[2] == row['before'][2] and os.readlink(path) == row['old'],
+                        'original link was not restored')
+                if row['path'] not in replaced:
+                    require(now == row['before'], 'unchanged path identity changed')
+        except (OSError, Refusal):
+            conflicts.append(row['path'])
+    return conflicts
+
+
+def print_package_result(package, outcome):
+    retained = outcome.get('retained_changes')
+    count = str(retained) if retained is not None else 'unknown'
+    print(f'Package result: {package}: {outcome["status"]}; retained link changes: {count}', flush=True)
+    for path in outcome.get('recovery_paths', []):
+        print(f'  Manual recovery check: {path}', flush=True)
+
+
+def print_batch_results(selection, packages):
+    print('Final package results:', flush=True)
+    for package in selection['selected']:
+        result = packages[package]
+        outcome = result.get('outcome', {'status': 'not-started' if result['state'] == 'failed'
+                                        else result['state'], 'retained_changes': 0})
+        print_package_result(package, outcome)
+        if result.get('error'):
+            print(f'  Package error: {result["error"]}', flush=True)
+    for package in selection['excluded']:
+        print_package_result(package, {'status': 'excluded', 'retained_changes': 0})
+
+
+def apply_locked(repo, target, package, roots, snapshot, on_journal=None, on_complete=None, on_failure=None):
     """One conservative transaction; caller owns the target lock."""
     changed, created = [], []
     journal = None
@@ -461,49 +519,80 @@ def apply_locked(repo, target, package, roots, snapshot, on_journal=None, on_com
         require(all(fresh[key] == snapshot[key] for key in ('files', 'legacy', 'mapping', 'renames')),
                 'source changed during transaction')
         verify_result(target, repo, package, snapshot)
-        result = {'journal': str(journal), 'created': created}
+        outcome = {'status': 'rebound' if changed else 'unchanged',
+                   'retained_changes': len(changed), 'verification': 'current'}
+        result = {'journal': str(journal), 'created': created, 'outcome': outcome}
         with mutation_record():
+            write_record(journal.with_name('result.json'), outcome)
             if on_complete:
                 on_complete(result)
             complete = True
-        print('Rebind verified; hooks, system files and service state were not touched.')
+            print('Rebind verified; hooks, system files and service state were not touched.')
+            if on_complete is None:
+                print_package_result(package, outcome)
         return result
     except BaseException:
         if complete:
             raise  # Already committed and durably reported to a batch caller.
-        for row, own in reversed(changed):
-            p = target / row['path']
-            try:
-                directories(p.parent)
-                now = identity(p)
-                require((now is None if own is None else now is not None and now[:2] == own and
-                         p.is_symlink() and os.readlink(p) == row['new']), 'rollback ownership lost')
-                if row['old'] is None:
-                    p.unlink()
-                else:
-                    temp = p.with_name('.runner-rebind-rollback-' + uuid.uuid4().hex)
-                    temp.symlink_to(row['old'])
-                    try:
-                        if own is None:
-                            os.link(temp, p, follow_symlinks=False)
-                        else:
-                            os.replace(temp, p)
-                    finally:
-                        if temp.is_symlink():
-                            temp.unlink()
-            except (OSError, Refusal):
-                print(f'Manual rollback required: {p}; journal: {journal}', file=sys.stderr)
-        for directory, own in reversed(created):
-            try:
-                current = identity(directory)
-                if current and current[:2] == own[:2] and stat.S_ISDIR(current[2]):
-                    directory.rmdir()  # Empty directories created by this transaction only.
-            except OSError:
-                pass
+        # A second handled signal must not interrupt rollback halfway through.
+        with mutation_record():
+            outcome = rollback_package(target, snapshot, changed, created, journal)
+            if journal is not None:
+                try:
+                    write_record(journal.with_name('result.json'), outcome)
+                except OSError:
+                    print(f'Could not record package result; journal: {journal}', file=sys.stderr)
+            if on_failure:
+                on_failure(outcome)
+            else:
+                print_package_result(package, outcome)
         raise
 
 
-def write_progress(path, progress):
+def rollback_package(target, snapshot, changed, created, journal):
+    errors = set()
+    for row, own in reversed(changed):
+        p = target / row['path']
+        try:
+            check_parents(snapshot, created, p)
+            directories(p.parent)
+            def still_owned():
+                now = identity(p)
+                require((now is None if own is None else now is not None and now[:2] == own and
+                         p.is_symlink() and os.readlink(p) == row['new']), 'rollback ownership lost')
+            still_owned()
+            if row['old'] is None:
+                p.unlink()
+            else:
+                temp = p.with_name('.runner-rebind-rollback-' + uuid.uuid4().hex)
+                try:
+                    temp.symlink_to(row['old'])
+                    check_parents(snapshot, created, p)
+                    still_owned()
+                    if own is None:
+                        os.link(temp, p, follow_symlinks=False)
+                    else:
+                        os.replace(temp, p)
+                finally:
+                    if temp.is_symlink():
+                        temp.unlink()
+        except (OSError, Refusal):
+            errors.add(row['path'])
+            print(f'Manual rollback required: {p}; journal: {journal}', file=sys.stderr)
+    for directory, own in reversed(created):
+        try:
+            current = identity(directory)
+            if current and current[:2] == own[:2] and stat.S_ISDIR(current[2]):
+                directory.rmdir()  # Empty directories created by this transaction only.
+        except OSError:
+            pass
+    conflicts = sorted(errors | set(original_state_conflicts(target, snapshot, changed)))
+    return {'status': 'manual-recovery' if conflicts else 'rolled-back' if changed else 'not-started',
+            'retained_changes': None if conflicts else 0,
+            'verification': 'unverified' if conflicts else 'original', 'recovery_paths': conflicts}
+
+
+def write_record(path, progress):
     temporary = path.with_name('.progress-' + uuid.uuid4().hex)
     try:
         fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -516,6 +605,10 @@ def write_progress(path, progress):
             temporary.unlink()
 
 
+def write_progress(path, progress):
+    write_record(path, progress)
+
+
 def batch_snapshot(repo, target, package, roots, snapshot, created):
     fresh = plan(repo, target, package, roots)
     expected = dict(snapshot)
@@ -525,73 +618,139 @@ def batch_snapshot(repo, target, package, roots, snapshot, created):
     return expected
 
 
-def apply_batch(repo, target, selection, prepared):
+def apply_batch(repo, target, selection, prepared, failures=None):
+    failures = failures or {}
     progress = {'repository': str(repo), 'target': str(target), 'selection': selection,
-                'packages': {package: {'state': 'unattempted'} for package in selection['selected']},
+                'packages': {package: {'state': 'failed', 'error': failures[package], 'outcome': {
+                    'status': 'blocked', 'retained_changes': 0}} if package in failures else {
+                    'state': 'unattempted'} for package in selection['selected']},
                 'plans': {package: {'roots': list(map(str, roots)), 'snapshot': snapshot}
                           for package, (roots, snapshot) in prepared.items()}, 'state': 'running',
-                'stage': 'packages'}
+                'stage': 'before-writes'}
     created = {}
-    with target_lock(target):
+    journal = None
+    current = None
+    locks = ExitStack()
+    try:
+        locks.enter_context(target_lock(target))
         require(batch_selection(repo) == selection, 'batch selection changed after approval; rerun')
         # Revalidate the entire approved batch before the first installed write.
         for package, (roots, snapshot) in prepared.items():
-            batch_snapshot(repo, target, package, roots, snapshot, created)
+            try:
+                batch_snapshot(repo, target, package, roots, snapshot, created)
+            except Interrupted:
+                raise
+            except (Refusal, OSError, ValueError, subprocess.SubprocessError) as error:
+                progress['packages'][package].update(state='failed', error=str(error), outcome={
+                    'status': 'not-started', 'retained_changes': 0})
         journal = Path(tempfile.mkdtemp(prefix='runner-rebind-batch-', dir='/tmp')) / 'progress.json'
+        progress['stage'] = 'packages'
         write_progress(journal, progress)
         print(f'Batch recovery journal: {journal}', flush=True)
-        current = None
-        try:
-            for package, (roots, snapshot) in prepared.items():
-                current = package
-                require(batch_selection(repo) == selection, 'batch selection changed during execution')
+        for package, (roots, snapshot) in prepared.items():
+            current = package
+            require(batch_selection(repo) == selection, 'batch selection changed during execution')
+            if progress['packages'][package]['state'] == 'failed':
+                continue
+
+            def started(path):
+                progress['packages'][package]['journal'] = str(path)
+                write_progress(journal, progress)
+
+            def completed(result):
+                previous = dict(progress['packages'][package])
+                progress['packages'][package].update(state='completed', outcome=result['outcome'])
+                try:
+                    write_progress(journal, progress)
+                except BaseException:
+                    progress['packages'][package].clear()
+                    progress['packages'][package].update(previous)
+                    raise
+                created.update({str(path): entry[:3] for path, entry in result['created']})
+
+            def failed(outcome):
+                progress['packages'][package]['outcome'] = outcome
+                write_progress(journal, progress)
+
+            try:
                 approved = batch_snapshot(repo, target, package, roots, snapshot, created)
                 progress['packages'][package]['state'] = 'running'
                 write_progress(journal, progress)
-
-                def started(path):
-                    progress['packages'][package]['journal'] = str(path)
-                    write_progress(journal, progress)
-
-                def completed(result):
-                    progress['packages'][package]['state'] = 'completed'
-                    try:
-                        write_progress(journal, progress)
-                    except BaseException:
-                        progress['packages'][package]['state'] = 'running'
-                        raise
-                    created.update({str(path): entry[:3] for path, entry in result['created']})
-
-                apply_locked(repo, target, package, roots, approved, started, completed)
-            current = None
-            progress['stage'] = 'final-verification'
-            write_progress(journal, progress)
-            require(batch_selection(repo) == selection, 'batch selection changed during execution')
-            for package, (roots, snapshot) in prepared.items():
+                apply_locked(repo, target, package, roots, approved, started, completed, failed)
+            except Interrupted:
+                raise
+            except (Refusal, OSError, ValueError, subprocess.SubprocessError) as error:
+                result = progress['packages'][package]
+                result.update(state='failed', error=str(error))
+                result.setdefault('outcome', {'status': 'not-started', 'retained_changes': 0})
+                # Continuation requires a writable recovery record. Persistent
+                # journal failures escape here and stop the batch.
+                write_progress(journal, progress)
+        current = None
+        progress['stage'] = 'final-verification'
+        write_progress(journal, progress)
+        require(batch_selection(repo) == selection, 'batch selection changed during execution')
+        for package, (roots, snapshot) in prepared.items():
+            result = progress['packages'][package]
+            if result['state'] != 'completed':
+                continue
+            try:
                 fresh = plan(repo, target, package, roots)
                 check_parents(snapshot, [(Path(path), entry) for path, entry in created.items()])
                 require(all(fresh[key] == snapshot[key] for key in ('files', 'legacy', 'mapping', 'renames')),
                         f'source changed during batch: {package}')
                 verify_result(target, repo, package, snapshot)
-            progress['state'] = 'completed'
-            progress['stage'] = 'complete'
-            write_progress(journal, progress)
-        except BaseException:
+            except Interrupted:
+                raise
+            except (Refusal, OSError, ValueError, subprocess.SubprocessError) as error:
+                result['error'] = str(error)
+                result['outcome'] = {'status': 'final-state-unverified', 'verification': 'unverified',
+                                     'retained_changes': None}
+        errors = [name for name, result in progress['packages'].items() if result.get('error')]
+        progress['state'] = 'failed' if errors else 'completed'
+        progress['stage'] = 'complete'
+        write_progress(journal, progress)
+        if errors:
+            raise Refusal('batch completed with package failures: ' + ', '.join(errors))
+    except BaseException:
+        with mutation_record():
             progress['state'] = 'failed'
             if current is not None and progress['packages'][current]['state'] != 'completed':
                 progress['packages'][current]['state'] = 'failed'
-            try:
-                with mutation_record():
-                    write_progress(journal, progress)
-            except OSError:
-                print(f'Could not update batch recovery journal: {journal}', file=sys.stderr)
-            raise
+            # Report the current final state, not merely a previous successful callback.
+            for package, result in progress['packages'].items():
+                if result['state'] != 'completed':
+                    continue
+                try:
+                    roots, snapshot = prepared[package]
+                    fresh = plan(repo, target, package, roots)
+                    check_parents(snapshot, [(Path(path), entry) for path, entry in created.items()])
+                    require(all(fresh[key] == snapshot[key] for key in ('files', 'legacy', 'mapping', 'renames')),
+                            'completed package source changed')
+                    verify_result(target, repo, package, snapshot)
+                except (Refusal, OSError, ValueError, subprocess.SubprocessError) as error:
+                    result['error'] = str(error)
+                    result['outcome'] = {'status': 'final-state-unverified', 'verification': 'unverified',
+                                         'retained_changes': None}
+            if journal is not None:
+                try:
+                    with mutation_record():
+                        write_progress(journal, progress)
+                except OSError:
+                    print(f'Could not update batch recovery journal: {journal}', file=sys.stderr)
+        raise
+    finally:
+        try:
+            with mutation_record():
+                for state in ('completed', 'failed', 'unattempted'):
+                    names = [name for name, result in progress['packages'].items() if result['state'] == state]
+                    print(f'Batch {state} packages: ' + (', '.join(names) or '(none)'), flush=True)
+                print_batch_results(selection, progress['packages'])
+                print(f'Batch status: {progress["state"]}; stage: {progress["stage"]}', flush=True)
+                if journal is not None:
+                    print(f'Batch recovery journal: {journal}', flush=True)
         finally:
-            for state in ('completed', 'failed', 'unattempted'):
-                names = [name for name, result in progress['packages'].items() if result['state'] == state]
-                print(f'Batch {state} packages: ' + (', '.join(names) or '(none)'), flush=True)
-            print(f'Batch status: {progress["state"]}; stage: {progress["stage"]}', flush=True)
-            print(f'Batch recovery journal: {journal}', flush=True)
+            locks.close()
 
 
 def main():
@@ -609,12 +768,20 @@ def main():
     if args.inspect and args.package == 'all-user':
         return inspect_all(repo, target, explicit_roots)
     if args.package == 'all-user':
-        selection, prepared = prepare_batch(repo, target, explicit_roots)
+        selection, prepared, failures = prepare_batch(repo, target, explicit_roots)
         if args.dry_run:
+            print_batch_results(selection, {package: {'state': 'unattempted', 'outcome': {
+                'status': 'blocked' if package in failures else 'preview-only', 'retained_changes': 0},
+                'error': failures.get(package)} for package in selection['selected']})
             print('Read-only batch preflight complete; no installed paths changed.')
-            return 0
-        approve(args, explicit_roots)
-        apply_batch(repo, target, selection, prepared)
+            return 1 if failures else 0
+        try:
+            approve(args, explicit_roots)
+        except BaseException:
+            print_batch_results(selection, {package: {'state': 'unattempted', 'outcome': {
+                'status': 'not-started', 'retained_changes': 0}} for package in selection['selected']})
+            raise
+        apply_batch(repo, target, selection, prepared, failures)
         return 0
     roots, snapshot = prepare(repo, target, args.package, explicit_roots)
     if args.dry_run or args.inspect:
@@ -641,7 +808,7 @@ def approve(args, explicit_roots):
 
 if __name__ == '__main__':
     def interrupted(signum, frame):
-        raise Refusal(f'interrupted by signal {signum}')
+        raise Interrupted(f'interrupted by signal {signum}')
     signal.signal(signal.SIGTERM, interrupted)
     try:
         sys.exit(main())

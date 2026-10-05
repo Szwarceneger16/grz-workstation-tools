@@ -45,9 +45,9 @@ class RebindBatchTests(unittest.TestCase):
             return engine.prepare_batch(self.repo, self.target, [self.old] if explicit else [])
 
     def apply(self, prepared=None):
-        selection, plans = prepared or self.prepare()
+        selection, plans, failures = prepared or self.prepare()
         with contextlib.redirect_stdout(io.StringIO()) as output:
-            engine.apply_batch(self.repo, self.target, selection, plans)
+            engine.apply_batch(self.repo, self.target, selection, plans, failures)
         return output.getvalue()
 
     def progress(self):
@@ -69,6 +69,7 @@ class RebindBatchTests(unittest.TestCase):
         self.assertIn('Selected user packages: demo, second, third', result.stdout)
         for name in ('demo', 'second', 'third'):
             self.assertIn('Package: ' + name, result.stdout)
+            self.assertIn(f'Package result: {name}: preview-only; retained link changes: 0', result.stdout)
         self.assertEqual(self.state(), before)
 
     def test_cli_batch_succeeds_without_running_hooks_or_system_tools(self):
@@ -100,16 +101,17 @@ class RebindBatchTests(unittest.TestCase):
         (self.repo / 'manifests').mkdir()
         (self.repo / 'manifests/ignore-all-install.txt').write_text('# fixture policy\nsecond\n')
         before = os.readlink(self.target / '.local/bin/second')
-        selection, prepared = self.prepare()
+        selection, prepared, failures = self.prepare()
         self.assertEqual(selection['selected'], ['demo', 'third'])
         self.assertEqual(selection['excluded'], ['second'])
-        self.apply((selection, prepared))
+        output = self.apply((selection, prepared, failures))
+        self.assertIn('Package result: second: excluded; retained link changes: 0', output)
         self.assertEqual(os.readlink(self.target / '.local/bin/second'), before)
         result = self.command('verify', '--rebind', 'all-user')
         self.assertEqual(result.returncode, 3, result.stderr)
         self.assertIn('3 packages, 1 need migration, 0 failed', result.stdout)
 
-    def test_preflight_continues_after_conflict_and_refuses_entire_batch(self):
+    def test_preflight_conflict_skips_only_affected_package_and_migrates_others(self):
         path = self.target / '.local/bin/second'
         path.unlink()
         path.write_text('owner data')
@@ -117,9 +119,16 @@ class RebindBatchTests(unittest.TestCase):
         result = self.command('install', '--rebind', '--from-repo', str(self.old), '--yes', 'all-user')
         self.assertEqual(result.returncode, 1)
         self.assertIn('Package: third', result.stdout)
-        self.assertIn('batch preflight failed', result.stderr)
-        self.assertEqual(self.state(), before)
+        self.assertIn('batch completed with package failures: second', result.stderr)
+        self.assertIn('Package result: second: blocked; retained link changes: 0', result.stdout)
+        for name in ('demo', 'third'):
+            self.assertIn(f'Package result: {name}: rebound;', result.stdout)
+        self.assert_current('demo', self.files)
+        self.assert_current('third', ['.local/bin/third'])
         self.assertEqual(path.read_text(), 'owner data')
+        for line in result.stdout.splitlines():
+            if line.startswith(('Rollback journal: ', 'Batch recovery journal: ')):
+                self.addCleanup(shutil.rmtree, Path(line.split(': ', 1)[1]).parent, True)
 
     def test_duplicate_and_prefix_overlapping_destinations_are_refused(self):
         for path in self.target.rglob('*'):
@@ -130,10 +139,8 @@ class RebindBatchTests(unittest.TestCase):
                 source = self.repo / 'packages/second/install' / relative
                 source.parent.mkdir(parents=True, exist_ok=True)
                 source.write_text('fixture')
-                with contextlib.redirect_stderr(io.StringIO()) as errors:
-                    with self.assertRaises(engine.Refusal):
-                        self.prepare(False)
-                self.assertIn('overlapping batch destinations', errors.getvalue())
+                with self.assertRaisesRegex(engine.Refusal, 'overlapping batch destinations'):
+                    self.prepare(False)
                 self.assertEqual(self.state(), {})
                 source.unlink()
 
@@ -165,8 +172,10 @@ class RebindBatchTests(unittest.TestCase):
     def test_explicit_roots_retain_per_package_validation(self):
         shutil.rmtree(self.old / 'packages/third')
         before = self.state()
-        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(engine.Refusal):
-            self.prepare()
+        with contextlib.redirect_stderr(io.StringIO()):
+            selection, prepared, failures = self.prepare()
+        self.assertEqual(list(failures), ['third'])
+        self.assertEqual(list(prepared), ['demo', 'second'])
         self.assertEqual(self.state(), before)
 
     def test_discovery_can_bind_different_roots_for_different_packages(self):
@@ -175,10 +184,10 @@ class RebindBatchTests(unittest.TestCase):
         path = self.target / '.local/bin/second'
         path.unlink()
         path.symlink_to(other / 'stow/second/.local/bin/second')
-        selection, prepared = self.prepare(False)
+        selection, prepared, failures = self.prepare(False)
         self.assertEqual(prepared['demo'][0], [self.old])
         self.assertEqual(prepared['second'][0], [other])
-        self.apply((selection, prepared))
+        self.apply((selection, prepared, failures))
         self.assert_current('second', ['.local/bin/second'])
 
     def test_bare_yes_never_authorizes_discovery(self):
@@ -186,6 +195,8 @@ class RebindBatchTests(unittest.TestCase):
         result = self.command('install', '--rebind', '--yes', 'all-user')
         self.assertEqual(result.returncode, 1)
         self.assertIn('--yes requires explicit --from-repo', result.stderr)
+        for name in ('demo', 'second', 'third'):
+            self.assertIn(f'Package result: {name}: not-started; retained link changes: 0', result.stdout)
         self.assertEqual(self.state(), before)
 
     def interactive(self, reply):
@@ -212,15 +223,17 @@ class RebindBatchTests(unittest.TestCase):
             self.interactive(lambda prompt: 'no')
         self.assertEqual(self.state(), before)
 
-    def test_last_source_change_during_confirmation_blocks_every_write(self):
+    def test_last_source_change_during_confirmation_blocks_only_that_package(self):
         before = self.state()
         def reply(prompt):
             (self.repo / 'packages/third/install/.local/bin/third').write_text('changed after preview')
             return 'REBIND'
         with self.assertRaises(engine.Refusal):
             self.interactive(reply)
-        self.assertEqual(self.state(), before)
-        self.assertFalse(list(self.base.glob('runner-rebind-batch-*')))
+        self.assert_current('demo', self.files)
+        self.assert_current('second', ['.local/bin/second'])
+        self.assertEqual(os.readlink(self.target / '.local/bin/third'), before['.local/bin/third'])
+        self.assertEqual(self.progress()['packages']['third']['outcome']['status'], 'not-started')
 
     def test_selection_change_after_approval_refuses_every_write(self):
         prepared = self.prepare()
@@ -318,7 +331,7 @@ class RebindBatchTests(unittest.TestCase):
                 os.kill(os.getpid(), signal.SIGTERM)
             return result
         def handler(signum, frame):
-            raise engine.Refusal('injected boundary signal')
+            raise engine.Interrupted('injected boundary signal')
         previous = signal.signal(signal.SIGTERM, handler)
         try:
             with mock.patch.object(engine, 'write_progress', side_effect=interrupted), self.assertRaises(engine.Refusal):
@@ -348,11 +361,11 @@ class RebindBatchTests(unittest.TestCase):
         with mock.patch.object(engine, 'verify_result', side_effect=fail), self.assertRaises(engine.Refusal):
             self.apply()
         self.assert_current('demo', self.files)
-        for relative in ('.local/bin/second', '.local/bin/third'):
-            self.assertEqual(os.readlink(self.target / relative), before[relative])
+        self.assertEqual(os.readlink(self.target / '.local/bin/second'), before['.local/bin/second'])
+        self.assert_current('third', ['.local/bin/third'])
         progress = self.progress()
         self.assertEqual({name: result['state'] for name, result in progress['packages'].items()},
-                         {'demo': 'completed', 'second': 'failed', 'third': 'unattempted'})
+                         {'demo': 'completed', 'second': 'failed', 'third': 'completed'})
         self.assertTrue(Path(progress['packages']['second']['journal']).is_file())
         self.assertFalse(list(self.target.rglob('.runner-rebind-*')))
         # Resumption is a new full preflight, preserving completed current links.
@@ -372,7 +385,7 @@ class RebindBatchTests(unittest.TestCase):
             self.apply()
         self.assert_current('demo', self.files)
         self.assertEqual((self.target / '.local/bin/second').read_text(), 'concurrent data')
-        self.assertEqual(self.progress()['packages']['third']['state'], 'unattempted')
+        self.assert_current('third', ['.local/bin/third'])
 
     def test_handled_signal_in_second_package_restores_its_original_link(self):
         original = engine.os.replace
@@ -383,7 +396,7 @@ class RebindBatchTests(unittest.TestCase):
                 os.kill(os.getpid(), signal.SIGTERM)
             return result
         def handler(signum, frame):
-            raise engine.Refusal('injected signal')
+            raise engine.Interrupted('injected signal')
         previous = signal.signal(signal.SIGTERM, handler)
         try:
             with mock.patch.object(engine.os, 'replace', side_effect=interrupted), self.assertRaises(engine.Refusal):
@@ -401,11 +414,12 @@ class RebindBatchTests(unittest.TestCase):
             if progress['packages']['second']['state'] == 'completed':
                 raise OSError('injected journal write failure')
             return original(path, progress)
-        with mock.patch.object(engine, 'write_progress', side_effect=fail), self.assertRaises(OSError):
+        with mock.patch.object(engine, 'write_progress', side_effect=fail), self.assertRaises(engine.Refusal):
             self.apply()
         self.assert_current('demo', self.files)
         self.assertEqual(os.readlink(self.target / '.local/bin/second'), before['.local/bin/second'])
         self.assertEqual(self.progress()['packages']['second']['state'], 'failed')
+        self.assert_current('third', ['.local/bin/third'])
 
     def test_final_batch_verification_failure_preserves_completed_transactions(self):
         original = engine.verify_result
@@ -420,8 +434,150 @@ class RebindBatchTests(unittest.TestCase):
             self.apply()
         progress = self.progress()
         self.assertEqual(progress['state'], 'failed')
-        self.assertEqual(progress['stage'], 'final-verification')
+        self.assertEqual(progress['stage'], 'complete')
         self.assertTrue(all(result['state'] == 'completed' for result in progress['packages'].values()))
+
+    def test_batch_reports_unchanged_rollback_and_later_success_separately(self):
+        for rel in self.files:
+            (self.target / rel).unlink()
+            self.link(rel, self.repo)
+        original = engine.verify_result
+        def fail(target, repo, package, snapshot):
+            if package == 'second':
+                raise engine.Refusal('injected')
+            return original(target, repo, package, snapshot)
+        selection, plans, failures = self.prepare()
+        with mock.patch.object(engine, 'verify_result', side_effect=fail), \
+                contextlib.redirect_stdout(io.StringIO()) as output, self.assertRaises(engine.Refusal):
+            engine.apply_batch(self.repo, self.target, selection, plans, failures)
+        for name, status in (('demo', 'unchanged'), ('second', 'rolled-back')):
+            self.assertIn(f'Package result: {name}: {status}; retained link changes: 0', output.getvalue())
+        self.assertIn('Package result: third: rebound; retained link changes: 1', output.getvalue())
+        outcomes = self.progress()['packages']
+        self.assertEqual(outcomes['demo']['outcome']['verification'], 'current')
+        self.assertEqual(outcomes['second']['outcome']['verification'], 'original')
+
+    def test_batch_reports_incomplete_package_rollback_without_claiming_zero_changes(self):
+        original = engine.verify_result
+        def race(target, repo, package, snapshot):
+            if package == 'second':
+                path = target / '.local/bin/second'
+                path.unlink()
+                path.write_text('concurrent data')
+                raise engine.Refusal('injected')
+            return original(target, repo, package, snapshot)
+        selection, plans, failures = self.prepare()
+        with mock.patch.object(engine, 'verify_result', side_effect=race), \
+                contextlib.redirect_stdout(io.StringIO()) as output, \
+                contextlib.redirect_stderr(io.StringIO()), self.assertRaises(engine.Refusal):
+            engine.apply_batch(self.repo, self.target, selection, plans, failures)
+        self.assertIn('Package result: demo: rebound; retained link changes: 2', output.getvalue())
+        self.assertIn('Package result: second: manual-recovery; retained link changes: unknown', output.getvalue())
+        self.assertIn('Manual recovery check: .local/bin/second', output.getvalue())
+        self.assertIn('Package result: third: rebound; retained link changes: 1', output.getvalue())
+        outcome = self.progress()['packages']['second']['outcome']
+        self.assertEqual(outcome['recovery_paths'], ['.local/bin/second'])
+        self.assertIsNone(outcome['retained_changes'])
+
+    def test_failure_rechecks_completed_packages_under_the_same_target_lock(self):
+        original = engine.verify_result
+        failed = False
+        lock_checks = []
+        def fail(target, repo, package, snapshot):
+            nonlocal failed
+            if package == 'second':
+                failed = True
+                path = target / self.files[0]
+                path.unlink()
+                path.write_text('concurrent data')
+                raise engine.Refusal('injected')
+            if failed:
+                with self.assertRaises(BlockingIOError), engine.target_lock(target):
+                    pass
+                lock_checks.append(package)
+            return original(target, repo, package, snapshot)
+        selection, plans, failures = self.prepare()
+        with mock.patch.object(engine, 'verify_result', side_effect=fail), \
+                contextlib.redirect_stdout(io.StringIO()) as output, self.assertRaises(engine.Refusal):
+            engine.apply_batch(self.repo, self.target, selection, plans, failures)
+        self.assertIn('demo', lock_checks)
+        self.assertIn('Package result: demo: final-state-unverified; retained link changes: unknown', output.getvalue())
+        self.assertEqual(self.progress()['packages']['demo']['outcome']['status'], 'final-state-unverified')
+        self.assertEqual((self.target / self.files[0]).read_text(), 'concurrent data')
+
+    def test_early_apply_refusal_reports_every_package_with_zero_retained_changes(self):
+        selection, plans, failures = self.prepare()
+        with engine.target_lock(self.target), contextlib.redirect_stdout(io.StringIO()) as output, \
+                self.assertRaises(BlockingIOError):
+            engine.apply_batch(self.repo, self.target, selection, plans, failures)
+        for name in selection['selected']:
+            self.assertIn(f'Package result: {name}: unattempted; retained link changes: 0', output.getvalue())
+        self.assertIn('Batch status: failed; stage: before-writes', output.getvalue())
+        self.assertFalse(list(self.base.glob('runner-rebind-batch-*')))
+
+    def test_failed_package_removes_its_shared_new_directory_before_next_package(self):
+        for root in (self.repo, self.old):
+            source = root / 'packages/second/install/.config/shared/second'
+            source.parent.mkdir(parents=True)
+            source.write_text('fixture')
+            source = root / 'packages/third/install/.config/shared/third'
+            source.parent.mkdir(parents=True)
+            source.write_text('fixture')
+        original = engine.verify_result
+        def fail(target, repo, package, snapshot):
+            if package == 'second':
+                raise engine.Refusal('injected')
+            return original(target, repo, package, snapshot)
+        with mock.patch.object(engine, 'verify_result', side_effect=fail), self.assertRaises(engine.Refusal):
+            self.apply()
+        self.assertFalse((self.target / '.config/shared/second').exists())
+        self.assert_current('third', ['.config/shared/third', '.local/bin/third'])
+        self.assertEqual(self.progress()['packages']['second']['outcome']['status'], 'rolled-back')
+
+    def test_multiple_package_failures_are_recorded_and_later_package_still_succeeds(self):
+        original = engine.verify_result
+        before = self.state()
+        def fail(target, repo, package, snapshot):
+            if package in ('demo', 'second'):
+                raise engine.Refusal('injected ' + package)
+            return original(target, repo, package, snapshot)
+        with mock.patch.object(engine, 'verify_result', side_effect=fail), self.assertRaises(engine.Refusal):
+            self.apply()
+        for path in self.files + ['.local/bin/second']:
+            self.assertEqual(os.readlink(self.target / path), before[path])
+        self.assert_current('third', ['.local/bin/third'])
+        progress = self.progress()
+        self.assertEqual(progress['stage'], 'complete')
+        for name in ('demo', 'second'):
+            self.assertEqual(progress['packages'][name]['outcome']['status'], 'rolled-back')
+            self.assertEqual(progress['packages'][name]['error'], 'injected ' + name)
+
+    def test_persistent_batch_journal_error_stops_before_next_package(self):
+        original = engine.write_progress
+        def fail(path, progress):
+            if progress['packages']['second']['state'] in ('running', 'failed'):
+                raise OSError('persistent journal failure')
+            return original(path, progress)
+        before = self.state()
+        with mock.patch.object(engine, 'write_progress', side_effect=fail), \
+                contextlib.redirect_stderr(io.StringIO()), self.assertRaises(OSError):
+            self.apply()
+        self.assert_current('demo', self.files)
+        for rel in ('.local/bin/second', '.local/bin/third'):
+            self.assertEqual(os.readlink(self.target / rel), before[rel])
+
+    def test_failed_batch_dry_run_reports_blocked_package_and_changes_nothing(self):
+        path = self.target / '.local/bin/second'
+        path.unlink()
+        path.write_text('owner data')
+        before = self.state()
+        result = self.command('install', '--rebind', '--from-repo', str(self.old), '--dry-run', 'all-user')
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('Package result: second: blocked; retained link changes: 0', result.stdout)
+        for name in ('demo', 'third'):
+            self.assertIn(f'Package result: {name}: preview-only; retained link changes: 0', result.stdout)
+        self.assertEqual(self.state(), before)
+        self.assertEqual(path.read_text(), 'owner data')
 
 
 if __name__ == '__main__':
