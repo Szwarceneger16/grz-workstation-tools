@@ -17,6 +17,21 @@ Use a stable checkout for normal installations; switching its branch later also
 changes what installed links expose. Per-package worktree installations remain
 an explicit choice.
 
+## Migration and orphan cleanup
+
+Use rebind from the destination checkout while the approved source package tree
+still exists. It verifies package mappings, exact declared paths and source
+inventories before transferring user links. Dangling links after source loss,
+removed packages and undeclared leftovers are not repaired by rebind.
+
+`uninstall --orphaned PACKAGE` is a separate cleanup command for leftovers
+anchored in the checkout running it. It uses a bounded target scan and a
+user-unit naming heuristic, can deactivate user units, and does not migrate
+links, share rebind's lock or provide its package rollback. Do not use it as a
+preparatory step for rebind or run it concurrently against the same target.
+Ordinary `verify PACKAGE` checks installed files and package verification;
+`verify --rebind PACKAGE` performs read-only migration inspection instead.
+
 ## Read-only discovery and approval
 
 From the destination checkout:
@@ -42,7 +57,9 @@ Detected roots are candidates, not proof of trusted Git provenance. Each needs a
 valid package/Stow mapping and safe source files. The preview shows source roots,
 destination checkout, individual link states and payload differences. The last
 command asks for literal `REBIND` to approve that preview; changed state after
-approval aborts. No source checkout's scripts or configuration are executed.
+approval blocks the affected package. An aggregate run still attempts the
+remaining eligible packages; shared plan changes or explicit interruption stop
+the series. No source checkout's scripts or configuration are executed.
 
 Optionally repeat `--from-repo` to restrict the operation to explicitly selected
 roots instead of discovery. `--legacy-root` remains a compatibility alias; it
@@ -79,16 +96,17 @@ apply to every inspected package; roots missing that package fail validation.
 The inventory classifies current links, missing destinations, proven legacy
 links, mapped renames, unmapped legacy residue and unknown conflicts. A regular
 file, dangling/indirect/foreign link, linked parent directory, special source,
-source symlink, invalid package mapping or custom Stow ignore policy blocks the
-operation before mutation. Source content/mode differences are disclosed; a
-rebind can therefore also deploy a reviewed payload change, not merely move a
-path. The old checkout must remain available for proof.
+source symlink or custom Stow ignore policy blocks the affected package before
+its mutation. Invalid aggregate selection metadata or Stow mappings refuse the
+entire batch before any package writes. Source content/mode differences are
+disclosed; a rebind can therefore also deploy a reviewed payload change, not
+merely move a path. The old checkout must remain available for proof.
 
 ## Aggregate user rebind
 
 `install --rebind all-user` selects package names in sorted order from `stow/`,
 honoring `manifests/ignore-all-install.txt`. It prints both selected and excluded
-packages. Each Stow link must have the declared package/install mapping; selected
+packages. Each Stow link must have the declared package/install mapping; eligible
 packages must have safe, nonempty inventories. Read-only `verify --rebind all-user`
 continues to inspect excluded packages too. A named package can be migrated
 separately after reviewing its plan. An empty aggregate selection is refused.

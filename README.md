@@ -80,8 +80,9 @@ The manual follow-up includes a successful manager reload after link removal
 and checks of concrete template instances and activation sources. The orphaned
 command does not provide those checks itself.
 
-To transfer installed links from another checkout whose package tree still
-exists, use the separate [user-package rebind workflow](docs/runner-rebind.md).
+For a package still available in an approved source checkout, use the
+[migration workflow above](#migrating-user-links-between-checkouts). Orphaned
+cleanup removes leftovers anchored in this checkout; it does not transfer them.
 
 For managed user-install files, excluding Stow metadata, `verify` requires
 an installed symlink and compares its resolved target with the
