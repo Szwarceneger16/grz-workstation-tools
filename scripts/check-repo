@@ -360,6 +360,14 @@ manifest_declares_unit() {
   return 1
 }
 
+# Trigger targets require exact concrete names. Template-file coverage above
+# does not select an instance, and Accept=yes uses its separate template gate.
+manifest_declares_concrete_target() {
+  local want="$1"
+  is_template_unit_name "$want" && return 1
+  [[ -n "${unit_names[$want]-}" ]]
+}
+
 # When $1 is a template unit file base (e.g. foo@.timer) and $2 is its
 # Unit=/Service= directive value (which may contain the %i/%I specifier),
 # verify the directive resolves to a manifest-declared unit for every
@@ -375,7 +383,7 @@ check_template_directive_instances() {
     inst_suffix_unescaped="$(systemd_unescape_instance "$inst_suffix")"
     resolved="${directive//\%i/$inst_suffix}"
     resolved="${resolved//\%I/$inst_suffix_unescaped}"
-    manifest_declares_unit "$resolved" ||
+    manifest_declares_concrete_target "$resolved" ||
       err "$package: $file_base references $directive_name=$directive which resolves to $resolved for instance $instance, not in $manifest_name"
   done
 }
@@ -395,11 +403,11 @@ check_directive_target() {
       inst_suffix_unescaped="$(systemd_unescape_instance "$inst_suffix")"
       resolved="${directive//\%i/$inst_suffix}"
       resolved="${resolved//\%I/$inst_suffix_unescaped}"
-      manifest_declares_unit "$resolved" ||
+      manifest_declares_concrete_target "$resolved" ||
         err "$package: $file_base references $directive_name=$directive which resolves to $resolved, not in $manifest_name"
     fi
   else
-    manifest_declares_unit "$directive" ||
+    manifest_declares_concrete_target "$directive" ||
       err "$package: $file_base references $directive_name=$directive which is not in $manifest_name"
   fi
 }
@@ -407,7 +415,7 @@ check_directive_target() {
 check_implicit_service_target() {
   local unit_dir="$1" base="$2" implicit_svc="$3" manifest_name="$4"
   if repo_unit_file_exists "$unit_dir" "$implicit_svc"; then
-    manifest_declares_unit "$implicit_svc" ||
+    manifest_declares_concrete_target "$implicit_svc" ||
       err "$package: $base implicitly requires $implicit_svc which is not in $manifest_name"
   else
     err "$package: $base implicitly requires $implicit_svc which has no repo unit file"

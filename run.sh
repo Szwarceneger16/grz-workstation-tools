@@ -684,6 +684,7 @@ activation_bases_for_unit() {
       if [[ -n "$managed_target" ]]; then
         [[ -n "$unit_instance" ]] && managed_target="${managed_target//\%i/$unit_instance}"
         [[ -n "$unit_instance" ]] && managed_target="${managed_target//\%I/$unit_instance_unescaped}"
+        is_template_unit_name "$managed_target" && die "uninstantiated template trigger target: $unit -> $managed_target"
         print -r -- "${managed_target%.service}"
       else
         print -r -- "${unit%.*}"
@@ -695,6 +696,7 @@ activation_bases_for_unit() {
       if [[ -n "$managed_target" ]]; then
         [[ -n "$unit_instance" ]] && managed_target="${managed_target//\%i/$unit_instance}"
         [[ -n "$unit_instance" ]] && managed_target="${managed_target//\%I/$unit_instance_unescaped}"
+        is_template_unit_name "$managed_target" && die "uninstantiated template trigger target: $unit -> $managed_target"
         print -r -- "${managed_target%.service}"
       elif systemd_truthy_directive Accept "$unit_file"; then
         # Accept=yes sockets instantiate the template service per connection;

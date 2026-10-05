@@ -135,6 +135,67 @@ class UnitParserPolicyTests(unittest.TestCase):
                            'demo.socket\ndemo.service\n')
                 self.invalid_both()
 
+    def test_uninstantiated_explicit_targets_are_not_authorized_by_template_coverage(self):
+        for kind, key in (('timer', 'Unit'), ('path', 'Unit'), ('socket', 'Service')):
+            for trigger in ('demo.' + kind, 'demo@alpha.' + kind, 'demo@.' + kind):
+                for target_declarations in ('worker@alpha.service\n',
+                                            'worker@alpha.service\nworker@beta.service\n',
+                                            'worker@.service\nworker.socket\n'):
+                    with self.subTest(kind=kind, trigger=trigger, targets=target_declarations):
+                        self.setUp()
+                        files = {trigger: f'[{kind.title()}]\n{key}=worker@.service\n',
+                                 'worker@.service': '[Service]\n'}
+                        if 'worker.socket' in target_declarations:
+                            # A legitimate accepting socket may declare this bare
+                            # template, but cannot authorize another trigger's target.
+                            files['worker.socket'] = '[Socket]\nAccept=yes\n'
+                        declaration = trigger.replace('@.', '@alpha.')
+                        self.units(files, declaration + '\n' + target_declarations)
+                        self.invalid_both()
+
+    def test_exact_concrete_targets_keep_template_file_coverage(self):
+        for kind, key in (('timer', 'Unit'), ('path', 'Unit'), ('socket', 'Service')):
+            for trigger, value in (('demo.' + kind, 'worker@alpha.service'),
+                                   ('demo@.' + kind, 'worker@%i.service'),
+                                   ('demo@.' + kind, 'worker@%I.service')):
+                with self.subTest(kind=kind, trigger=trigger, value=value):
+                    self.setUp()
+                    self.units({trigger: f'[{kind.title()}]\n{key}={value}\n',
+                                'worker@.service': '[Service]\n'},
+                               trigger.replace('@.', '@alpha.') + '\nworker@alpha.service\n')
+                    self.valid_both()
+
+    def test_resolved_targets_need_the_exact_declared_instance(self):
+        for kind, key in (('timer', 'Unit'), ('path', 'Unit'), ('socket', 'Service')):
+            for trigger in ('demo@alpha.' + kind, 'demo@.' + kind):
+                with self.subTest(kind=kind, trigger=trigger):
+                    self.setUp()
+                    self.units({trigger: f'[{kind.title()}]\n{key}=worker@%i.service\n',
+                                'worker@.service': '[Service]\n'},
+                               trigger.replace('@.', '@alpha.') + '\nworker@beta.service\n')
+                    self.invalid_both()
+
+    @unittest.skipUnless(shutil.which('zsh'), 'requires Zsh for user-unit gate')
+    def test_user_trigger_targets_cannot_borrow_template_file_coverage(self):
+        for kind, key in (('timer', 'Unit'), ('path', 'Unit'), ('socket', 'Service')):
+            for accepting_socket in (False, True):
+                with self.subTest(kind=kind, accepting_socket=accepting_socket):
+                    self.setUp()
+                    package = self.repo / 'packages/demo'
+                    install = package / 'install/.config/systemd/user'
+                    install.mkdir(parents=True)
+                    (install / ('demo.' + kind)).write_text(f'[{kind.title()}]\n{key}=worker@.service\n')
+                    (install / 'worker@.service').write_text('[Service]\n')
+                    declarations = 'demo.' + kind + '\nworker@alpha.service\n'
+                    if accepting_socket:
+                        (install / 'worker.socket').write_text('[Socket]\nAccept=yes\n')
+                        declarations = 'demo.' + kind + '\nworker@.service\nworker.socket\n'
+                    (package / 'user-units.manifest').write_text(declarations)
+                    stow = self.repo / 'stow'
+                    stow.mkdir()
+                    (stow / 'demo').symlink_to('../packages/demo/install')
+                    self.assertNotEqual(self.checker().returncode, 0)
+
     @unittest.skipUnless(shutil.which('zsh'), 'requires Zsh for user-unit gate')
     def test_user_unit_gate_applies_sections_and_specifier_refusal(self):
         for text, service in (('[Unit]\nAccept=yes\n', 'demo@.service'),
@@ -214,6 +275,33 @@ resolve_unit_file_path() { print -r -- "$1/$2"; }
                         result = self.invoke(script, root, 'demo@alpha.timer')
                         self.assertEqual(result.returncode, 0, result.stderr)
                         self.assertEqual(result.stdout.strip(), 'worker@alpha')
+
+    def test_lifecycle_refuses_uninstantiated_explicit_template_targets(self):
+        with tempfile.TemporaryDirectory(prefix='unit-target-') as directory:
+            root = Path(directory)
+            for script in ('run.sh', 'scripts/system-copy-select'):
+                for kind, key in (('timer', 'Unit'), ('path', 'Unit'), ('socket', 'Service')):
+                    for unit in ('demo.' + kind, 'demo@alpha.' + kind):
+                        with self.subTest(script=script, unit=unit):
+                            (root / unit).write_text(f'[{kind.title()}]\n{key}=worker@.service\n')
+                            result = self.invoke(script, root, unit)
+                            self.assertNotEqual(result.returncode, 0)
+                            self.assertIn('uninstantiated template trigger target', result.stderr)
+                            self.assertEqual(result.stdout, '')
+
+    def test_lifecycle_preserves_exact_and_expanded_concrete_targets(self):
+        with tempfile.TemporaryDirectory(prefix='unit-target-') as directory:
+            root = Path(directory)
+            for script in ('run.sh', 'scripts/system-copy-select'):
+                for kind, key in (('timer', 'Unit'), ('path', 'Unit'), ('socket', 'Service')):
+                    for unit, target in (('demo.' + kind, 'worker@alpha.service'),
+                                         ('demo@alpha.' + kind, 'worker@%i.service'),
+                                         ('demo@alpha.' + kind, 'worker@%I.service')):
+                        with self.subTest(script=script, unit=unit, target=target):
+                            (root / unit).write_text(f'[{kind.title()}]\n{key}={target}\n')
+                            result = self.invoke(script, root, unit)
+                            self.assertEqual(result.returncode, 0, result.stderr)
+                            self.assertEqual(result.stdout.strip(), 'worker@alpha')
 
     def test_target_parser_failure_aborts_each_lifecycle_before_service_commands(self):
         for script, name in (('run.sh', 'activate_user_units'), ('run.sh', 'deactivate_user_units'),

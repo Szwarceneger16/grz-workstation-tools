@@ -387,7 +387,9 @@ def system_units(repo, package, entries):
                 resolved = resolved.replace('%i', suffix)
                 if '%I' in value:
                     resolved = resolved.replace('%I', unescape_unit_instance(suffix))
-            require(covered(resolved), f'system unit {name} references undeclared target: {resolved}')
+            require(not is_unit_template(resolved),
+                    f'system unit {name} references uninstantiated template target: {resolved}')
+            require(resolved in declared, f'system unit {name} references undeclared target: {resolved}')
 
     accepted_templates = set()
     for name, text in files.items():

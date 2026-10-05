@@ -45,6 +45,15 @@ socket requires its explicitly declared service template; a bare service-templat
 declaration without such a socket is refused. Duplicate/invalid declarations and
 ambiguous repeated or continued target directives are refused too.
 
+Trigger targets must resolve to exactly declared concrete unit names. A file
+such as `worker@.service` can back a declared `worker@alpha.service`, but that
+file-coverage rule does not authorize `Unit=worker@.service` or
+`Service=worker@.service`; neither selects an instance. Resolve `%i`/`%I` for
+every declared trigger instance before checking its exact target. A bare
+service template remains valid only for the separate implicit `Accept=yes`
+socket contract. The standalone helper, system/user validator and lifecycle
+selection enforce this distinction.
+
 Contract directives are read only from their actual sections: `Timer.Unit`,
 `Path.Unit`, `Socket.Service` and `Socket.Accept`. Assignments before any
 section or under a different section are ignored, as systemd ignores them.
