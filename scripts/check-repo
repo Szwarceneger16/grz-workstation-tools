@@ -18,7 +18,7 @@ repo_root="${0:A:h:h}"
 packages_dir="$repo_root/packages"
 
 errors=0
-allowed_hooks=(install.hook.sh verify.hook.sh)
+allowed_hooks=(install.hook.sh uninstall.hook.sh verify.hook.sh)
 protected_paths_file="$repo_root/manifests/protected-system-paths.txt"
 typeset -a protected_paths
 protected_paths=()
