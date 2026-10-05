@@ -30,6 +30,8 @@ trap finish_run_sudo_session EXIT
 
 usage() {
   print -u2 -- "usage: $script_name install [--verbose] [--verify] [--test] all|all-user|all-system|<package>"
+  print -u2 -- "       $script_name install --rebind-system --from-repo PATH [--dry-run|--yes] [--system-root PATH] <package>"
+  print -u2 -- "       $script_name verify --rebind-system --from-repo PATH [--system-root PATH] <package>"
   print -u2 -- "       $script_name install --rebind [--recover-dangling] [--force-links] [--from-repo <checkout>] [--dry-run] [-y] <package>|all-user"
   print -u2 -- "       $script_name verify --rebind [--recover-dangling] [--force-links] [--from-repo <checkout>] <package>|all-user"
   print -u2 -- "       $script_name uninstall [--verbose] all|all-user|all-system|<package>"
@@ -1576,10 +1578,19 @@ run_user_rebind() {
   python3 -I "$helper" --target "$target" "$@"
 }
 
+run_system_rebind() {
+  local helper="$repo_root/scripts/rebind-system-package"
+  [[ -f "$helper" && ! -L "$helper" ]] || \
+    die "optional system rebind helper is not installed: scripts/rebind-system-package"
+  python3 -I "$helper" --repo "$repo_root" "$@"
+}
+
 parse_verify() {
   local selector=""
   local verbose=0
   local rebind=0
+  local system_rebind=0
+  local system_options=0
   local -a legacy_roots
   legacy_roots=()
 
@@ -1590,6 +1601,15 @@ parse_verify() {
         ;;
       --rebind)
         rebind=1
+        ;;
+      --rebind-system)
+        system_rebind=1
+        ;;
+      --system-root)
+        (( $# >= 2 )) || die "$1 requires an absolute path"
+        legacy_roots+=(--system-root "$2")
+        system_options=1
+        shift
         ;;
       --recover-dangling)
         legacy_roots+=(--recover-dangling)
@@ -1621,6 +1641,12 @@ parse_verify() {
 
   [[ -n "$selector" ]] || { usage; exit 64; }
 
+  if (( system_rebind )); then
+    (( ! rebind )) || die "user and system rebind must be separate operations"
+    run_system_rebind --inspect --package "$selector" "${legacy_roots[@]}"
+    return
+  fi
+  (( ! system_options )) || die "--system-root requires --rebind-system"
   if (( rebind )); then
     run_user_rebind --inspect --package "$selector" "${legacy_roots[@]}"
     return
@@ -1780,6 +1806,8 @@ parse_install() {
   local do_verify=0
   local do_test=0
   local rebind=0
+  local system_rebind=0
+  local system_options=0
   local -a rebind_args
   rebind_args=()
 
@@ -1796,6 +1824,15 @@ parse_install() {
         ;;
       --rebind)
         rebind=1
+        ;;
+      --rebind-system)
+        system_rebind=1
+        ;;
+      --system-root|--journal-dir)
+        (( $# >= 2 )) || die "$1 requires an absolute path"
+        rebind_args+=("$1" "$2")
+        system_options=1
+        shift
         ;;
       --dry-run|-n)
         rebind_args+=(--dry-run)
@@ -1845,6 +1882,13 @@ parse_install() {
     exit 64
   }
 
+  if (( system_rebind )); then
+    (( ! rebind && ! do_verify && ! do_test )) || \
+      die "system rebind is separate from user rebind and --verify/--test hooks"
+    run_system_rebind --package "$selector" "${rebind_args[@]}"
+    return
+  fi
+  (( ! system_options )) || die "--system-root/--journal-dir require --rebind-system"
   if (( rebind )); then
     (( ! do_verify && ! do_test )) || die "--rebind verifies links itself; --verify/--test hooks are not allowed"
     run_user_rebind --package "$selector" "${rebind_args[@]}"

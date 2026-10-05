@@ -1,0 +1,568 @@
+#!/usr/bin/env python3
+"""Proof-based regular-file migration for one explicit system package."""
+import argparse
+from contextlib import contextmanager
+import ctypes
+import fcntl
+import fnmatch
+import grp
+import hashlib
+import json
+import os
+from pathlib import Path
+import pwd
+import re
+import signal
+import stat
+import sys
+import tempfile
+
+LIMIT = 16 * 1024 * 1024
+
+
+class Refusal(Exception):
+    pass
+
+
+def require(condition, message):
+    if not condition:
+        raise Refusal(message)
+
+
+def relative(value):
+    require(value and not value.startswith('/') and
+            all(part not in {'', '.', '..'} for part in value.split('/')) and
+            not any(character.isspace() or ord(character) < 32 for character in value),
+            'manifest path must be normalized and relative')
+    return value
+
+
+def absolute(value):
+    require(value.startswith('/') and os.path.normpath(value) == value,
+            'root must be a normalized absolute path')
+    return Path(value)
+
+
+def node(info):
+    # Renaming updates ctime; stable file identity deliberately excludes it.
+    return [info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_gid,
+            info.st_size, info.st_mtime_ns, info.st_nlink]
+
+
+@contextmanager
+def directory(path):
+    """Open every absolute component without following any directory symlink."""
+    path = absolute(str(path))
+    fd = os.open('/', os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for component in path.parts[1:]:
+            child = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                            dir_fd=fd)
+            os.close(fd)
+            fd = child
+        yield fd
+    finally:
+        os.close(fd)
+
+
+def parents(path):
+    result = []
+    for parent in reversed(path.parents):
+        with directory(parent) as fd:
+            info = os.fstat(fd)
+            result.append([str(parent), info.st_dev, info.st_ino, info.st_mode,
+                           info.st_uid, info.st_gid])
+    return result
+
+
+def read_at(fd, name, *, single=False):
+    opened = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
+    try:
+        before = os.fstat(opened)
+        require(stat.S_ISREG(before.st_mode), 'refusing a non-regular file')
+        require(not single or before.st_nlink == 1, 'refusing a hard-linked destination')
+        require(before.st_size <= LIMIT, 'system file exceeds the 16 MiB limit')
+        require(not os.listxattr(opened), 'extended attributes require separate migration')
+        chunks, size = [], 0
+        while True:
+            chunk = os.read(opened, 65536)
+            if not chunk:
+                break
+            size += len(chunk)
+            require(size <= LIMIT, 'system file exceeds the 16 MiB limit')
+            chunks.append(chunk)
+        after = os.fstat(opened)
+        require(node(before) == node(after) and before.st_ctime_ns == after.st_ctime_ns,
+                'file changed while reading')
+        require(node(os.stat(name, dir_fd=fd, follow_symlinks=False)) == node(after),
+                'file identity changed while reading')
+        data = b''.join(chunks)
+        require(len(data) == after.st_size, 'file size changed while reading')
+        return {'identity': node(after), 'sha256': hashlib.sha256(data).hexdigest()}, data
+    finally:
+        os.close(opened)
+
+
+def read(path, *, optional=False, single=False):
+    try:
+        with directory(path.parent) as fd:
+            state, data = read_at(fd, path.name, single=single)
+        state['parents'] = parents(path)
+        return state, data
+    except FileNotFoundError:
+        require(optional, f'missing required file: {path}')
+        # Validate existing parents too: absence is never permission to traverse
+        # a symlink, unreadable directory, or a non-directory component.
+        current = path.parent
+        while True:
+            try:
+                with directory(current):
+                    break
+            except FileNotFoundError:
+                current = current.parent
+        return None, None
+
+
+def policy(repo, name):
+    state, data = read(repo / 'manifests' / name, optional=True)
+    entries = [] if data is None else [line.strip() for line in data.decode().splitlines()
+                                     if line.strip() and not line.lstrip().startswith('#')]
+    return state, entries
+
+
+def numeric(value, group=False):
+    require(re.fullmatch(r'[0-9]+|[A-Za-z_][A-Za-z0-9_-]*', value), 'invalid owner/group')
+    number = (int(value) if value.isdigit() else
+              (grp.getgrnam(value).gr_gid if group else pwd.getpwnam(value).pw_uid))
+    require(0 <= number < 2**32 - 1, 'invalid owner/group ID')
+    return number
+
+
+def config_paths(repo, package):
+    state, data = read(repo / 'packages' / package / 'system-config.manifest', optional=True)
+    result = set()
+    if data is not None:
+        for line in data.decode().splitlines():
+            if line.strip() and not line.lstrip().startswith('#'):
+                fields = line.split()
+                require(len(fields) == 4, 'invalid system config declaration')
+                result.add(relative(fields[0]))
+    return state, result
+
+
+def manifest(repo, package, protected, allowed, excluded):
+    base = repo / 'packages' / package
+    state, data = read(base / 'system-install.manifest')
+    entries = {}
+    for line in data.decode().splitlines():
+        if not line.strip() or line.lstrip().startswith('#'):
+            continue
+        fields = line.split()
+        require(len(fields) == 4, 'system manifest requires path mode owner group')
+        path, mode, owner, group = fields
+        relative(path)
+        require(path not in entries, f'duplicate system destination: {path}')
+        require(re.fullmatch(r'[0-7]{3,4}', mode), 'invalid system mode')
+        number = int(mode, 8)
+        require(not number & 0o7000 or path in allowed, f'unapproved special mode: {path}')
+        require(not any(path == item or path.startswith(item + '/') or item.startswith(path + '/')
+                        for item in excluded), f'system config destination excluded: {path}')
+        parts = Path(path).parts
+        require(not any(fnmatch.fnmatchcase('/'.join(parts[:index]), pattern)
+                        for pattern in protected for index in range(1, len(parts) + 1)),
+                f'protected system destination: {path}')
+        source = base / 'system-install' / path
+        file_state, _ = read(source)
+        entries[path] = {'mode': number, 'uid': numeric(owner), 'gid': numeric(group, True),
+                         'source': file_state}
+    require(entries, 'system manifest must not be empty')
+    names = sorted(entries)
+    for index, path in enumerate(names):
+        require(not any(other.startswith(path + '/') for other in names[index + 1:]),
+                'overlapping system destinations')
+    install = base / 'system-install'
+    def failed(error):
+        raise error
+    for folder, dirs, files in os.walk(install, followlinks=False, onerror=failed):
+        with directory(Path(folder)):
+            pass
+        for name in dirs:
+            require(not (Path(folder) / name).is_symlink(), 'system source directory is a symlink')
+        for name in files:
+            path = Path(folder) / name
+            rel = path.relative_to(install).as_posix()
+            require(stat.S_ISREG(path.lstat().st_mode), 'system source is not a regular file')
+            if rel not in entries:
+                require(name in {'.gitkeep', '.stow-local-ignore', '.gitignore', '.gitattributes', '.gitmodules'}
+                        or '.git' in path.relative_to(install).parts,
+                        f'undeclared system source: {rel}')
+    return state, entries
+
+
+def matches(state, entry):
+    info = state['identity']
+    return (state['sha256'] == entry['source']['sha256'] and
+            stat.S_IMODE(info[2]) == entry['mode'] and
+            info[3:5] == [entry['uid'], entry['gid']])
+
+
+def safe_target_parents(target, path):
+    owner = 0 if target == Path('/') else os.geteuid()
+    for parent in reversed(path.parents):
+        if not parent.is_relative_to(target):
+            continue
+        try:
+            with directory(parent) as fd:
+                info = os.fstat(fd)
+                require(info.st_uid == owner and not stat.S_IMODE(info.st_mode) & 0o022,
+                        'system destination parent has unsafe ownership or write permissions')
+        except FileNotFoundError:
+            break  # Missing parents are inspected as MISSING, never created.
+
+
+def prepare(repo, target, package, roots):
+    require(re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]*', package) and
+            package not in {'all', 'all-system', 'all-user'}, 'select one explicit system package')
+    require(roots, 'system rebind requires explicit --from-repo')
+    for path in [repo, target, *roots]:
+        with directory(path):
+            pass
+    require(target == Path('/') or all(not target.is_relative_to(root) and not root.is_relative_to(target)
+                                      for root in [repo, *roots]),
+            'offline system root overlaps a source checkout')
+    require(len(set(roots)) == len(roots), 'duplicate source root')
+    for index, root in enumerate(roots):
+        require(root != repo and not root.is_relative_to(repo) and not repo.is_relative_to(root),
+                'old/current source roots overlap')
+        require(all(not root.is_relative_to(other) and not other.is_relative_to(root)
+                    for other in roots[:index]), 'legacy source roots overlap')
+    protected_state, protected = policy(repo, 'protected-system-paths.txt')
+    allowed_state, allowed = policy(repo, 'allow-setid-system-paths.txt')
+    for pattern in protected:
+        require(not any(character in pattern for character in '(){}^#~\\'),
+                'unsupported protected-path glob; no migration is allowed')
+        require(not pattern.startswith('/') and '..' not in pattern.split('/'),
+                'invalid protected-path glob')
+    for path in allowed:
+        relative(path)
+    configs, excluded = {}, set()
+    for root in [repo, *roots]:
+        config_state, paths = config_paths(root, package)
+        configs[str(root)] = config_state
+        excluded.update(paths)
+    current_state, current = manifest(repo, package, protected, allowed, excluded)
+    legacy, old_manifests = {}, {}
+    for root in roots:
+        manifest_state, entries = manifest(root, package, protected, allowed, excluded)
+        old_manifests[str(root)] = manifest_state
+        legacy[str(root)] = entries
+    rows, conflicts = [], []
+    for path, entry in sorted(current.items()):
+        destination = target / path
+        sources = [root / 'packages' / package / 'system-install' for root in [repo, *roots]]
+        require(not any(destination.is_relative_to(source) or source.is_relative_to(destination)
+                        for source in sources), 'destination overlaps package sources')
+        try:
+            safe_target_parents(target, destination)
+            before, _ = read(destination, optional=True, single=True)
+            found = [root for root, entries in legacy.items()
+                     if path in entries and before and matches(before, entries[path])]
+            classification = ('MISSING' if before is None else 'CURRENT' if matches(before, entry)
+                              else 'REBINDABLE' if found else 'FOREIGN')
+            if classification == 'FOREIGN':
+                conflicts.append(path)
+        except (OSError, Refusal) as error:
+            before, found, classification = None, [], 'FOREIGN'
+            conflicts.append(path)
+            print(f'Conflict at {path!r}: {error}', file=sys.stderr)
+        rows.append({'path': path, 'class': classification, 'before': before,
+                     'desired': entry, 'legacy_roots': found})
+    residue = sorted(set().union(*(set(entries) for entries in legacy.values())) - set(current))
+    return {'repo': str(repo), 'root': str(target), 'package': package,
+            'roots': [str(root) for root in roots], 'current_manifest': current_state,
+            'old_manifests': old_manifests, 'legacy': legacy, 'configs': configs,
+            'policies': [protected_state, allowed_state], 'rows': rows,
+            'conflicts': conflicts, 'residue': residue}
+
+
+def print_plan(snapshot):
+    print(f'System package: {snapshot["package"]}; root: {snapshot["root"]}')
+    print(f'Current source repo: {snapshot["repo"]!r}')
+    print('Admitted old roots: ' + ', '.join(repr(root) for root in snapshot['roots']))
+    for row in snapshot['rows']:
+        desired = row['desired']
+        print(f'{row["class"]}: {row["path"]!r}; source sha256={desired["source"]["sha256"]}; '
+              f'mode={desired["mode"]:04o}; uid={desired["uid"]}; gid={desired["gid"]}')
+        if row['legacy_roots']:
+            print('  Proven legacy roots: ' + ', '.join(repr(root) for root in row['legacy_roots']))
+        if row['before']:
+            installed = row['before']
+            info = installed['identity']
+            print(f'  Installed sha256={installed["sha256"]}; mode={stat.S_IMODE(info[2]):04o}; '
+                  f'uid={info[3]}; gid={info[4]}')
+    for path in snapshot['residue']:
+        print(f'RESIDUE (unverified, untouched): {path!r}')
+
+
+def save(journal, record):
+    with directory(journal) as fd:
+        info = os.fstat(fd)
+        require(info.st_uid == os.geteuid() and stat.S_IMODE(info.st_mode) == 0o700,
+                'recovery journal must remain account-owned and mode 0700')
+        name = 'progress.json.new'
+        opened = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600,
+                         dir_fd=fd)
+        try:
+            with os.fdopen(opened, 'w') as stream:
+                json.dump(record, stream, sort_keys=True)
+                stream.write('\n')
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(name, 'progress.json', src_dir_fd=fd, dst_dir_fd=fd)
+            os.fsync(fd)
+        finally:
+            try:
+                os.unlink(name, dir_fd=fd)
+            except FileNotFoundError:
+                pass
+
+
+def move(fd, source, destination):
+    libc = ctypes.CDLL(None, use_errno=True)
+    rename = getattr(libc, 'renameat2', None)
+    require(rename is not None, 'Linux renameat2 is required; no unsafe fallback')
+    rename.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    rename.restype = ctypes.c_int
+    if rename(fd, os.fsencode(source), fd, os.fsencode(destination), 1):
+        failure = ctypes.get_errno()
+        raise OSError(failure, os.strerror(failure))
+
+
+@contextmanager
+def mutation():
+    previous = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT, signal.SIGTERM})
+    try:
+        yield
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+
+
+def write_at(fd, name, data, mode, uid, gid):
+    opened = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600,
+                     dir_fd=fd)
+    try:
+        with os.fdopen(opened, 'wb') as stream:
+            stream.write(data)
+            stream.flush()
+            info = os.fstat(stream.fileno())
+            if [info.st_uid, info.st_gid] != [uid, gid]:
+                os.fchown(stream.fileno(), uid, gid)
+            os.fchmod(stream.fileno(), mode)
+            os.fsync(stream.fileno())
+            return {'identity': node(os.fstat(stream.fileno())), 'sha256': hashlib.sha256(data).hexdigest()}
+    except BaseException:
+        # An incomplete stage remains in the journal's recovery evidence.
+        raise
+
+
+def assert_parents(path, expected):
+    require(parents(path) == expected, f'destination parent changed: {path}')
+
+
+def revalidate(repo, target, package, roots, snapshot, changes):
+    fresh = prepare(repo, target, package, roots)
+    for change in changes:
+        row = next(item for item in fresh['rows'] if item['path'] == change['path'])
+        require(row['class'] == 'CURRENT' and row['before']['identity'] == change['new']['identity'],
+                'previously published destination changed')
+        row.update(next(item for item in snapshot['rows'] if item['path'] == change['path']))
+    require(fresh == snapshot, 'approved source, policy or target changed')
+
+
+def owned_at(fd, name, expected):
+    try:
+        state, _ = read_at(fd, name, single=True)
+        return state == expected
+    except FileNotFoundError:
+        return False
+
+
+def restore(fd, row):
+    """Never replace an occupied name, including one created by another writer."""
+    leaf = Path(row['path']).name
+    quarantine, stage = row['quarantine'], row['stage']
+    try:
+        os.stat(quarantine, dir_fd=fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    try:
+        os.stat(leaf, dir_fd=fd, follow_symlinks=False)
+    except FileNotFoundError:
+        move(fd, quarantine, leaf)
+        return
+    require(row.get('published') and owned_at(fd, leaf, row['new']),
+            f'concurrent destination retained; displaced file remains at {quarantine}')
+    move(fd, leaf, stage)
+    require(owned_at(fd, stage, row['new']), 'concurrent file retained in recovery stage')
+    try:
+        move(fd, quarantine, leaf)
+    except BaseException:
+        # Best-effort no-clobber restoration of our new file when another writer
+        # created the final path; neither that writer nor quarantine is removed.
+        try:
+            move(fd, stage, leaf)
+        except OSError:
+            pass
+        raise
+    if owned_at(fd, stage, row['new']):
+        os.unlink(stage, dir_fd=fd)
+    os.fsync(fd)
+
+
+def apply(repo, target, package, roots, snapshot, journal_parent):
+    require(target != Path('/') or os.geteuid() == 0,
+            'live system writes require an explicitly privileged helper invocation')
+    require(not snapshot['conflicts'] and
+            not any(row['class'] == 'MISSING' for row in snapshot['rows']),
+            'full preflight failed; missing/foreign files require separate installation or resolution')
+    with directory(target) as root_fd:
+        fcntl.flock(root_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        require(prepare(repo, target, package, roots) == snapshot, 'approved plan changed')
+        selected = [row for row in snapshot['rows'] if row['class'] == 'REBINDABLE']
+        if not selected:
+            print('System package already current; no writes')
+            return
+        with directory(journal_parent):
+            pass
+        journal = Path(tempfile.mkdtemp(prefix='runner-system-rebind-', dir=journal_parent))
+        record = {'status': 'prepared', 'snapshot': snapshot, 'changes': [], 'recovery': []}
+        print(f'System recovery journal: {journal / "progress.json"}', flush=True)
+        save(journal, record)
+        try:
+            for index, row in enumerate(selected):
+                # Revalidate all remaining evidence, including policy and manifests,
+                # allowing only our already-published target identities to differ.
+                revalidate(repo, target, package, roots, snapshot, record['changes'])
+                path = target / row['path']
+                assert_parents(path, row['before']['parents'])
+                with directory(path.parent) as fd:
+                    before, old = read_at(fd, path.name, single=True)
+                    require(before == {key: row['before'][key] for key in ('identity', 'sha256')},
+                            'destination changed at write boundary')
+                    source = repo / 'packages' / package / 'system-install' / row['path']
+                    source_state, data = read(source)
+                    require(source_state == row['desired']['source'], 'source changed at write boundary')
+                    with directory(journal) as journal_fd:
+                        write_at(journal_fd, f'{index}.before', old, 0o600, os.geteuid(), os.getegid())
+                    change = {'path': row['path'], 'parents': row['before']['parents'],
+                              'stage': f'.runner-system-{journal.name}-{index}.new',
+                              'quarantine': f'.runner-system-{journal.name}-{index}.old',
+                              'published': False}
+                    record['changes'].append(change)
+                    save(journal, record)
+                    desired = row['desired']
+                    change['new'] = write_at(fd, change['stage'], data, desired['mode'], desired['uid'], desired['gid'])
+                    require(owned_at(fd, change['stage'], change['new']), 'prepared stage changed')
+                    save(journal, record)
+                    assert_parents(path, row['before']['parents'])
+                    with mutation():
+                        move(fd, path.name, change['quarantine'])
+                        save(journal, record)
+                    displaced, _ = read_at(fd, change['quarantine'], single=True)
+                    require(displaced == before, 'destination raced with quarantine; restoring without overwrite')
+                    require(owned_at(fd, change['stage'], change['new']), 'prepared stage changed before publication')
+                    with mutation():
+                        move(fd, change['stage'], path.name)
+                        change['published'] = True
+                        save(journal, record)
+                        os.fsync(fd)
+            revalidate(repo, target, package, roots, snapshot, record['changes'])
+            record['status'] = 'committed'
+            save(journal, record)
+        except BaseException:
+            # Persist recovery state before attempting bounded rollback. SIGKILL
+            # or power loss still requires manual reconciliation from this record.
+            record['status'] = 'rolling-back'
+            save(journal, record)
+            for change in reversed(record['changes']):
+                path = target / change['path']
+                try:
+                    assert_parents(path, change['parents'])
+                    with directory(path.parent) as fd, mutation():
+                        restore(fd, change)
+                        try:
+                            os.stat(change['stage'], dir_fd=fd, follow_symlinks=False)
+                        except FileNotFoundError:
+                            pass
+                        else:
+                            require(change.get('new') and owned_at(fd, change['stage'], change['new']),
+                                    'unfinished or changed stage retained for manual recovery')
+                            os.unlink(change['stage'], dir_fd=fd)
+                except (OSError, Refusal) as error:
+                    record['recovery'].append({'path': change['path'], 'reason': str(error)})
+            record['status'] = 'recovery-required' if record['recovery'] else 'rolled-back'
+            save(journal, record)
+            print(f'System result: {record["status"]}', file=sys.stderr)
+            raise
+        # Completed transaction is durable before old staging names are removed.
+        for change in record['changes']:
+            path = target / change['path']
+            try:
+                assert_parents(path, change['parents'])
+                with directory(path.parent) as fd:
+                    expected = next(row['before'] for row in snapshot['rows'] if row['path'] == change['path'])
+                    if owned_at(fd, change['quarantine'], {key: expected[key] for key in ('identity', 'sha256')}):
+                        os.unlink(change['quarantine'], dir_fd=fd)
+                        os.fsync(fd)
+                    else:
+                        raise Refusal('quarantine changed; retained for manual recovery')
+            except (OSError, Refusal) as error:
+                record['recovery'].append({'path': change['path'], 'reason': str(error)})
+        save(journal, record)
+        require(not record['recovery'], 'files committed; recovery remnants require manual inspection')
+        print('System result: committed; backups retained in recovery journal')
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--repo', default=str(Path(__file__).absolute().parents[1]))
+    parser.add_argument('--system-root', default='/')
+    parser.add_argument('--journal-dir', default='/tmp')
+    parser.add_argument('--package', required=True)
+    parser.add_argument('--from-repo', action='append', default=[])
+    parser.add_argument('--inspect', action='store_true')
+    parser.add_argument('--dry-run', action='store_true')
+    parser.add_argument('--yes', action='store_true')
+    args = parser.parse_args()
+    require(not args.inspect or not (args.dry_run or args.yes), 'inspection is read-only')
+    repo, target = absolute(args.repo), absolute(args.system_root)
+    roots = [absolute(root) for root in args.from_repo]
+    snapshot = prepare(repo, target, args.package, roots)
+    print_plan(snapshot)
+    if args.inspect:
+        return 1 if snapshot['conflicts'] else 3 if any(row['class'] != 'CURRENT' for row in snapshot['rows']) else 0
+    require(not snapshot['conflicts'] and not any(row['class'] == 'MISSING' for row in snapshot['rows']),
+            'full preflight failed; no system files changed')
+    if args.dry_run:
+        print('System preview only; no files changed')
+        return 0
+    if not args.yes:
+        require(sys.stdin.isatty(), 'use explicit --yes or interactive SYSTEM REBIND approval')
+        require(input('Type SYSTEM REBIND to approve this exact system plan: ') == 'SYSTEM REBIND',
+                'system rebind not approved')
+    apply(repo, target, args.package, roots, snapshot, absolute(args.journal_dir))
+    return 0
+
+
+def interrupted(signum, frame):
+    raise Refusal(f'system rebind interrupted by signal {signum}')
+
+
+if __name__ == '__main__':
+    signal.signal(signal.SIGINT, interrupted)
+    signal.signal(signal.SIGTERM, interrupted)
+    try:
+        sys.exit(main())
+    except (OSError, Refusal, ValueError, KeyError, UnicodeError) as error:
+        print(f'rebind-system-package: {error}', file=sys.stderr)
+        sys.exit(1)

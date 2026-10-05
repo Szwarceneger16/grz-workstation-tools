@@ -117,6 +117,15 @@ entirely by **declarative manifests** (no per-package shell code for the privile
 
 The repo only ever contains `*.example` configs and unit files — **never real secrets**.
 
+### Migrating copied system files
+
+Use `verify --rebind-system --from-repo PATH PACKAGE` to inspect one system
+package, then `install --rebind-system --from-repo PATH --dry-run PACKAGE`
+to preview replacements proven against an existing legacy checkout. See
+[system-file migration](docs/runner-system-rebind.md) for explicit approval,
+privilege boundaries, preserved backups and rollback. This operation is separate
+from user-link rebind, configuration-secret handling and service activation.
+
 ### Installing configs/secrets
 
 `./run.sh install <name>` copies the files, then for each entry in `system-config.manifest`
