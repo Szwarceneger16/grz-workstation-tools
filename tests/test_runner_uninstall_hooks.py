@@ -186,6 +186,28 @@ parse_uninstall "$@"
         self.assertIn("hook must live in package root", result.stderr)
         self.assertEqual(self.events(), ["preflight:-- alpha"])
 
+    def test_all_lifecycle_hooks_reject_directories_and_fifos_before_deactivation(self):
+        package = self.package("alpha", hook=False)
+        for name in ("install.hook.sh", "uninstall.hook.sh", "verify.hook.sh"):
+            for kind in ("directory", "fifo"):
+                with self.subTest(hook=name, kind=kind):
+                    path = package / name
+                    if kind == "directory":
+                        path.mkdir()
+                    else:
+                        os.mkfifo(path, 0o700)
+                    self.trace.write_text("")
+                    try:
+                        result = self.invoke("alpha")
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertIn("hook must be a regular file", result.stderr)
+                        self.assertEqual(self.events(), ["preflight:-- alpha"])
+                    finally:
+                        if kind == "directory":
+                            path.rmdir()
+                        else:
+                            path.unlink()
+
     def test_manifest_failure_on_later_package_blocks_all_deactivation(self):
         self.package("alpha")
         package = self.package("beta")

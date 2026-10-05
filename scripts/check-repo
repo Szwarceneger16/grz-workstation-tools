@@ -407,7 +407,10 @@ check_hooks() {
       err "$package: unknown hook file (allowed: ${allowed_hooks[*]}): $base"
       continue
     fi
-    [[ ! -L "$f" ]] || err "$package: hook must be a regular file, not a symlink: $base"
+    if [[ -L "$f" || ! -f "$f" ]]; then
+      err "$package: hook must be a regular file, not a symlink or other node: $base"
+      continue
+    fi
     [[ -x "$f" ]] || err "$package: hook is not executable: $base"
     if grep -nE '(^|[[:space:];&|(])(/usr/bin/|/bin/)?sudo([[:space:]]|$)' -- "$f" >/dev/null 2>&1; then
       err "$package: hook must not use sudo (user-level only): $base"
