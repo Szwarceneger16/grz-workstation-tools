@@ -241,6 +241,139 @@ def manifest(repo, package, protected, allowed, excluded):
     return state, entries
 
 
+UNIT_SUFFIXES = {'service', 'timer', 'path', 'socket', 'mount', 'target'}
+
+
+def unit_template(name):
+    return name.split('@', 1)[0] + '@.' + name.rsplit('.', 1)[1]
+
+
+def is_unit_template(name):
+    return '@' in name and name.rsplit('.', 1)[0].split('@', 1)[1] == ''
+
+
+def unit_instance_matches(name, template):
+    return '@' in name and unit_template(name) == template
+
+
+def unescape_unit_instance(value):
+    # systemd-escape --unescape semantics for instance names, without executing
+    # a command (especially repository code) from the privileged helper.
+    result = bytearray()
+    index = 0
+    while index < len(value):
+        character = value[index]
+        if character == '\\':
+            require(re.fullmatch(r'\\x[0-9A-Fa-f]{2}', value[index:index + 4]),
+                    'unsupported system unit instance escape')
+            result.append(int(value[index + 2:index + 4], 16))
+            index += 4
+        else:
+            result.extend(('/' if character == '-' else character).encode())
+            index += 1
+    return result.decode()
+
+
+def system_units(repo, package, entries):
+    """Validate the selected current system-unit contract as data only.
+
+    Mirror check-repo's declarations, template coverage and trigger checks.
+    Keep the unit manifest in the approval snapshot, like installation policy.
+    Legacy declarations are proof input, never current activation authority.
+    """
+    base = repo / 'packages' / package
+    state, data = read(base / 'system-units.manifest', optional=True)
+    declared = set()
+    if data is not None:
+        for fields in declaration_rows(data):
+            require(len(fields) == 1, 'system unit manifest requires one unit name')
+            name = relative(fields[0])
+            require('/' not in name and not name.startswith('-') and
+                    name.rsplit('.', 1)[-1] in UNIT_SUFFIXES,
+                    'invalid system unit name or unsupported suffix')
+            require(not is_unit_template(name) or name.endswith('.service'),
+                    'system unit manifest must list concrete trigger instances')
+            require(name not in declared, 'duplicate system unit declaration')
+            declared.add(name)
+    files = {}
+    for path, entry in entries.items():
+        parts = Path(path).parts
+        # Only top-level supported units under this directory are covered by
+        # the package contract. Do not silently accept another load directory,
+        # drop-ins or a nested layout that the authoritative gate cannot check.
+        if any(
+                parts[index:index + 2] == ('systemd', 'system')
+                for index in range(len(parts) - 1)):
+            require(parts[:3] == ('etc', 'systemd', 'system') and len(parts) == 4 and
+                    parts[-1].rsplit('.', 1)[-1] in UNIT_SUFFIXES,
+                    'unsupported system unit location or suffix')
+            source_state, payload = read(base / 'system-install' / path)
+            require(source_state == entry['source'], 'system unit changed during preflight')
+            files[parts[-1]] = payload.decode()
+
+    def covered(name):
+        return name in declared or is_unit_template(name) and any(
+            unit_instance_matches(instance, name) for instance in declared)
+
+    def exists(name):
+        return name in files or '@' in name and not name.endswith('.mount') and unit_template(name) in files
+
+    for name in files:
+        require(covered(name), f'systemd unit not in system-units.manifest: {name}')
+    for name in declared:
+        require(exists(name), f'system-units.manifest entry has no repo unit file: {name}')
+
+    def directive(text, key):
+        # The authoritative validator reads the first occurrence. Refuse
+        # repeated assignments and continuations rather than authorizing an
+        # ambiguous value that systemd may resolve differently.
+        values = re.findall(r'^\s*' + key + r'\s*=([^\n]*)$', text, re.MULTILINE)
+        require(len(values) <= 1 and all(not value.rstrip().endswith('\\') for value in values),
+                f'ambiguous system unit directive: {key}')
+        return values[0].strip() if values else ''
+
+    def check_target(name, value):
+        instances = ([instance for instance in declared if unit_instance_matches(instance, name)]
+                     if is_unit_template(name) else [name])
+        for instance in instances:
+            resolved = value
+            if '@' in name and ('%i' in value or '%I' in value):
+                suffix = instance.rsplit('.', 1)[0].split('@', 1)[1]
+                resolved = resolved.replace('%i', suffix)
+                if '%I' in value:
+                    resolved = resolved.replace('%I', unescape_unit_instance(suffix))
+            require(covered(resolved), f'system unit {name} references undeclared target: {resolved}')
+
+    accepted_templates = set()
+    for name, text in files.items():
+        kind = name.rsplit('.', 1)[-1]
+        if kind not in {'timer', 'path', 'socket'}:
+            continue
+        custom = directive(text, 'Service' if kind == 'socket' else 'Unit')
+        accept = directive(text, 'Accept') if kind == 'socket' else ''
+        accept = accept.split('#', 1)[0].split(';', 1)[0].strip().lower() in {'yes', 'true', '1', 'on'}
+        if custom:
+            require(kind != 'socket' or custom.endswith('.service') and not accept,
+                    'socket Service= requires a service target and Accept=no')
+            check_target(name, custom)
+        elif accept:
+            service = name.split('@', 1)[0].removesuffix('.socket') + '@.service'
+            require(service in files and service in declared,
+                    f'Accept=yes socket requires declared service template: {service}')
+            accepted_templates.add(service)
+        else:
+            service = name.rsplit('.', 1)[0] + '.service'
+            if is_unit_template(name):
+                check_target(name, name.split('@', 1)[0] + '@%i.service')
+            else:
+                require(exists(service), f'system trigger requires a repo service: {service}')
+                check_target(name, service)
+    for name in declared:
+        require(not is_unit_template(name) or name in accepted_templates,
+                f'service template requires an Accept=yes socket: {name}')
+    return state
+
+
 def matches(state, entry):
     info = state['identity']
     return (state['sha256'] == entry['source']['sha256'] and
@@ -297,6 +430,7 @@ def prepare(repo, target, package, roots):
         configs[str(root)] = config_state
         excluded.update(paths)
     current_state, current = manifest(repo, package, protected, allowed, excluded)
+    units_state = system_units(repo, package, current)
     legacy, old_manifests = {}, {}
     for root in roots:
         manifest_state, entries = manifest(root, package, protected, allowed, excluded)
@@ -331,6 +465,7 @@ def prepare(repo, target, package, roots):
     return {'repo': str(repo), 'root': str(target), 'package': package,
             'root_bindings': bindings,
             'roots': [str(root) for root in roots], 'current_manifest': current_state,
+            'system_units': units_state,
             'old_manifests': old_manifests, 'legacy': legacy, 'configs': configs,
             'policies': [protected_state, allowed_state], 'rows': rows,
             'conflicts': conflicts, 'residue': residue}

@@ -35,6 +35,31 @@ same package layout and its own manifest. Each installed file normally lives
 under `/` at its exact declared relative path. Source permissions are recorded
 for race detection; installed mode and owner/group come from the manifest.
 
+The helper validates the selected current package's system-unit contract before
+inspection, preview or writes, including direct privileged invocation. Supported
+unit files at `system-install/etc/systemd/system/` must be declared in
+`system-units.manifest`, and every declared unit must have a source file or an
+applicable service/trigger template. Timer/path/socket targets must be declared,
+including implicit services and every selected template instance. An `Accept=yes`
+socket requires its explicitly declared service template; a bare service-template
+declaration without such a socket is refused. Duplicate/invalid declarations and
+ambiguous repeated or continued target directives are refused too.
+
+This is data validation inside the reviewed Python helper: it never executes a
+checker or hook from an input checkout. It implements the system-unit checks of
+`check-repo`, with regression comparisons against that authoritative validator;
+it does not claim to run all user-layer/hook checks. Unit files in other systemd
+system load directories, nested unit layouts, drop-ins and unsupported suffixes
+are outside this rebind contract and refused. Invalid unselected packages do not
+block the selected package. Legacy unit declarations do not grant current
+activation authority; legacy file bytes/metadata remain proof input only.
+
+The current unit manifest's absence or exact file identity, bytes and ancestry
+are part of the approved snapshot. Unit payloads are already bound through the
+installation manifest. Every revalidation repeats the unit gate, so changed
+declarations stop forward work and enter the existing bounded rollback if any
+file has already been published. Validation never reloads or starts units.
+
 Inspection reports:
 
 | Classification | Meaning |

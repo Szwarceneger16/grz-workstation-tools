@@ -207,6 +207,16 @@ The selected-package checks are expected to reject, among other things:
   current static check;
 - unsafe special permission bits unless explicitly allowed.
 
+The optional system rebind helper validates the selected current package's
+system-unit declarations, template coverage and trigger targets internally,
+including direct privileged invocation. It binds the current unit manifest to
+the approval snapshot and repeats this validation before publication boundaries
+and final acceptance. It does not execute an input checkout's checker or hooks.
+This internal gate is limited to the system rebind data contract; it is not a
+claim that all user-layer/hook checks from `check-repo` ran. Unsupported systemd
+system load locations and drop-in layouts are refused by this helper. See
+`docs/runner-system-rebind.md` for its exact scope.
+
 The current hook scan is a heuristic, not a proof that a hook cannot obtain or
 invoke privilege indirectly. For example, constructing `sudo` through a
 variable or another executable path can evade a simple textual match. The
