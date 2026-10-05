@@ -1,7 +1,9 @@
 # Optional user-package rebind (WP-5)
 
 `scripts/rebind-user-package` discovers and transfers selected packages' user-layer
-symlinks from approved, still-existing checkouts to this checkout. It is a separate
+symlinks from approved, still-existing checkouts to this checkout. An explicit
+recovery mode also accepts exact dangling links after a checkout was removed.
+It is a separate
 optional Python helper; `run.sh` only routes arguments. Consumers may omit the
 helper from their selection manifest. Ordinary install/verify still work without
 it; requesting rebind then fails with an explicit unavailable-feature message.
@@ -21,8 +23,10 @@ an explicit choice.
 
 Use rebind from the destination checkout while the approved source package tree
 still exists. It verifies package mappings, exact declared paths and source
-inventories before transferring user links. Dangling links after source loss,
-removed packages and undeclared leftovers are not repaired by rebind.
+inventories before transferring user links. By default, dangling links after
+source loss remain conflicts. The missing-checkout recovery mode below accepts
+a narrower class of dangling links. Removed packages and undeclared leftovers
+are not repaired by either mode.
 
 `uninstall --orphaned PACKAGE` is a separate cleanup command for leftovers
 anchored in the checkout running it. It uses a bounded target scan and a
@@ -91,9 +95,60 @@ repository's `stow/`, including packages excluded from ordinary `install all`,
 and performs the same exact-path inspection for each. It continues after package
 failures and returns 1 if any failed, otherwise 3 if any need migration, or 0 if
 all are current. It does not widen the target search. Explicit root restrictions
-apply to every inspected package; roots missing that package fail validation.
+apply to every inspected package; roots missing that package fail validation
+in normal rebind mode.
 
-The inventory classifies current links, missing destinations, proven legacy
+## Explicit recovery after losing a checkout
+
+If the entire old checkout has been removed, normal rebind lacks the source
+inventory needed to prove ownership or compare old payload bytes and modes.
+Use `--recover-dangling` only after reviewing the exact selected missing roots:
+
+```sh
+./run.sh verify --rebind --recover-dangling --from-repo /path/to/lost-checkout PACKAGE
+./run.sh install --rebind --recover-dangling --from-repo /path/to/lost-checkout --dry-run PACKAGE
+./run.sh install --rebind --recover-dangling --from-repo /path/to/lost-checkout --yes PACKAGE
+```
+
+Replace `PACKAGE` with `all-user` for a package-by-package batch. The same
+exclusions, target lock, complete preflight, approval, final verification,
+rollback and explicit outcome reporting apply. `verify` remains read-only and
+returns 3 for recoverable links. The generated preview command retains the
+recovery flag. Automatic source discovery is disabled in this mode; explicit
+`--from-repo` values are mandatory even for inspection or dry-run.
+
+Every selected root must be absent, with no symlinked ancestors. An existing
+checkout with a missing package is refused; use normal rebind when its source
+is available. The root cannot be the destination checkout or lie inside the
+installation target. Repeated `--from-repo` values may select several missing
+roots, but valid and missing source roots cannot be mixed in one recovery run.
+
+Recovery accepts only current declared destination leaves whose direct link
+text is the canonical absolute or relative spelling of exactly
+`ROOT/stow/PACKAGE/RELATIVE_PATH` or
+`ROOT/packages/PACKAGE/install/RELATIVE_PATH`. It does not follow foreign link
+chains. Regular files, linked parents, indirect links, noncanonical link text,
+other packages/paths and unrelated dangling links remain conflicts. Missing
+destinations may be created and current links remain unchanged, as in normal
+rebind. Rename-manifest leftovers are refused; recovery does not remove old
+names or enumerate undeclared destinations.
+
+The preview explicitly discloses that old payload and ownership cannot be
+verified. A matching link text is evidence of the selected layout, not proof
+of historical ownership; approval authorizes deploying the current package
+payload in place of those exact dangling leaves. The journal records the
+recovery mode, selected missing roots/ancestor identities and original link
+texts. Reappearing roots or changed ancestors invalidate the approved plan;
+changes detected during the transaction cause rollback of that package.
+Rollback restores the original link text even if it remains dangling. Final
+success requires every current declared link to resolve to this checkout.
+
+This mode neither performs orphan cleanup nor enables a general force overwrite.
+It never copies system files, reads system secrets, runs hooks or activates
+services. Source reconstruction from Git, crash recovery and arbitrary writers
+remain outside the transaction guarantee.
+
+The normal inventory classifies current links, missing destinations, proven legacy
 links, mapped renames, unmapped legacy residue and unknown conflicts. A regular
 file, dangling/indirect/foreign link, linked parent directory, special source,
 source symlink or custom Stow ignore policy blocks the affected package before
@@ -202,8 +257,9 @@ intermediate state; SIGKILL, power loss and lost temporary journals still requir
 manual recovery. Ordinary install tools and external writers do not participate
 in the advisory lock. Mixed packages migrate user links only; the batch never
 copies system files, reads system secrets, runs hooks or activates services.
-Dangling links after loss of a source checkout remain conflicts. Aggregate rebind
-does not enable a force overwrite, missing-source repair or orphan cleanup.
+Dangling links after loss of a source checkout remain conflicts unless the
+explicit recovery mode above accepts their exact text. Aggregate rebind does
+not enable a general force overwrite or orphan cleanup.
 
 ## Renamed files
 

@@ -58,12 +58,12 @@ def directories(path, missing=False):
         require(entry is not None and stat.S_ISDIR(entry[2]), f"unsafe directory: {part}")
 
 
-def absolute(value):
+def absolute(value, missing=False):
     p = Path(value)
     require(p.is_absolute() and str(p) == value and '..' not in p.parts and
             not any(ord(c) < 32 or ord(c) == 127 for c in value), 'expected normalized absolute path')
     require(p != Path('/'), 'filesystem root is not a valid installation target')
-    directories(p)
+    directories(p, missing=missing)
     return p
 
 
@@ -134,11 +134,35 @@ def mappings(repo, package, files):
     return result, (identity(path), hashlib.sha256(raw).hexdigest())
 
 
-def plan(repo, target, package, roots):
+def lost_source_state(roots):
+    """Bind explicitly missing roots and their non-symlink ancestors to approval."""
+    state = {}
+    for root in roots:
+        directories(root, missing=True)
+        require(identity(root) is None, f'recovery source checkout must be absent: {root}')
+        state[str(root)] = {str(p): entry[:3] if (entry := identity(p)) else None
+                            for p in (root, *root.parents)}
+    return state
+
+
+def refresh_plan(repo, target, package, roots, snapshot):
+    if snapshot.get('recover_dangling'):
+        return plan(repo, target, package, roots, recover_dangling=True)
+    return plan(repo, target, package, roots)
+
+
+def source_unchanged(fresh, snapshot):
+    keys = ('files', 'legacy', 'mapping', 'renames')
+    return all(fresh[key] == snapshot[key] for key in keys) and (
+        fresh.get('lost_sources') == snapshot.get('lost_sources'))
+
+
+def plan(repo, target, package, roots, recover_dangling=False):
     directories(target)
     files = inventory(repo, package)
     renames, mapping_state = mappings(repo, package, files)
-    legacy = {str(root): inventory(root, package) for root in roots}
+    lost_sources = lost_source_state(roots) if recover_dangling else None
+    legacy = {str(root): {} if recover_dangling else inventory(root, package) for root in roots}
     rows = []
     parents = {}
     conflicts = []
@@ -175,11 +199,24 @@ def plan(repo, target, package, roots):
                     allowed = {root / 'stow' / package / rel, root / 'packages' / package / 'install' / rel}
                     if lexical in allowed:
                         owner = str(root)
+        lost_owner = None
+        if recover_dangling and raw is not None and rel in files:
+            for root in roots:
+                sources = {root / 'stow' / package / rel,
+                           root / 'packages' / package / 'install' / rel}
+                # With no old tree, do not resolve a chain to prove ownership.
+                # Accept canonical direct text only, avoiding interior '..'
+                # components that could traverse an unrelated symlink first.
+                if raw in {text for source in sources for text in (
+                        str(source), os.path.relpath(source, dest.parent))}:
+                    lost_owner = str(root)
         if before is None:
             state = 'missing' if rel in files else 'absent-legacy'
         elif resolved == source and rel in files and raw is not None and Path(os.path.abspath(dest.parent / raw)) in {
                 source, repo / 'stow' / package / rel}:
             state = 'current'
+        elif lost_owner:
+            state = 'recover-dangling'
         elif owner:
             state = 'rebind' if rel in files else 'rename' if rel in renames else 'legacy-residue'
         else:
@@ -196,11 +233,14 @@ def plan(repo, target, package, roots):
             renamed_changes[renames[rel]] = (replacement[1] != original[1] or
                 stat.S_IMODE(replacement[0][2]) != stat.S_IMODE(original[0][2]))
         rows.append({'path': rel, 'state': state, 'before': before, 'old': raw, 'new': new,
-                     'content_changed': changed, 'from_repo': owner})
+                     'content_changed': changed, 'from_repo': owner or lost_owner})
     for row in rows:
         row['content_changed'] |= renamed_changes.get(row['path'], False)
-    return {'files': files, 'legacy': legacy, 'mapping': mapping_state, 'renames': renames, 'parents': parents,
-            'rows': rows, 'conflicts': conflicts}
+    result = {'files': files, 'legacy': legacy, 'mapping': mapping_state, 'renames': renames, 'parents': parents,
+              'rows': rows, 'conflicts': conflicts}
+    if recover_dangling:
+        result.update(recover_dangling=True, lost_sources=lost_sources)
+    return result
 
 
 def discover_sources(repo, target, package):
@@ -230,16 +270,24 @@ def discover_sources(repo, target, package):
     return sorted(roots)
 
 
-def prepare(repo, target, package, explicit_roots):
+def prepare(repo, target, package, explicit_roots, recover_dangling=False):
     require(re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]*', package) and
             package not in {'all', 'all-user', 'all-system'}, 'select exactly one explicit package')
+    require(not recover_dangling or explicit_roots,
+            '--recover-dangling requires explicit --from-repo values')
     roots = explicit_roots if explicit_roots else discover_sources(repo, target, package)
     require(len(set(roots)) == len(roots) and repo not in roots,
             'supply distinct source checkouts, never the current checkout')
     require(not any(target == r or target.is_relative_to(r) for r in [repo, *roots]),
             'installation target cannot be inside a source checkout')
-    snapshot = plan(repo, target, package, roots)
+    require(not recover_dangling or not any(r.is_relative_to(target) for r in roots),
+            'recovery source cannot be inside the installation target')
+    snapshot = plan(repo, target, package, roots, recover_dangling=True) if recover_dangling else (
+        plan(repo, target, package, roots))
     print(f'Repository: {repo}\nTarget: {target}\nPackage: {package}')
+    if recover_dangling:
+        print('Dangling-link recovery: old payload and ownership cannot be verified; '
+              'approval uses exact link text and the selected missing roots only.')
     for root in roots:
         label = 'Selected source repository' if explicit_roots else 'Detected source candidate'
         print(f'{label}: {root}')
@@ -255,14 +303,14 @@ def prepare(repo, target, package, explicit_roots):
     return roots, snapshot
 
 
-def inspect_all(repo, target, explicit_roots):
+def inspect_all(repo, target, explicit_roots, recover_dangling=False):
     directories(repo / 'stow')
     packages = sorted(path.name for path in (repo / 'stow').iterdir())
     require(packages, 'no user packages to inspect')
     failures = pending = 0
     for package in packages:
         try:
-            _, snapshot = prepare(repo, target, package, explicit_roots)
+            _, snapshot = prepare(repo, target, package, explicit_roots, recover_dangling)
             pending += any(row['state'] not in {'current', 'absent-legacy'} for row in snapshot['rows'])
         except (Refusal, OSError, ValueError, subprocess.SubprocessError) as error:
             failures += 1
@@ -302,7 +350,7 @@ def batch_selection(repo):
             'entries': entries, 'policy': policy_state}
 
 
-def prepare_batch(repo, target, explicit_roots):
+def prepare_batch(repo, target, explicit_roots, recover_dangling=False):
     selection = batch_selection(repo)
     print('Selected user packages: ' + ', '.join(selection['selected']))
     print('Excluded user packages: ' + (', '.join(selection['excluded']) or '(none)'))
@@ -310,7 +358,7 @@ def prepare_batch(repo, target, explicit_roots):
     try:
         for package in selection['selected']:
             try:
-                roots, snapshot = prepare(repo, target, package, explicit_roots)
+                roots, snapshot = prepare(repo, target, package, explicit_roots, recover_dangling)
                 prepared[package] = (roots, snapshot)
             except Interrupted:
                 raise
@@ -467,7 +515,8 @@ def apply_locked(repo, target, package, roots, snapshot, on_journal=None, on_com
     journal = None
     complete = False
     try:
-        require(plan(repo, target, package, roots) == snapshot, 'candidate changed after approval; rerun')
+        require(refresh_plan(repo, target, package, roots, snapshot) == snapshot,
+                'candidate changed after approval; rerun')
         journal = Path(tempfile.mkdtemp(prefix='runner-rebind-journal-', dir='/tmp')) / 'before.json'
         journal.write_text(json.dumps({'repository': str(repo), 'target': str(target), 'package': package,
                                        'snapshot': snapshot}, indent=2) + '\n')
@@ -514,9 +563,9 @@ def apply_locked(repo, target, package, roots, snapshot, on_journal=None, on_com
                         changed.append((row, None))
             finally:
                 os.close(parent)
-        fresh = plan(repo, target, package, roots)
+        fresh = refresh_plan(repo, target, package, roots, snapshot)
         check_parents(snapshot, created)
-        require(all(fresh[key] == snapshot[key] for key in ('files', 'legacy', 'mapping', 'renames')),
+        require(source_unchanged(fresh, snapshot),
                 'source changed during transaction')
         verify_result(target, repo, package, snapshot)
         outcome = {'status': 'rebound' if changed else 'unchanged',
@@ -610,7 +659,7 @@ def write_progress(path, progress):
 
 
 def batch_snapshot(repo, target, package, roots, snapshot, created):
-    fresh = plan(repo, target, package, roots)
+    fresh = refresh_plan(repo, target, package, roots, snapshot)
     expected = dict(snapshot)
     expected['parents'] = {path: created.get(path) if value is None and path in created else value
                            for path, value in snapshot['parents'].items()}
@@ -695,9 +744,9 @@ def apply_batch(repo, target, selection, prepared, failures=None):
             if result['state'] != 'completed':
                 continue
             try:
-                fresh = plan(repo, target, package, roots)
+                fresh = refresh_plan(repo, target, package, roots, snapshot)
                 check_parents(snapshot, [(Path(path), entry) for path, entry in created.items()])
-                require(all(fresh[key] == snapshot[key] for key in ('files', 'legacy', 'mapping', 'renames')),
+                require(source_unchanged(fresh, snapshot),
                         f'source changed during batch: {package}')
                 verify_result(target, repo, package, snapshot)
             except Interrupted:
@@ -723,9 +772,9 @@ def apply_batch(repo, target, selection, prepared, failures=None):
                     continue
                 try:
                     roots, snapshot = prepared[package]
-                    fresh = plan(repo, target, package, roots)
+                    fresh = refresh_plan(repo, target, package, roots, snapshot)
                     check_parents(snapshot, [(Path(path), entry) for path, entry in created.items()])
-                    require(all(fresh[key] == snapshot[key] for key in ('files', 'legacy', 'mapping', 'renames')),
+                    require(source_unchanged(fresh, snapshot),
                             'completed package source changed')
                     verify_result(target, repo, package, snapshot)
                 except (Refusal, OSError, ValueError, subprocess.SubprocessError) as error:
@@ -760,15 +809,18 @@ def main():
     parser.add_argument('--from-repo', '--legacy-root', dest='from_repo', action='append', default=[])
     parser.add_argument('--dry-run', action='store_true')
     parser.add_argument('--inspect', action='store_true')
+    parser.add_argument('--recover-dangling', action='store_true')
     parser.add_argument('--yes', action='store_true')
     args = parser.parse_args()
     repo = absolute(str(Path(__file__).absolute().parent.parent))
     target = absolute(args.target)
-    explicit_roots = [absolute(value) for value in args.from_repo]
+    require(not args.recover_dangling or args.from_repo,
+            '--recover-dangling requires explicit --from-repo values')
+    explicit_roots = [absolute(value, missing=args.recover_dangling) for value in args.from_repo]
     if args.inspect and args.package == 'all-user':
-        return inspect_all(repo, target, explicit_roots)
+        return inspect_all(repo, target, explicit_roots, args.recover_dangling)
     if args.package == 'all-user':
-        selection, prepared, failures = prepare_batch(repo, target, explicit_roots)
+        selection, prepared, failures = prepare_batch(repo, target, explicit_roots, args.recover_dangling)
         if args.dry_run:
             print_batch_results(selection, {package: {'state': 'unattempted', 'outcome': {
                 'status': 'blocked' if package in failures else 'preview-only', 'retained_changes': 0},
@@ -783,12 +835,14 @@ def main():
             raise
         apply_batch(repo, target, selection, prepared, failures)
         return 0
-    roots, snapshot = prepare(repo, target, args.package, explicit_roots)
+    roots, snapshot = prepare(repo, target, args.package, explicit_roots, args.recover_dangling)
     if args.dry_run or args.inspect:
         print('Read-only preflight complete; no installed paths changed.')
         if roots and any(row['state'] not in {'current', 'absent-legacy'} for row in snapshot['rows']):
             command = ['python3', '-I', str(repo / 'scripts/rebind-user-package'),
                        '--target', str(target), '--package', args.package]
+            if args.recover_dangling:
+                command += ['--recover-dangling']
             for root in roots:
                 command += ['--from-repo', str(root)]
             print('Review explicit dry-run: ' + shlex.join(command + ['--dry-run']))

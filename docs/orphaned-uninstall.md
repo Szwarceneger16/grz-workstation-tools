@@ -232,8 +232,10 @@ guarantee against reactivation. The script performs none of this follow-up.
   Rebind accepts a named package or `all-user`, preserves successful package
   migrations, and attempts later eligible packages after a package error.
   Its package rollback and target lock do not apply to orphaned cleanup.
-  Missing-source dangling-link recovery is not provided by rebind. Do not clean
-  up source links before migration or run both operations concurrently.
+  If the entire source checkout was removed, rebind's explicit
+  `--recover-dangling --from-repo /path/to/lost-checkout` mode can recover only
+  exact declared leaves; it cannot discover arbitrary orphan leftovers.
+  Do not clean up source links before migration or run both operations concurrently.
 
 ## Validation with a throwaway target
 
