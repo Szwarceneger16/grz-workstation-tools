@@ -514,7 +514,7 @@ def probe_detached_target(reference):
         return 'unknown'  # Permission errors and loops are not proof of absence.
 
 
-def update_detached_targets(target, outcome):
+def update_detached_targets(target, outcome, probe=True):
     """Metadata-only follow-up for actually changed forced leaves, never cleanup."""
     if not outcome.get('forced_links'):
         return
@@ -539,10 +539,13 @@ def update_detached_targets(target, outcome):
                     continue  # Rollback (or another writer) restored the reference.
                 if raw == row['new']:
                     link_state = 'replaced'
-            target_state = probe_detached_target(reference)
+            if probe:
+                target_state = probe_detached_target(reference)
             if target_state == 'missing':
                 missing += 1
                 continue
+        except Interrupted:
+            raise
         except (OSError, Refusal):
             pass  # Unsafe/changed parents: retain an explicitly uncertain check.
         checks.append({'old_target': location, 'installed_path': str(installed),
@@ -556,12 +559,13 @@ def record_forced_links(target, outcome, changed):
             for row, _ in changed if row['state'] == 'force-link']
     if rows:
         outcome['forced_links'] = rows
-        update_detached_targets(target, outcome)
+        # Persist conservative evidence before any potentially blocking lookup.
+        update_detached_targets(target, outcome, probe=False)
 
 
-def refresh_batch_target_reports(target, packages):
+def refresh_batch_target_reports(target, packages, probe=True):
     for result in packages.values():
-        update_detached_targets(target, result.get('outcome', {}))
+        update_detached_targets(target, result.get('outcome', {}), probe=probe)
 
 
 def print_detached_targets(outcomes):
@@ -615,6 +619,7 @@ def apply_locked(repo, target, package, roots, snapshot, on_journal=None, on_com
     changed, created = [], []
     journal = None
     complete = False
+    reported = False
     try:
         require(refresh_plan(repo, target, package, roots, snapshot) == snapshot,
                 'candidate changed after approval; rerun')
@@ -678,13 +683,23 @@ def apply_locked(repo, target, package, roots, snapshot, on_journal=None, on_com
             if on_complete:
                 on_complete(result)
             complete = True
+        try:
+            if outcome.get('forced_links'):
+                update_detached_targets(target, outcome)
+                with mutation_record():
+                    write_record(journal.with_name('result.json'), outcome)
+        finally:
+            reported = True
             print('Rebind verified; hooks, system files and service state were not touched.')
             if on_complete is None:
                 print_package_result(package, outcome)
                 print_detached_targets({package: outcome})
         return result
-    except BaseException:
+    except BaseException as error:
         if complete:
+            if not reported and on_complete is None:
+                print_package_result(package, outcome)
+                print_detached_targets({package: outcome})
             raise  # Already committed and durably reported to a batch caller.
         # A second handled signal must not interrupt rollback halfway through.
         with mutation_record():
@@ -696,7 +711,14 @@ def apply_locked(repo, target, package, roots, snapshot, on_journal=None, on_com
                     print(f'Could not record package result; journal: {journal}', file=sys.stderr)
             if on_failure:
                 on_failure(outcome)
-            else:
+        try:
+            if outcome.get('forced_links') and not isinstance(error, (Interrupted, KeyboardInterrupt)):
+                update_detached_targets(target, outcome)
+                if journal is not None:
+                    with mutation_record():
+                        write_record(journal.with_name('result.json'), outcome)
+        finally:
+            if on_failure is None:
                 print_package_result(package, outcome)
                 print_detached_targets({package: outcome})
         raise
@@ -869,7 +891,7 @@ def apply_batch(repo, target, selection, prepared, failures=None):
         write_progress(journal, progress)
         if errors:
             raise Refusal('batch completed with package failures: ' + ', '.join(errors))
-    except BaseException:
+    except BaseException as failure:
         with mutation_record():
             progress['state'] = 'failed'
             if current is not None and progress['packages'][current]['state'] != 'completed':
@@ -890,13 +912,21 @@ def apply_batch(repo, target, selection, prepared, failures=None):
                     result['outcome'] = {**result.get('outcome', {}),
                                          'status': 'final-state-unverified', 'verification': 'unverified',
                                          'retained_changes': None}
-            refresh_batch_target_reports(target, progress['packages'])
+            refresh_batch_target_reports(target, progress['packages'], probe=False)
             if journal is not None:
                 try:
                     with mutation_record():
                         write_progress(journal, progress)
                 except OSError:
                     print(f'Could not update batch recovery journal: {journal}', file=sys.stderr)
+        # No foreign target lookup may run in the signal-masked recovery path.
+        # An interrupted report must not retry the same potentially stuck lookup.
+        if not isinstance(failure, (Interrupted, KeyboardInterrupt)) and any(
+                result.get('outcome', {}).get('forced_links') for result in progress['packages'].values()):
+            refresh_batch_target_reports(target, progress['packages'])
+            if journal is not None:
+                with mutation_record():
+                    write_progress(journal, progress)
         raise
     finally:
         try:

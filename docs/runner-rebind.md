@@ -214,6 +214,16 @@ than collapsing interior `..` through an unknown symlink. Existence is a
 point-in-time observation and may change after the report. This is a checklist
 for the owner, not a claim that the old target is unused or safe to delete.
 
+Foreign-target lookups run with SIGINT and SIGTERM unmasked, outside the
+mutation/rollback recording sections. Before a lookup, the package outcome
+and conservative `unknown` target references are saved in the journal (and
+the batch completion callback records success). Interrupting a follow-up does
+not undo a committed package or retry that lookup; it stops the remaining
+batch and leaves the durable record available. Rollback results are likewise
+saved before any optional follow-up, so another signal cannot interrupt the
+rollback itself. After interruption the report may retain `unknown` entries
+whose existence was not checked.
+
 This mode may intentionally replace a healthy link owned by another installer.
 Approval authorizes that exact link replacement and deployment of the current
 package payload; it cannot establish old payload equivalence or compatibility

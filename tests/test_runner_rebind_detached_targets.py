@@ -4,6 +4,7 @@ import io
 import json
 import os
 from pathlib import Path
+import signal
 import unittest
 from unittest import mock
 
@@ -142,6 +143,77 @@ class DetachedTargetTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn('Detached forced targets to inspect', result.stdout)
 
+    def test_probe_runs_with_unmasked_signals_after_durable_success_record(self):
+        original = engine.probe_detached_target
+        def checked(reference):
+            self.assertFalse(signal.pthread_sigmask(signal.SIG_BLOCK, set()) &
+                             {signal.SIGINT, signal.SIGTERM})
+            outcome = json.loads(next(self.base.glob('runner-rebind-journal-*/result.json')).read_text())
+            self.assertEqual(outcome['status'], 'rebound')
+            self.assertEqual(outcome['detached_targets'][0]['target_state'], 'unknown')
+            return original(reference)
+        with mock.patch.object(engine, 'probe_detached_target', side_effect=checked) as probes:
+            outcome, _ = self.apply_report()
+        self.assertEqual(probes.call_count, 1)
+        self.assertEqual(outcome['detached_targets'][0]['target_state'], 'exists')
+
+    def test_signal_during_success_probe_keeps_committed_links_and_durable_unknown_report(self):
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            with self.subTest(signal=sig):
+                self.force_leaf(self.files[0])
+                def interrupted(signum, frame):
+                    raise engine.Interrupted('fixture report signal')
+                def probe(reference):
+                    self.assertNotIn(sig, signal.pthread_sigmask(signal.SIG_BLOCK, set()))
+                    os.kill(os.getpid(), sig)
+                    self.fail('probe continued after interruption')
+                previous = signal.signal(sig, interrupted)
+                try:
+                    with contextlib.redirect_stdout(io.StringIO()) as output:
+                        with mock.patch.object(engine, 'probe_detached_target', side_effect=probe) as probes:
+                            with self.assertRaises(engine.Interrupted):
+                                engine.apply(self.repo, self.target, 'demo', [self.old], self.snapshot())
+                finally:
+                    signal.signal(sig, previous)
+                self.assertEqual(probes.call_count, 1)
+                self.assertIn('[unknown]', output.getvalue())
+                self.assertEqual((self.target / self.files[0]).resolve(),
+                                 self.repo / 'packages/demo/install' / self.files[0])
+                outcomes = [json.loads(path.read_text())
+                            for path in self.base.glob('runner-rebind-journal-*/result.json')]
+                self.assertTrue(all(outcome['status'] == 'rebound' and
+                                    outcome['detached_targets'][0]['target_state'] == 'unknown'
+                                    for outcome in outcomes))
+                with engine.target_lock(self.target):
+                    pass
+
+    def test_second_signal_during_failed_package_probe_preserves_rollback_record(self):
+        path = self.target / self.files[0]
+        def concurrent_failure(*args):
+            path.unlink()
+            path.write_text('concurrent owner data')
+            raise engine.Refusal('fixture transaction failure')
+        def interrupted(signum, frame):
+            raise engine.Interrupted('fixture second signal')
+        def probe(reference):
+            self.assertNotIn(signal.SIGTERM, signal.pthread_sigmask(signal.SIG_BLOCK, set()))
+            outcome = json.loads(next(self.base.glob('runner-rebind-journal-*/result.json')).read_text())
+            self.assertEqual(outcome['status'], 'manual-recovery')
+            self.assertEqual(outcome['detached_targets'][0]['target_state'], 'unknown')
+            os.kill(os.getpid(), signal.SIGTERM)
+        previous = signal.signal(signal.SIGTERM, interrupted)
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                with mock.patch.object(engine, 'verify_result', side_effect=concurrent_failure), \
+                        mock.patch.object(engine, 'probe_detached_target', side_effect=probe):
+                    with self.assertRaises(engine.Interrupted):
+                        engine.apply(self.repo, self.target, 'demo', [self.old], self.snapshot())
+        finally:
+            signal.signal(signal.SIGTERM, previous)
+        self.assertEqual(path.read_text(), 'concurrent owner data')
+        with engine.target_lock(self.target):
+            pass
+
 
 class DetachedBatchTests(unittest.TestCase):
     setUp = force.ForceBatchTests.setUp
@@ -221,3 +293,79 @@ class DetachedBatchTests(unittest.TestCase):
         outcome = self.progress()['packages']['demo']['outcome']
         self.assertEqual(outcome['detached_targets'], [])
         self.assertEqual(outcome['omitted_missing_targets'], 1)
+
+    def test_failed_batch_refresh_probes_with_signals_unmasked_and_failure_record_saved(self):
+        self.existing_targets()
+        selection, plans, failures = self.prepare()
+        original_verify = engine.verify_result
+        original_probe = engine.probe_detached_target
+        failure_probes = []
+        def second_fails(target, repo, package, snapshot):
+            if package == 'second':
+                raise engine.Refusal('fixture second-package failure')
+            return original_verify(target, repo, package, snapshot)
+        def checked(reference):
+            self.assertFalse(signal.pthread_sigmask(signal.SIG_BLOCK, set()) &
+                             {signal.SIGINT, signal.SIGTERM})
+            progress = self.progress()
+            if progress['state'] == 'failed':
+                failure_probes.append(reference)
+                self.assertEqual(progress['packages']['second']['outcome']['status'], 'rolled-back')
+            return original_probe(reference)
+        with contextlib.redirect_stdout(io.StringIO()):
+            with mock.patch.object(engine, 'verify_result', side_effect=second_fails), \
+                    mock.patch.object(engine, 'probe_detached_target', side_effect=checked):
+                with self.assertRaises(engine.Refusal):
+                    engine.apply_batch(self.repo, self.target, selection, plans, failures)
+        self.assertTrue(failure_probes)
+
+    def test_signal_during_first_package_probe_stops_batch_without_retry_or_rollback(self):
+        self.existing_targets()
+        selection, plans, failures = self.prepare()
+        def interrupted(signum, frame):
+            raise engine.Interrupted('fixture batch report signal')
+        def probe(reference):
+            self.assertNotIn(signal.SIGTERM, signal.pthread_sigmask(signal.SIG_BLOCK, set()))
+            self.assertEqual(self.progress()['packages']['demo']['state'], 'completed')
+            os.kill(os.getpid(), signal.SIGTERM)
+        previous = signal.signal(signal.SIGTERM, interrupted)
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                with mock.patch.object(engine, 'probe_detached_target', side_effect=probe) as probes:
+                    with self.assertRaises(engine.Interrupted):
+                        engine.apply_batch(self.repo, self.target, selection, plans, failures)
+        finally:
+            signal.signal(signal.SIGTERM, previous)
+        self.assertEqual(probes.call_count, 1)
+        progress = self.progress()
+        self.assertEqual(progress['packages']['demo']['state'], 'completed')
+        self.assertEqual(progress['packages']['second']['state'], 'unattempted')
+        self.assertEqual(progress['packages']['third']['state'], 'unattempted')
+        self.assertEqual(progress['packages']['demo']['outcome']['detached_targets'][0]['target_state'], 'unknown')
+        self.assert_current('demo', self.files)
+        with engine.target_lock(self.target):
+            pass
+
+    def test_keyboard_interrupt_during_final_refresh_keeps_all_completed_packages(self):
+        self.existing_targets()
+        selection, plans, failures = self.prepare()
+        original = engine.probe_detached_target
+        calls = 0
+        def probe(reference):
+            nonlocal calls
+            calls += 1
+            self.assertNotIn(signal.SIGINT, signal.pthread_sigmask(signal.SIG_BLOCK, set()))
+            if calls == 4:
+                raise KeyboardInterrupt('fixture final report interruption')
+            return original(reference)
+        with contextlib.redirect_stdout(io.StringIO()):
+            with mock.patch.object(engine, 'probe_detached_target', side_effect=probe):
+                with self.assertRaises(KeyboardInterrupt):
+                    engine.apply_batch(self.repo, self.target, selection, plans, failures)
+        self.assertEqual(calls, 4)
+        progress = self.progress()
+        self.assertTrue(all(result['state'] == 'completed' for result in progress['packages'].values()))
+        self.assertTrue(all(result['outcome']['detached_targets'][0]['target_state'] == 'unknown'
+                            for result in progress['packages'].values()))
+        with engine.target_lock(self.target):
+            pass
