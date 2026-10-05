@@ -1716,6 +1716,37 @@ run_install_hooks() {
   done
 }
 
+# Select only user-layer hooks, retaining the ordinary uninstall selection.
+# Static package validation runs before unit deactivation; hooks run afterward,
+# while their package files are still available.
+select_uninstall_hook_packages() {
+  local selector="$1"
+  local package
+  typeset -ga hook_packages
+  hook_packages=()
+
+  select_user_packages "$selector"
+  for package in "${selected_user_packages[@]}"; do
+    [[ -f "$repo_root/packages/$package/uninstall.hook.sh" ]] && hook_packages+=("$package")
+  done
+}
+
+run_uninstall_hooks() {
+  local verbose="$1"
+  local package hook
+
+  (( ${#hook_packages[@]} > 0 )) || return 0
+
+  for package in "${hook_packages[@]}"; do
+    hook="$repo_root/packages/$package/uninstall.hook.sh"
+    [[ -x "$hook" ]] || die "uninstall hook is not executable: $hook"
+    (( verbose )) && print -- "  → uninstall hook: $package/${hook:t}"
+    if ! env "${env_prefix}_REPO_ROOT=$repo_root" "${env_prefix}_PACKAGE=$package" "STOW_TARGET=$target" "${env_prefix}_VERBOSE=$verbose" "$hook"; then
+      die "$package uninstall hook failed"
+    fi
+  done
+}
+
 run_stow_action() {
   local action="$1"
   local selector="$2"
@@ -2210,7 +2241,7 @@ parse_uninstall() {
 
   local any_user_units=0
 
-  select_user_packages "$selector"
+  select_uninstall_hook_packages "$selector"
   # Preflight the manifests before touching anything, mirroring activation
   # (run_check_repo_for_packages in parse_activate). A user unit file omitted
   # from user-units.manifest would otherwise be left running after
@@ -2221,6 +2252,7 @@ parse_uninstall() {
     deactivate_user_units "$package"
     (( ${#user_units[@]} > 0 )) && any_user_units=1
   done
+  run_uninstall_hooks "$verbose"
   run_system_action uninstall "$selector" "$verbose"
   run_stow_action uninstall "$selector" "$verbose"
 
