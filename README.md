@@ -37,8 +37,7 @@ Override install target: `GRZ_STOW_TARGET=/path ./run.sh install all`
 ### Orphaned links
 
 If a package was removed from this checkout after it had been installed, use the
-orphaned-cleanup path to inspect and remove only the stale symlinks that still
-belong to that package:
+orphaned-cleanup preview to inspect the bounded link and unit cleanup candidates:
 
 ```sh
 ./run.sh uninstall --orphaned --dry-run <package>
@@ -49,7 +48,10 @@ belong to that package:
 `--reap` is an alias for `--orphaned`; `--dry-run`/`-n` previews the candidates
 and `-y`/`--yes` skips confirmations. The bounded scan matches package-tree
 links anchored in this checkout and has a separate naming heuristic for dangling
-user-unit enablement links. It does not replace files or foreign-checkout links.
+user-unit enablement links. A unit selected by one dangling link can share its
+name with a healthy unit from another checkout. Accepting the unit prompt also
+authorizes removal of all surviving same-name enablement symlinks without
+per-link prompts; that healthy unit and its links can be affected.
 The orphaned path refuses only when both the Stow entry exists and the package's
 install directory remains; a missing or dangling Stow entry permits cleanup
 even with the source directory present.
@@ -57,6 +59,8 @@ even with the source directory present.
 User-unit deactivation is best effort: failures can leave units running while
 their links are removed. A successful exit also does not cover destinations
 outside the scan roots, including this repo's agent-sound and netrole data links.
+Symlinked ancestors of scan roots can redirect cleanup outside the physical
+target directory, so inspect those ancestors as well as the preview.
 See the [orphaned-cleanup guide](docs/orphaned-uninstall.md) for the exact
 boundaries, required manual unit verification and a throwaway-target example.
 

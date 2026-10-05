@@ -35,8 +35,8 @@ normal uninstall if you intend to retain the package's normal teardown path.
 
 ## How it finds things
 
-The scan is bounded to known Stow-managed subtrees. A candidate symlink must
-still point into this checkout's own `stow/<package>/` tree (or the equivalent
+The package-tree scan is bounded to known Stow-managed subtrees. A candidate
+symlink must still point into this checkout's own `stow/<package>/` tree (or the equivalent
 `packages/<package>/install/` tree). The source does not need to exist: the
 link may be dangling after the package was deleted.
 
@@ -44,10 +44,18 @@ The scan roots are `.local/bin`, `.local/lib`, `.local/my-custom-bin`,
 `.local/share/applications`, `.config/systemd/user`, `.config/autostart`,
 `.config/zsh/rc.d`, `.config/profile.d`, and `.zsh_scripts`. A root that is
 itself a symlink is inspected too, including a dangling root left by Stow
-directory folding. The scan does not follow directory symlinks.
+directory folding. The package-tree walk does not descend through a symlink
+at the scan root or one encountered below it.
 
-Destinations outside these roots are not scanned. In particular,
-`ai-agents-hooks` installs sound links under `.local/share/agent-sounds`, and
+Symlinked ancestors of a scan root are different: pathname resolution follows
+them before the walk starts. For example, if `$HOME/.local` points to
+`/data/local`, scanning `$HOME/.local/bin` inspects `/data/local/bin` and can
+remove matching links there. The listed target-relative paths therefore do
+not guarantee physical containment within the target directory. Check their
+ancestor paths before cleanup.
+
+Target-relative destinations outside the listed paths are not scanned. In
+particular, `ai-agents-hooks` installs sound links under `.local/share/agent-sounds`, and
 `simplified_netrole` installs a configuration-example link under
 `.local/share/simplified-netrole`. Removing either package can leave those
 links behind even when its `.local/bin` links are cleaned up successfully.
@@ -62,8 +70,17 @@ For user-systemd enablement links that no longer contain a package-tree marker,
 the command has a narrower fallback heuristic: a dangling link under a
 `*.wants/`, `*.requires/`, or `*.upholds/` directory is considered only when
 its unit name is `<package>.<type>` or `<package>-*.<type>`, where the type is
-`service`, `timer`, `path`, `socket`, or `target`. A live, healthy unit is never
-removed by this heuristic.
+`service`, `timer`, `path`, `socket`, or `target`.
+
+This dangling-link check selects a **unit name**, not a bounded set of broken
+links. For a home-directory target with `systemctl` available, confirming that
+unit's cleanup attempts to disable and stop the unit, then removes every
+surviving symlink with that basename under `*.wants/`, `*.requires/`, and
+`*.upholds/`. Those later links are not checked for brokenness or ownership.
+One dangling link can therefore select a name also used by a healthy unit
+from another checkout, causing that unit to be stopped and its valid
+enablement links to be removed. Review all enablement links for each selected
+name and the unit it currently identifies before confirming cleanup.
 
 ## Usage
 
@@ -71,7 +88,7 @@ removed by this heuristic.
 # Preview only — lists candidates, removes nothing, asks nothing.
 ./run.sh uninstall --orphaned --dry-run <package>
 
-# Interactive — asks before each symlink removal and unit-deactivation attempt.
+# Interactive — confirms unit cleanup, then individual package-tree links.
 ./run.sh uninstall --orphaned <package>
 
 # Non-interactive — removes links and attempts unit deactivation without prompts.
@@ -89,13 +106,20 @@ The confirmation prompt is read from `/dev/tty` when a terminal is available,
 so it still works when standard input is redirected; otherwise it falls back
 to standard input.
 
+Accepting a unit-deactivation prompt also authorizes direct removal of its
+surviving enablement symlinks without separate per-link prompts. Individual
+prompts in the later package-tree pass apply to those package-tree links only.
+
 ## User-unit cleanup and verification
 
 For a home-directory target, the command attempts
 `systemctl --user disable --now <unit>` for each detected unit whose cleanup
-is confirmed. If that call fails, it prints a warning and continues removing
-matching enablement links and package symlinks. If `systemctl` is unavailable,
-it skips deactivation but can still remove package symlinks. Declining a unit's
+is confirmed. That confirmation also covers direct removal of all surviving
+same-name enablement symlinks in the three directory types above, including
+valid links, without further prompts. If the call fails, it prints a warning
+and continues removing those enablement links and package symlinks. If
+`systemctl` is unavailable, it skips deactivation but can still remove package
+symlinks. Declining a unit's
 deactivation prompt also does not cancel the later symlink-removal pass.
 
 Consequently a unit can remain running after its unit-file link is removed,
@@ -104,8 +128,10 @@ does not enforce the fatal deactivation-failure rule documented in `AGENTS.md`
 for ordinary uninstall. Treat warnings, skipped deactivation and the final
 removal count as cleanup information, not proof that the runtime stopped.
 
-Record the unit names from the preview before cleanup. For each detected unit,
-query the reachable user manager afterward, using the exact reported name:
+Before cleanup, record the unit names from the preview and inspect every
+same-name enablement link and its destination for the collision risk above.
+For each detected unit, query the reachable user manager afterward, using
+the exact reported name:
 
 ```sh
 systemctl --user show <unit> --property=ActiveState --property=SubState
