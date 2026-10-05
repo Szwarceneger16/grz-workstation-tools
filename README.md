@@ -34,6 +34,54 @@ Installs all packages (from `stow/`) as symlinks into `$HOME` using GNU Stow.
 
 Override install target: `GRZ_STOW_TARGET=/path ./run.sh install all`
 
+### Orphaned links
+
+If a package was removed from this checkout after it had been installed, use the
+orphaned-cleanup preview to inspect the bounded link and unit cleanup candidates:
+
+```sh
+./run.sh uninstall --orphaned --dry-run <package>
+./run.sh uninstall --orphaned <package>
+./run.sh uninstall --orphaned -y <package>
+```
+
+`--reap` is an alias for `--orphaned`; `--dry-run`/`-n` previews the candidates
+and `-y`/`--yes` skips confirmations. Dry-run does not expand systemd's full
+side effects. The bounded package-tree scan matches links anchored in this
+checkout and has a separate naming heuristic for dangling
+user-unit enablement links. A unit selected by one dangling link can share its
+name with a healthy unit from another checkout. Accepting the unit prompt also
+authorizes `systemctl disable --now` and direct removal of surviving same-name
+enablement symlinks without per-link prompts. Systemd can also remove aliases
+and manual links or disable `Also=` companions beyond the displayed paths;
+that healthy unit and its links can be affected.
+The existing-package safeguard refuses cleanup when both the Stow entry
+exists and the package's install directory remains; a missing or dangling
+Stow entry permits cleanup
+even with the source directory present.
+
+User-unit deactivation is best effort: failures can leave units running while
+their links are removed. A successful exit also does not cover destinations
+outside the scan roots, including this repo's agent-sound and netrole data links.
+Symlinked ancestors of scan roots can redirect cleanup outside the physical
+target directory, so inspect those ancestors as well as the preview.
+See the [orphaned-cleanup guide](docs/orphaned-uninstall.md) for the exact
+boundaries, required manual unit verification and a throwaway-target example.
+The manual follow-up includes a successful manager reload after link removal
+and checks of concrete template instances and activation sources. The orphaned
+command does not provide those checks itself.
+
+To transfer installed links from another checkout whose package tree still
+exists, use the separate [user-package rebind workflow](docs/runner-rebind.md).
+
+For managed user-install files, excluding Stow metadata, `verify` requires
+an installed symlink and compares its resolved target with the
+resolved source under this checkout. Run `./run.sh verify <package>` (or
+`./run.sh verify all-user`) after a migration; a link left by another checkout
+is reported as "installed symlink points elsewhere" with both paths. A plain
+`install` does not run this check; use `./run.sh install --verify <package>`
+when verification should be part of the same invocation.
+
 ## Adding a user package
 
 1. Create `packages/<name>/install/` with files mirroring their `$HOME` paths.
