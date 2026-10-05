@@ -54,6 +54,19 @@ service template remains valid only for the separate implicit `Accept=yes`
 socket contract. The standalone helper, system/user validator and lifecycle
 selection enforce this distinction.
 
+Only top-level supported units under `etc/systemd/system/` are accepted.
+Other standard system-manager load-directory families are refused at any
+prefix: `systemd/system`, `systemd/system.control`, `systemd/system.attached`,
+`systemd/transient`, `systemd/generator`, `systemd/generator.early` and
+`systemd/generator.late`. This includes their nested drop-ins and unsupported
+unit suffixes; declaring an alternate-path file as an ordinary system file
+cannot bypass the unit gate. `check-repo` applies the same install-location
+restriction and also rejects system-config destinations in these load trees.
+Classification is static and does not depend on the development host's unit
+search path or execute commands from input checkouts. Arbitrary custom load
+paths selected by a manager's `SYSTEMD_UNIT_PATH` or build configuration are
+not discovered by this package contract.
+
 Contract directives are read only from their actual sections: `Timer.Unit`,
 `Path.Unit`, `Socket.Service` and `Socket.Accept`. Assignments before any
 section or under a different section are ignored, as systemd ignores them.

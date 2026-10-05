@@ -572,6 +572,35 @@ check_helper_parity() {
     "s/manifest_declares_unit/UNIT_DECLARES_UNIT/; s/unit_names/UNIT_MAP/g"
 }
 
+# Classify complete standard system-manager load-directory families by path
+# components, not by unit suffix: drop-ins and future unit types must not pass
+# as ordinary system files. Do not query/execute the host or candidate code.
+is_system_unit_load_path() {
+  local rel="$1" index
+  local -a components
+  components=("${(@s:/:)rel}")
+  for (( index=1; index<${#components}; index++ )); do
+    [[ "${components[$index]}" == systemd ]] || continue
+    case "${components[$(( index + 1 ))]}" in
+      system|system.control|system.attached|transient|generator|generator.early|generator.late) return 0 ;;
+    esac
+  done
+  return 1
+}
+
+check_system_unit_install_location() {
+  local rel="$1" package="$2"
+  local -a components
+  is_system_unit_load_path "$rel" || return 0
+  components=("${(@s:/:)rel}")
+  if [[ "$rel" == etc/systemd/system/* && ${#components} == 4 ]]; then
+    case "${rel:e}" in
+      service|timer|path|socket|mount|target) return 0 ;;
+    esac
+  fi
+  err "$package: unsupported system unit location or suffix: $rel"
+}
+
 check_system_layer() {
   local package="$1"
   local sys_dir="$packages_dir/$package/system-install"
@@ -580,6 +609,20 @@ check_system_layer() {
   local config_manifest="$packages_dir/$package/system-config.manifest"
   local f rel base real_rel
   typeset -A install_paths install_modes config_paths unit_names accept_service_templates
+
+  # Config-only packages still need destination validation even without a
+  # system-install source tree.
+  load_4col_manifest "$config_manifest"
+  _check_config_manifest_security "$config_manifest" "$package"
+  config_paths=("${(@kv)manifest_paths}")
+  for rel in "${(@k)config_paths}"; do
+    # Unit payloads must be reviewable source, never out-of-band secret data.
+    is_system_unit_load_path "$rel" &&
+      err "$package: system config destination must not be a system unit load path: $rel"
+    _is_protected_rel_path "$rel" &&
+      err "$package: protected system path in system-config.manifest: $rel"
+  done
+
 
   [[ ! -L "$sys_dir" ]] || { err "$package: system-install must not be a symlink"; return 0; }
   [[ -d "$sys_dir" ]] || return 0
@@ -593,6 +636,7 @@ check_system_layer() {
   install_paths=("${(@kv)manifest_paths}")
   install_modes=("${(@kv)manifest_modes}")
   for rel in "${(@k)install_paths}"; do
+    check_system_unit_install_location "$rel" "$package"
     _is_protected_rel_path "$rel" &&
       err "$package: protected system path in system-install.manifest: $rel"
     # set-id/sticky (octal 7000 bits) is a privilege-escalation primitive and
@@ -649,13 +693,6 @@ check_system_layer() {
     fi
   done
 
-  load_4col_manifest "$config_manifest"
-  _check_config_manifest_security "$config_manifest" "$package"
-  config_paths=("${(@kv)manifest_paths}")
-  for rel in "${(@k)config_paths}"; do
-    _is_protected_rel_path "$rel" &&
-      err "$package: protected system path in system-config.manifest: $rel"
-  done
 
   # Check 3: every *.example config maps to a declared real destination.
   for f in "$sys_dir"/**/*.example(DN.); do

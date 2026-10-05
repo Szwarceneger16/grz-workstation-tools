@@ -242,6 +242,10 @@ def manifest(repo, package, protected, allowed, excluded):
 
 
 UNIT_SUFFIXES = {'service', 'timer', 'path', 'socket', 'mount', 'target'}
+# Reserved standard system-manager load directories, including runtime output
+# and control/attached units. These names are independent of the host's prefix.
+SYSTEM_UNIT_LOAD_DIRS = {'system', 'system.control', 'system.attached', 'transient',
+                         'generator', 'generator.early', 'generator.late'}
 
 
 def unit_template(name):
@@ -353,7 +357,7 @@ def system_units(repo, package, entries):
         # the package contract. Do not silently accept another load directory,
         # drop-ins or a nested layout that the authoritative gate cannot check.
         if any(
-                parts[index:index + 2] == ('systemd', 'system')
+                parts[index] == 'systemd' and parts[index + 1] in SYSTEM_UNIT_LOAD_DIRS
                 for index in range(len(parts) - 1)):
             require(parts[:3] == ('etc', 'systemd', 'system') and len(parts) == 4 and
                     parts[-1].rsplit('.', 1)[-1] in UNIT_SUFFIXES,

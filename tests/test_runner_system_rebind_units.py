@@ -169,6 +169,92 @@ class SystemUnitPolicyTests(unittest.TestCase):
         (bad / 'bad.service').write_text('[Service]\n')
         self.apply()
 
+    def test_control_attached_transient_and_generator_load_trees_are_refused(self):
+        directories = ('etc/systemd/system.control', 'run/systemd/system.control',
+                       'etc/systemd/system.attached', 'run/systemd/system.attached',
+                       'run/systemd/transient', 'run/systemd/generator',
+                       'run/systemd/generator.early', 'run/systemd/generator.late')
+        for directory in directories:
+            for name in ('demo.service', 'demo.service.d/override.conf', 'demo.slice'):
+                with self.subTest(directory=directory, name=name):
+                    self.setUp()
+                    self.units({name: '[Service]\n'}, directory=directory)
+                    self.refusal_without_writes()
+                    if shutil.which('zsh'):
+                        checked = self.checker()
+                        self.assertNotEqual(checked.returncode, 0)
+                        self.assertIn('unsupported system unit location', checked.stderr)
+
+    def test_reserved_load_families_are_prefix_independent(self):
+        for prefix in ('etc', 'run', 'usr/lib', 'usr/local/lib', 'lib', 'opt/vendor'):
+            for family in ('system', 'system.control', 'system.attached', 'transient',
+                           'generator', 'generator.early', 'generator.late'):
+                with self.subTest(prefix=prefix, family=family):
+                    self.setUp()
+                    directory = prefix + '/systemd/' + family
+                    supported = directory == 'etc/systemd/system'
+                    self.units({'demo.service': '[Service]\n'},
+                               'demo.service\n' if supported else None, directory=directory)
+                    if supported:
+                        self.apply()
+                    else:
+                        self.refusal_without_writes()
+                    if shutil.which('zsh'):
+                        checked = self.checker()
+                        self.assertEqual(checked.returncode == 0, supported, checked.stderr)
+
+    @unittest.skipUnless(shutil.which('zsh'), 'requires Zsh for config-destination gate')
+    def test_system_config_cannot_supply_unit_payloads_in_load_trees(self):
+        for directory in ('etc/systemd/system', 'etc/systemd/system.control',
+                          'run/systemd/system.control', 'etc/systemd/system.attached',
+                          'run/systemd/system.attached', 'run/systemd/transient',
+                          'run/systemd/generator', 'run/systemd/generator.early',
+                          'run/systemd/generator.late'):
+            with self.subTest(directory=directory):
+                self.setUp()
+                # Only destination metadata is supplied; no secret payload is read.
+                manifest = self.repo / 'packages/demo/system-config.manifest'
+                manifest.write_text(directory + '/demo.service 0600 root root\n')
+                checked = self.checker()
+                self.assertNotEqual(checked.returncode, 0)
+                self.assertIn('system config destination must not be a system unit load path', checked.stderr)
+
+    @unittest.skipUnless(shutil.which('zsh'), 'requires Zsh for config-only package gate')
+    def test_config_only_package_cannot_bypass_load_tree_gate(self):
+        for path in ('etc/systemd/system/demo.service', 'run/systemd/generator/demo.service',
+                     'etc/demo/private.conf'):
+            with self.subTest(path=path):
+                self.setUp()
+                package = self.repo / 'packages/demo'
+                shutil.rmtree(package / 'system-install')
+                (package / 'system-install.manifest').unlink()
+                (package / 'system-config.manifest').write_text(path + ' 0600 root root\n')
+                checked = self.checker()
+                self.assertEqual(checked.returncode == 0, path == 'etc/demo/private.conf', checked.stderr)
+                if path != 'etc/demo/private.conf':
+                    self.assertIn('system config destination must not be a system unit load path', checked.stderr)
+
+    def test_load_family_lookalikes_remain_ordinary_system_data(self):
+        for directory, name in (('opt/demo/system.control', 'demo.service'),
+                                ('etc/systemd/system.controls', 'demo.service'),
+                                ('etc/systemd/generator-cache', 'demo.service'),
+                                ('etc/demo', 'generator.late')):
+            with self.subTest(directory=directory, name=name):
+                self.setUp()
+                self.units({name: 'Ordinary fixture data\n'}, directory=directory)
+                if shutil.which('zsh'):
+                    checked = self.checker()
+                    self.assertEqual(checked.returncode, 0, checked.stderr)
+                self.apply()
+
+    @unittest.skipUnless(shutil.which('zsh'), 'requires Zsh for config-destination gate')
+    def test_non_unit_system_config_destination_remains_supported(self):
+        (self.repo / 'packages/demo/system-config.manifest').write_text(
+            'etc/demo/private.conf 0600 root root\n')
+        checked = self.checker()
+        self.assertEqual(checked.returncode, 0, checked.stderr)
+        self.apply()
+
     def test_alternate_load_directories_dropins_and_unsupported_suffixes_are_refused(self):
         for directory, name in (('usr/lib/systemd/system', 'demo.service'),
                                 ('usr/local/lib/systemd/system', 'demo.service'),
@@ -180,6 +266,8 @@ class SystemUnitPolicyTests(unittest.TestCase):
                 self.setUp()
                 self.units({name: '[Service]\n'}, directory=directory)
                 self.refusal_without_writes()
+                if shutil.which('zsh'):
+                    self.assertNotEqual(self.checker().returncode, 0)
 
     def test_repeated_or_continued_target_directives_are_refused(self):
         for value in ('Unit=worker.service\nUnit=demo.service\n', 'Unit=worker.service\\\n'):
@@ -235,34 +323,37 @@ class SystemUnitPolicyTests(unittest.TestCase):
         self.assertEqual(self.result()[1]['status'], 'rolled-back')
 
     def test_direct_cli_and_run_sh_inspection_preview_apply_share_unit_gate(self):
-        self.units({'demo.service': '[Service]\n'})
-        scripts = self.repo / 'scripts'
-        scripts.mkdir()
-        shutil.copy2(system.ROOT / 'scripts/rebind-system-package', scripts / 'rebind-system-package')
-        shutil.copy2(system.ROOT / 'run.sh', self.repo / 'run.sh')
-        (self.repo / 'runner.conf').write_text('RUNNER_ID=fixture\nRUNNER_ENV_PREFIX=FIXTURE\n')
-        (self.repo / 'stow').mkdir()
-        before = self.state()
-        for routed in (False, True):
-            for flags in (['--inspect'], ['--dry-run'], ['--yes']):
-                with self.subTest(routed=routed, flags=flags):
-                    if routed:
-                        command = ['zsh', '-f', str(self.repo / 'run.sh'),
-                                   'verify' if flags == ['--inspect'] else 'install',
-                                   '--rebind-system', '--from-repo', str(self.old),
-                                   '--system-root', str(self.target), 'demo']
-                        if flags != ['--inspect']:
-                            command += flags
-                    else:
-                        command = ['python3', '-I', str(scripts / 'rebind-system-package'),
-                                   '--repo', str(self.repo), '--system-root', str(self.target),
-                                   '--from-repo', str(self.old), '--package', 'demo', *flags]
-                    result = subprocess.run(command, capture_output=True, text=True, timeout=20)
-                    self.assertNotEqual(result.returncode, 0)
-                    self.assertIn('systemd unit not in system-units.manifest', result.stderr)
-                    self.assertEqual(self.state(), before)
-                    self.assertEqual(list(self.journals.iterdir()), [])
-
+        for alternate in (False, True):
+            self.setUp()
+            directory = 'etc/systemd/system.control' if alternate else 'etc/systemd/system'
+            expected = 'unsupported system unit location' if alternate else 'systemd unit not in system-units.manifest'
+            self.units({'demo.service': '[Service]\n'}, directory=directory)
+            scripts = self.repo / 'scripts'
+            scripts.mkdir()
+            shutil.copy2(system.ROOT / 'scripts/rebind-system-package', scripts / 'rebind-system-package')
+            shutil.copy2(system.ROOT / 'run.sh', self.repo / 'run.sh')
+            (self.repo / 'runner.conf').write_text('RUNNER_ID=fixture\nRUNNER_ENV_PREFIX=FIXTURE\n')
+            (self.repo / 'stow').mkdir()
+            before = self.state()
+            for routed in (False, True):
+                for flags in (['--inspect'], ['--dry-run'], ['--yes']):
+                    with self.subTest(alternate=alternate, routed=routed, flags=flags):
+                        if routed:
+                            command = ['zsh', '-f', str(self.repo / 'run.sh'),
+                                       'verify' if flags == ['--inspect'] else 'install',
+                                       '--rebind-system', '--from-repo', str(self.old),
+                                       '--system-root', str(self.target), 'demo']
+                            if flags != ['--inspect']:
+                                command += flags
+                        else:
+                            command = ['python3', '-I', str(scripts / 'rebind-system-package'),
+                                       '--repo', str(self.repo), '--system-root', str(self.target),
+                                       '--from-repo', str(self.old), '--package', 'demo', *flags]
+                        result = subprocess.run(command, capture_output=True, text=True, timeout=20)
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertIn(expected, result.stderr)
+                        self.assertEqual(self.state(), before)
+                        self.assertEqual(list(self.journals.iterdir()), [])
 
 if __name__ == '__main__':
     unittest.main()

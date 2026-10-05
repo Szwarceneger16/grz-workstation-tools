@@ -225,17 +225,20 @@ otherwise escalating privilege, but indirect privilege use must be prevented by
 review and by keeping privileged behavior in the declarative system layer; it
 must not be described as something `check-repo` can prove exhaustively.
 
-On current `main`, system-unit declaration checks do not enumerate every
-systemd load directory. A unit-like file placed under another load directory,
-such as `usr/lib/systemd/system/` or `usr/local/lib/systemd/system/`, can be
-declared as an ordinary system file without being required in
-`system-units.manifest`.
+The system rebind gate and `check-repo` reserve the standard system-manager
+load-directory families (`system`, `system.control`, `system.attached`,
+`transient`, `generator`, `generator.early`, `generator.late`) immediately
+below any `systemd` path component. Only top-level supported unit files under
+`etc/systemd/system/` may be installed; their declarations and trigger targets
+are validated. Alternate load trees, nested drop-ins and unsupported suffixes
+are refused even when listed as ordinary system files. System-config
+manifest destinations in these load trees are refused by `check-repo`, so
+out-of-band payloads cannot substitute for reviewable unit source.
 
-Those alternate systemd load directories are therefore outside the supported
-package contract and must not be used for package-supplied unit files unless
-the repository validation is first extended to cover them. The policy must not
-treat the current `check-repo` implementation as proof that every loadable
-systemd unit is declared.
+This static package contract does not query the host's unit search path or
+promise to discover arbitrary custom paths selected by `SYSTEMD_UNIT_PATH`
+or a nonstandard manager build. Such deployment customization needs its own
+reviewed policy; it must not be treated as covered by these checks.
 
 ## System paths
 
