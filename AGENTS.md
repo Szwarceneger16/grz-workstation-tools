@@ -152,17 +152,30 @@ do not add per-package shell code for activate/deactivate.
 
 ## Package hook rules (user layer only)
 
-The allowed hooks are `install.hook.sh` and `verify.hook.sh` — escape hatches for steps that
-can't be expressed as a manifest. `check-repo` rejects any other `*.hook.sh`.
+The allowed hooks are `install.hook.sh`, `uninstall.hook.sh` and `verify.hook.sh` —
+escape hatches for steps that can't be expressed as a manifest. `check-repo` rejects any other `*.hook.sh`.
 
 | Hook (in `packages/<pkg>/`) | Trigger |
 |---|---|
 | `install.hook.sh` | `./run.sh install <pkg>`, after stow (idempotent finishing step) |
+| `uninstall.hook.sh` | Ordinary user-package uninstall, after user-unit deactivation and before system/Stow removal |
 | `verify.hook.sh` | `./run.sh verify <pkg>`, after stow-link and user unit verification |
 
 Rules: executable; run as the normal user with **no `sudo`**; idempotent; exit non-zero to abort;
-must live in the package root (never under `install/`). Hooks receive `GRZ_REPO_ROOT`,
-`GRZ_PACKAGE`, `STOW_TARGET`. Do not run the hook to inspect it — read it.
+must live in the package root (never under `install/`). Hooks receive
+`<PREFIX>_REPO_ROOT`, `<PREFIX>_PACKAGE`, `STOW_TARGET` and `<PREFIX>_VERBOSE`,
+where `PREFIX` is the configured `RUNNER_ENV_PREFIX` (`GRZ` in this repository).
+Do not run the hook to inspect it — read it.
+
+Ordinary uninstall validates every selected user package before deactivating
+units. A deactivation failure prevents all uninstall hooks and file removal.
+An uninstall-hook failure stops later hooks and system/Stow removal, but units
+already deactivated remain stopped; the runner does not roll back hook actions
+or reactivate units. Keep hook cleanup idempotent and remove only objects whose
+ownership the package can establish. Hooks run only for selected user packages,
+including the user side of a mixed user/system package. `all-system` never runs
+user hooks, and `--orphaned` only cleans bounded source-less remnants without
+executing package code.
 
 Because the repo never owns `~/.zshrc` / `~/.profile`, `zsh-tools`'s `install.hook.sh` appends
 a marked loader block to them (via `scripts/ensure-rcd-loaders`) so `~/.config/zsh/rc.d/*.zsh`

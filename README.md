@@ -184,11 +184,26 @@ escape hatches for steps that can't be expressed as a manifest:
 | File in `packages/<name>/` | When it runs |
 |---|---|
 | `install.hook.sh` | `./run.sh install <name>`, after stow (idempotent finishing step) |
+| `uninstall.hook.sh` | Ordinary user-package uninstall, after user-unit deactivation and before system/Stow removal |
 | `verify.hook.sh` | `./run.sh verify <name>`, after stow-link and user unit verification |
 
 Each hook must be executable, run as the normal user (**no `sudo`**), be idempotent, and exit
-non-zero to signal failure. It receives: `GRZ_REPO_ROOT`, `GRZ_PACKAGE`, `STOW_TARGET`.
-Any other `*.hook.sh` is rejected by `check-repo`.
+non-zero to signal failure. It receives `<PREFIX>_REPO_ROOT`, `<PREFIX>_PACKAGE`,
+`STOW_TARGET` and `<PREFIX>_VERBOSE`; `PREFIX` comes from `RUNNER_ENV_PREFIX`
+(`GRZ` here), and verbose is `0` or `1`. Any other `*.hook.sh` is rejected by
+`check-repo`.
+
+Ordinary uninstall validates all selected user packages before any deactivation.
+It then deactivates their user units, runs their uninstall hooks, removes system
+files, and removes Stow links. A validation or deactivation failure prevents
+hooks and removal. A hook failure stops later hooks and file removal; already
+deactivated units remain stopped, and hook actions are not rolled back. Hooks
+must make retries safe and verify ownership before deleting managed objects.
+
+Hooks apply only to the selected user layer, including named packages with both
+user and system files. `all-system` skips them. `--orphaned` handles source-less
+remnants without running package hooks. See the [hook lifecycle contract](docs/package-hooks.md)
+for failure boundaries and validation.
 
 ## Consistency check (`check-repo`)
 

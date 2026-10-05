@@ -370,6 +370,7 @@ of the same destination while an interactive config install is in progress.
 The only package hook names permitted by the repository contract are:
 
 - `install.hook.sh`;
+- `uninstall.hook.sh`;
 - `verify.hook.sh`.
 
 They are user-layer escape hatches only.
