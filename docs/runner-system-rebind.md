@@ -45,6 +45,26 @@ socket requires its explicitly declared service template; a bare service-templat
 declaration without such a socket is refused. Duplicate/invalid declarations and
 ambiguous repeated or continued target directives are refused too.
 
+Contract directives are read only from their actual sections: `Timer.Unit`,
+`Path.Unit`, `Socket.Service` and `Socket.Accept`. Assignments before any
+section or under a different section are ignored, as systemd ignores them.
+Logical-line parsing consumes continuations on unrelated keys before looking
+for headers, so a physical `[Socket]` inside a continued description cannot
+authorize an accepting socket. Whole-line comments, CRLF, a single UTF-8 BOM
+and repeated section headers are handled; repeated or continued contract keys,
+malformed headers, NULs, ambiguous BOMs and invalid boolean values are refused.
+Inline `#`/`;` text is not stripped from boolean values.
+
+Only `%i` and `%I` in targets of template/instance units are supported. Every
+other percent sequence, including `%%`, a dangling `%`, or instance specifiers
+on a non-instance unit, is refused before writes. Literal percent signs in
+declared unit names cannot authorize an unexpanded target. Normalize unsupported
+targets to reviewed concrete names rather than relying on this helper to
+emulate systemd's full, host-dependent specifier expansion. The same section
+reader and specifier restriction apply to `check-repo` and system/user lifecycle
+selection. Lifecycle callers resolve trigger targets before service mutations
+and treat failed target-resolution command substitution as fatal.
+
 `Accept` recognizes every systemd true spelling (`1`, `yes`, `y`, `true`, `t`,
 `on`) without case sensitivity, as do `check-repo` and the system/user lifecycle
 readers. Each true spelling requires the accepting socket's declared service

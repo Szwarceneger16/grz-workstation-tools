@@ -274,6 +274,57 @@ def unescape_unit_instance(value):
     return result.decode()
 
 
+def unit_directives(text, section):
+    """Read only scalar contract keys in their real systemd section.
+
+    Consume continuations even on unrelated keys: a physical section header
+    inside a continued Description is data, never a new section. Reject
+    ambiguous contract assignments rather than guessing systemd's fallback.
+    """
+    require('\0' not in text, 'unsupported NUL in system unit')
+    keys = {'Timer': {'Unit'}, 'Path': {'Unit'}, 'Socket': {'Service', 'Accept'}}[section]
+    values = {}
+    active, pending = '', ''
+    continued = False
+    bom_seen = False
+    def consume(line, joined):
+        nonlocal active
+        line = line.strip(' \t\r')
+        if line.startswith('['):
+            require(re.fullmatch(r'\[[^\[\]]+\]', line), 'invalid system unit section header')
+            active = line[1:-1]
+        elif active == section and '=' in line:
+            key, value = line.split('=', 1)
+            key, value = key.strip(' \t\r'), value.strip(' \t\r')
+            if key in keys:
+                require(key not in values and not joined, f'ambiguous system unit directive: {key}')
+                values[key] = value
+    for physical in text.split('\n'):
+        physical = physical.removesuffix('\r')
+        if physical.lstrip(' \t\r').startswith(('#', ';')):
+            continue
+        if '\ufeff' in physical:
+            require(not bom_seen and not pending and physical.startswith('\ufeff') and
+                    physical.count('\ufeff') == 1, 'unsupported system unit byte-order mark')
+            physical, bom_seen = physical[1:], True
+        line = pending + physical
+        require(len(line.encode()) <= 1048576, 'system unit logical line exceeds supported limit')
+        slashes = len(line) - len(line.rstrip('\\'))
+        if slashes % 2:
+            pending = line[:-1] + ' '
+            continued = True
+            continue
+        consume(line, continued)
+        pending, continued = '', False
+    if pending:
+        consume(pending, True)
+    if 'Accept' in values:
+        require(values['Accept'].lower() in {'', 'yes', 'y', 'true', 't', '1', 'on',
+                                          'no', 'n', 'false', 'f', '0', 'off'},
+                'unsupported system unit Accept boolean')
+    return values
+
+
 def system_units(repo, package, entries):
     """Validate the selected current system-unit contract as data only.
 
@@ -288,7 +339,7 @@ def system_units(repo, package, entries):
         for fields in declaration_rows(data):
             require(len(fields) == 1, 'system unit manifest requires one unit name')
             name = relative(fields[0])
-            require('/' not in name and not name.startswith('-') and
+            require('/' not in name and '%' not in name and not name.startswith('-') and
                     name.rsplit('.', 1)[-1] in UNIT_SUFFIXES,
                     'invalid system unit name or unsupported suffix')
             require(not is_unit_template(name) or name.endswith('.service'),
@@ -323,16 +374,10 @@ def system_units(repo, package, entries):
     for name in declared:
         require(exists(name), f'system-units.manifest entry has no repo unit file: {name}')
 
-    def directive(text, key):
-        # The authoritative validator reads the first occurrence. Refuse
-        # repeated assignments and continuations rather than authorizing an
-        # ambiguous value that systemd may resolve differently.
-        values = re.findall(r'^\s*' + key + r'\s*=([^\n]*)$', text, re.MULTILINE)
-        require(len(values) <= 1 and all(not value.rstrip().endswith('\\') for value in values),
-                f'ambiguous system unit directive: {key}')
-        return values[0].strip() if values else ''
-
     def check_target(name, value):
+        require('%' not in value.replace('%i', '').replace('%I', '') and
+                ('%' not in value or '@' in name),
+                'unsupported system unit target specifier; only instance %i/%I are supported')
         instances = ([instance for instance in declared if unit_instance_matches(instance, name)]
                      if is_unit_template(name) else [name])
         for instance in instances:
@@ -349,9 +394,9 @@ def system_units(repo, package, entries):
         kind = name.rsplit('.', 1)[-1]
         if kind not in {'timer', 'path', 'socket'}:
             continue
-        custom = directive(text, 'Service' if kind == 'socket' else 'Unit')
-        accept = directive(text, 'Accept') if kind == 'socket' else ''
-        accept = accept.split('#', 1)[0].split(';', 1)[0].strip().lower() in {'yes', 'y', 'true', 't', '1', 'on'}
+        values = unit_directives(text, kind.title())
+        custom = values.get('Service' if kind == 'socket' else 'Unit', '')
+        accept = values.get('Accept', '').lower() in {'yes', 'y', 'true', 't', '1', 'on'}
         if custom:
             require(kind != 'socket' or custom.endswith('.service') and not accept,
                     'socket Service= requires a service target and Accept=no')

@@ -199,6 +199,10 @@ load_units_manifest() {
       err "unit name must not start with '-' at $manifest:$line_no: $unit"
       continue
     fi
+    if [[ "$unit" == *%* ]]; then
+      err "unit names must not contain literal specifiers at $manifest:$line_no: $unit"
+      continue
+    fi
     case "$unit" in
       *.mount)
         if [[ "$kind" == user ]]; then
@@ -242,20 +246,73 @@ unit_name_matches_template() {
 }
 
 systemd_directive_value() {
-  local key="$1" file="$2" value
-  value="$(
-    grep -m1 "^[[:space:]]*${key}[[:space:]]*=" "$file" 2>/dev/null |
-      sed "s/^[[:space:]]*${key}[[:space:]]*=[[:space:]]*//" || :
-  )"
-  value="${value%"${value##*[![:space:]]}"}"
-  print -r -- "$value"
+  local key="$1" file="$2" section
+  case "$key:${file:e}" in
+    Unit:timer) section=Timer ;;
+    Unit:path) section=Path ;;
+    Service:socket|Accept:socket) section=Socket ;;
+    Type:service) section=Service ;;
+    *) return 2 ;;
+  esac
+  # Parse logical lines before recognizing sections. Contract directives must
+  # be unambiguous scalars; unrelated continuations cannot forge a header.
+  LC_ALL=C awk -v wanted="$key" -v expected="$section" '
+    function trim(value) {
+      sub(/^[ \t\r]+/, "", value); sub(/[ \t\r]+$/, "", value)
+      return value
+    }
+    function consume(value, joined, key, position) {
+      value = trim(value)
+      if (substr(value, 1, 1) == "[") {
+        if (value !~ /^\[[^][]+\]$/) { bad = 1; return }
+        section = substr(value, 2, length(value) - 2)
+      } else if (section == expected && (position = index(value, "="))) {
+        key = trim(substr(value, 1, position - 1))
+        if (key == wanted || (expected == "Socket" && (key == "Service" || key == "Accept")) ||
+            ((expected == "Timer" || expected == "Path") && key == "Unit")) {
+          if (++seen[key] > 1 || joined) { bad = 1; return }
+          values[key] = trim(substr(value, position + 1))
+          if (key == "Accept" && tolower(values[key]) !~ /^(|1|yes|y|true|t|on|0|no|n|false|f|off)$/)
+            bad = 1
+        }
+      }
+    }
+    {
+      physical = $0
+      sub(/\r$/, "", physical)
+      if (index(physical, sprintf("%c", 0))) { bad = 1; exit 2 }
+      if (trim(physical) ~ /^[#;]/) next
+      if (index(physical, "\357\273\277")) {
+        if (bom_seen || pending != "" || index(physical, "\357\273\277") != 1) { bad = 1; exit 2 }
+        physical = substr(physical, 4); bom_seen = 1
+      }
+      value = pending physical
+      if (length(value) > 1048576) { bad = 1; exit 2 }
+      slashes = 0
+      for (i = length(value); i > 0 && substr(value, i, 1) == "\\"; i--) slashes++
+      if (slashes % 2) { pending = substr(value, 1, length(value) - 1) " "; continued = 1; next }
+      consume(value, continued)
+      pending = ""; continued = 0
+    }
+    END {
+      if (pending != "") consume(pending, 1)
+      if (bad) exit 2
+      print values[wanted]
+    }
+  ' "$file"
+}
+
+systemd_target_specifiers_supported() {
+  local unit="$1" value="$2" remainder
+  remainder="${value//\%i/}"
+  remainder="${remainder//\%I/}"
+  [[ "$remainder" != *%* ]] || return 1
+  [[ "$value" != *%[iI]* || "$unit" == *@*.* ]]
 }
 
 systemd_truthy_directive() {
   local key="$1" file="$2" value
-  value="$(systemd_directive_value "$key" "$file")"
-  value="${value%%#*}"
-  value="${value%%;*}"
+  value="$(systemd_directive_value "$key" "$file")" || return 2
   value="${value#"${value%%[![:space:]]*}"}"
   value="${value%"${value##*[![:space:]]}"}"
   case "${(L)value}" in
@@ -326,6 +383,10 @@ check_template_directive_instances() {
 check_directive_target() {
   local file_base="$1" directive="$2" directive_name="$3" manifest_name="$4"
   local inst_suffix inst_suffix_unescaped resolved
+  if ! systemd_target_specifiers_supported "$file_base" "$directive"; then
+    err "$package: unsupported target specifier in $file_base; only instance %i/%I are supported"
+    return 0
+  fi
   if [[ "$directive" == *%[iI]* && "$file_base" == *@*.* ]]; then
     if is_template_unit_name "$file_base"; then
       check_template_directive_instances "$file_base" "$directive" "$directive_name" "$manifest_name"
@@ -363,7 +424,10 @@ check_trigger_directives() {
     directive="${directive_by_type[$unit_type]}"
     for f in "$unit_dir"/*.$unit_type(N.); do
       base="${f:t}"
-      custom_target="$(systemd_directive_value "$directive" "$f")"
+      custom_target="$(systemd_directive_value "$directive" "$f")" || {
+        err "$package: invalid or ambiguous systemd contract in $base"
+        continue
+      }
       if [[ -n "$custom_target" ]]; then
         if [[ "$unit_type" == "socket" ]]; then
           [[ "$custom_target" == *.service ]] ||
@@ -479,6 +543,7 @@ check_helper_parity() {
     is_template_unit_name \
     template_unit_name_for_instance \
     systemd_directive_value \
+    systemd_target_specifiers_supported \
     systemd_truthy_directive \
     systemd_unescape_instance; do
     check_function_parity "$run_script" "$system_script" "$fn"

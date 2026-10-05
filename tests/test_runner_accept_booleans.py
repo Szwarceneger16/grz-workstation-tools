@@ -104,7 +104,8 @@ class AcceptLifecycleTests(unittest.TestCase):
                 lifecycle = script != 'scripts/check-repo'
                 if lifecycle:
                     functions += '\n' + '\n'.join(self.function(script, name) for name in
-                        ('activation_bases_for_unit', 'socket_accept_service_base', 'is_template_unit_name'))
+                        ('activation_bases_for_unit', 'socket_accept_service_base', 'is_template_unit_name',
+                         'systemd_target_specifiers_supported'))
                 source = functions + '''
 systemd_unescape_instance() { print -r -- "$1"; }
 resolve_unit_file_path() { print -r -- "$1/$2"; }
