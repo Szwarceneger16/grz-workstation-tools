@@ -47,11 +47,18 @@ belong to that package:
 ```
 
 `--reap` is an alias for `--orphaned`; `--dry-run`/`-n` previews the candidates
-and `-y`/`--yes` skips confirmations. This path is deliberately limited to
-links anchored in this checkout's own Stow/package tree. It is not a general
-force-overwrite switch for files or symlinks owned by another checkout. See the
-[orphaned-cleanup guide](docs/orphaned-uninstall.md) for the scan boundaries,
-user-unit behavior, and a throwaway-target example.
+and `-y`/`--yes` skips confirmations. The bounded scan matches package-tree
+links anchored in this checkout and has a separate naming heuristic for dangling
+user-unit enablement links. It does not replace files or foreign-checkout links.
+The orphaned path refuses only when both the Stow entry exists and the package's
+install directory remains; a missing or dangling Stow entry permits cleanup
+even with the source directory present.
+
+User-unit deactivation is best effort: failures can leave units running while
+their links are removed. A successful exit also does not cover destinations
+outside the scan roots, including this repo's agent-sound and netrole data links.
+See the [orphaned-cleanup guide](docs/orphaned-uninstall.md) for the exact
+boundaries, required manual unit verification and a throwaway-target example.
 
 To transfer installed links from another checkout whose package tree still
 exists, use the separate [user-package rebind workflow](docs/runner-rebind.md).

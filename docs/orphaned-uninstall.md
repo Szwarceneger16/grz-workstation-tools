@@ -2,9 +2,10 @@
 
 ## What it does
 
-Removes installed Stow symlinks (and, when the target is `$HOME`, deactivates
-the package's user systemd units) after the package source tree has already
-been removed from this repository.
+Removes matching installed Stow symlinks within the scan roots listed below
+after a package is removed from this checkout. When the target resolves to
+`$HOME`, it also attempts best-effort user-unit deactivation. A successful
+exit does not prove that all links were removed or that the units stopped.
 
 The normal uninstall path requires the package to exist under both
 `stow/<package>` and `packages/<package>/install`. Once that tree is gone,
@@ -21,9 +22,16 @@ without first running `./run.sh uninstall <package>`. Typical leftovers are:
 - enabled user units whose unit files came from the removed package;
 - dangling `*.wants/<unit>` links left by user-unit enablement.
 
-If the package still exists in this repository, use the normal
-`./run.sh uninstall <package>` path instead. The orphaned path refuses to run
-for a package that still has a source tree here.
+The orphaned path refuses only when **both** `stow/<package>` exists and
+`packages/<package>/install` is a directory. A dangling Stow entry does not
+count as existing. With both paths present, use the normal
+`./run.sh uninstall <package>` path instead.
+
+If the source directory remains but the Stow entry is missing or dangling,
+the orphaned path can still run and remove matching installed links, including
+links to that remaining source. For a user-only package, normal uninstall also
+rejects that incomplete mapping. Restore the valid Stow mapping before using
+normal uninstall if you intend to retain the package's normal teardown path.
 
 ## How it finds things
 
@@ -38,8 +46,17 @@ The scan roots are `.local/bin`, `.local/lib`, `.local/my-custom-bin`,
 itself a symlink is inspected too, including a dangling root left by Stow
 directory folding. The scan does not follow directory symlinks.
 
-Only symlinks matching that package marker are candidates. Real files and
-directories are never removed, and the command does not scan all of `$HOME`.
+Destinations outside these roots are not scanned. In particular,
+`ai-agents-hooks` installs sound links under `.local/share/agent-sounds`, and
+`simplified_netrole` installs a configuration-example link under
+`.local/share/simplified-netrole`. Removing either package can leave those
+links behind even when its `.local/bin` links are cleaned up successfully.
+Inspect those destinations separately. Even "No orphaned symlinks found"
+reports only the bounded scan, not the absence of all package leftovers.
+
+In the package-tree scan, only symlinks matching that package marker are
+candidates. Real files and directories are never removed, and the command
+does not scan all of `$HOME`.
 
 For user-systemd enablement links that no longer contain a package-tree marker,
 the command has a narrower fallback heuristic: a dangling link under a
@@ -54,10 +71,10 @@ removed by this heuristic.
 # Preview only — lists candidates, removes nothing, asks nothing.
 ./run.sh uninstall --orphaned --dry-run <package>
 
-# Interactive — asks before each symlink and user-unit cleanup.
+# Interactive — asks before each symlink removal and unit-deactivation attempt.
 ./run.sh uninstall --orphaned <package>
 
-# Non-interactive — removes/deactivates without prompting.
+# Non-interactive — removes links and attempts unit deactivation without prompts.
 ./run.sh uninstall --orphaned -y <package>
 ```
 
@@ -72,10 +89,40 @@ The confirmation prompt is read from `/dev/tty` when a terminal is available,
 so it still works when standard input is redirected; otherwise it falls back
 to standard input.
 
+## User-unit cleanup and verification
+
+For a home-directory target, the command attempts
+`systemctl --user disable --now <unit>` for each detected unit whose cleanup
+is confirmed. If that call fails, it prints a warning and continues removing
+matching enablement links and package symlinks. If `systemctl` is unavailable,
+it skips deactivation but can still remove package symlinks. Declining a unit's
+deactivation prompt also does not cancel the later symlink-removal pass.
+
+Consequently a unit can remain running after its unit-file link is removed,
+and the command can still exit successfully. This orphaned path currently
+does not enforce the fatal deactivation-failure rule documented in `AGENTS.md`
+for ordinary uninstall. Treat warnings, skipped deactivation and the final
+removal count as cleanup information, not proof that the runtime stopped.
+
+Record the unit names from the preview before cleanup. For each detected unit,
+query the reachable user manager afterward, using the exact reported name:
+
+```sh
+systemctl --user show <unit> --property=ActiveState --property=SubState
+```
+
+Confirm that the unit is inactive and inspect its enablement links separately.
+An unreachable manager or failed query leaves the runtime state unverified.
+If a unit remains running, stop it explicitly once the manager is reachable
+and repeat the check. The command does not perform this verification or retry
+automatically.
+
 ## Scope and limitations
 
-- Covers user Stow symlinks and user systemd units only.
-- User-unit deactivation runs only when the target resolves to `$HOME`.
+- Covers matching user Stow symlinks within the listed roots and the described
+  dangling user-unit enablement heuristic; it is not a complete inventory.
+- User-unit deactivation is attempted only when the target resolves to `$HOME`
+  and `systemctl` is available; the best-effort limitations above apply.
 - Files copied to `/` by a system-install manifest are not handled: they are
   not symlinks and cannot be discovered by this scan.
 - This is not a general `--force` or `--override` operation. It will not
