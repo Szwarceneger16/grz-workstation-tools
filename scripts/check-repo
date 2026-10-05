@@ -259,7 +259,7 @@ systemd_truthy_directive() {
   value="${value#"${value%%[![:space:]]*}"}"
   value="${value%"${value##*[![:space:]]}"}"
   case "${(L)value}" in
-    yes|true|1|on) return 0 ;;
+    yes|y|true|t|1|on) return 0 ;;
   esac
   return 1
 }

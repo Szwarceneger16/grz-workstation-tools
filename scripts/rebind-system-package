@@ -351,7 +351,7 @@ def system_units(repo, package, entries):
             continue
         custom = directive(text, 'Service' if kind == 'socket' else 'Unit')
         accept = directive(text, 'Accept') if kind == 'socket' else ''
-        accept = accept.split('#', 1)[0].split(';', 1)[0].strip().lower() in {'yes', 'true', '1', 'on'}
+        accept = accept.split('#', 1)[0].split(';', 1)[0].strip().lower() in {'yes', 'y', 'true', 't', '1', 'on'}
         if custom:
             require(kind != 'socket' or custom.endswith('.service') and not accept,
                     'socket Service= requires a service target and Accept=no')

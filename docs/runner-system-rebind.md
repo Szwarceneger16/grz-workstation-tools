@@ -45,6 +45,14 @@ socket requires its explicitly declared service template; a bare service-templat
 declaration without such a socket is refused. Duplicate/invalid declarations and
 ambiguous repeated or continued target directives are refused too.
 
+`Accept` recognizes every systemd true spelling (`1`, `yes`, `y`, `true`, `t`,
+`on`) without case sensitivity, as do `check-repo` and the system/user lifecycle
+readers. Each true spelling requires the accepting socket's declared service
+template and forbids `Service=`. The false spellings (`0`, `no`, `n`, `false`,
+`f`, `off`) retain non-accepting behavior; an absent directive defaults to false.
+The spelling sets follow systemd's
+[parse_boolean implementation](https://github.com/systemd/systemd/blob/main/src/basic/parse-util.c).
+
 This is data validation inside the reviewed Python helper: it never executes a
 checker or hook from an input checkout. It implements the system-unit checks of
 `check-repo`, with regression comparisons against that authoritative validator;
