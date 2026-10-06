@@ -3,9 +3,12 @@
 Package: `zsh-tools`
 
 This package uses a **hard cutover** from Volta to mise. There is no Volta
-fallback, no Corepack-based pnpm lookup, and no compatibility PATH for the
-legacy pnpm global-bin location. The migration assumes the old Volta/pnpm
-toolchain has been removed and the required tools are managed by mise.
+fallback and no Corepack-based pnpm lookup. Node, npm and the pnpm CLI are
+selected by mise.
+
+`PNPM_HOME` is deliberately retained because it is pnpm infrastructure, not
+Volta infrastructure. `$PNPM_HOME/bin` remains available at the lowest PATH
+priority for executables installed with `pnpm add -g`.
 
 ## Requirement
 
@@ -64,6 +67,18 @@ interactive Zsh activation. Shim path resolution follows this precedence:
 The directory is added only when it exists and is not already present in
 `PATH`.
 
+The same profile fragment exports:
+
+```sh
+PNPM_HOME="${PNPM_HOME:-$HOME/.local/share/pnpm}"
+```
+
+and keeps `$PNPM_HOME/bin` at the end of `PATH`. This does not choose the
+pnpm CLI; mise shims remain higher priority.
+
+For interactive Zsh, `99-path-finalize.zsh` preserves the same contract and
+normalizes `$PNPM_HOME/bin` to a single lowest-priority entry.
+
 ### Completion
 
 Source/target:
@@ -105,5 +120,6 @@ Runtime validation in a fresh Zsh:
 zsh -lic 'mise --version; command -v node; command -v npm; command -v pnpm; mise current'
 ```
 
-The expected state contains no `VOLTA_HOME` or `.volta/bin`. Project and
-global Node/npm/pnpm selection comes from mise.
+The expected state contains no `VOLTA_HOME` or `.volta/bin`. Node/npm and
+the pnpm CLI come from mise. `PNPM_HOME` and `$PNPM_HOME/bin` may remain
+present for pnpm global package executables.

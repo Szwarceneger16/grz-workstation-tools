@@ -17,7 +17,7 @@ def source_profile(home, path, **extra):
     env = {"HOME": str(home), "PATH": path}
     env.update(extra)
     result = subprocess.run(
-        ["sh", "-c", '. "$1"; printf "%s\\n" "$PATH"', "sh", str(PROFILE)],
+        ["sh", "-c", '. "$1"; printf "%s\\n%s\\n" "$PATH" "$PNPM_HOME"', "sh", str(PROFILE)],
         env=env,
         capture_output=True,
         text=True,
@@ -35,7 +35,10 @@ class MiseProfileTests(unittest.TestCase):
             shims.mkdir(parents=True)
             result = source_profile(home, "/usr/bin:/bin", XDG_DATA_HOME=str(xdg))
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(result.stdout.strip().split(":")[0], str(shims))
+            path_value, pnpm_home = result.stdout.splitlines()
+            self.assertEqual(path_value.split(":")[0], str(shims))
+            self.assertEqual(pnpm_home, str(home / ".local/share/pnpm"))
+            self.assertEqual(path_value.split(":")[-1], str(home / ".local/share/pnpm/bin"))
 
     def test_mise_data_dir_is_used_before_xdg_default(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -52,9 +55,12 @@ class MiseProfileTests(unittest.TestCase):
                 XDG_DATA_HOME=str(xdg),
             )
             self.assertEqual(result.returncode, 0, result.stderr)
-            entries = result.stdout.strip().split(":")
+            path_value, pnpm_home = result.stdout.splitlines()
+            entries = path_value.split(":")
             self.assertEqual(entries[0], str(shims))
             self.assertNotIn(str(xdg / "mise/shims"), entries)
+            self.assertEqual(pnpm_home, str(home / ".local/share/pnpm"))
+            self.assertEqual(entries[-1], str(home / ".local/share/pnpm/bin"))
 
     def test_mise_shims_dir_overrides_data_and_xdg_locations_idempotently(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -74,10 +80,13 @@ class MiseProfileTests(unittest.TestCase):
                 XDG_DATA_HOME=str(xdg),
             )
             self.assertEqual(result.returncode, 0, result.stderr)
-            entries = result.stdout.strip().split(":")
+            path_value, pnpm_home = result.stdout.splitlines()
+            entries = path_value.split(":")
             self.assertEqual(entries.count(str(dedicated)), 1)
             self.assertNotIn(str(data / "shims"), entries)
             self.assertNotIn(str(xdg / "mise/shims"), entries)
+            self.assertEqual(pnpm_home, str(home / ".local/share/pnpm"))
+            self.assertEqual(entries[-1], str(home / ".local/share/pnpm/bin"))
 
 
 @unittest.skipUnless(shutil.which("zsh"), "requires zsh")
@@ -128,13 +137,21 @@ class MiseInteractiveTests(unittest.TestCase):
 
 
 class HardCutoverTests(unittest.TestCase):
-    def test_active_runtime_does_not_restore_legacy_volta_or_pnpm_paths(self):
+    def test_active_runtime_does_not_restore_volta_or_corepack_pnpm_selection(self):
         combined = "\n".join(
             path.read_text()
             for path in (PROFILE, RC, FINALIZER, PNPM_COMPLETION)
         )
-        for legacy in ("VOLTA_HOME", ".volta/bin", "PNPM_HOME", ".local/share/pnpm/bin", "corepack which pnpm"):
+        for legacy in ("VOLTA_HOME", ".volta/bin", "corepack which pnpm"):
             self.assertNotIn(legacy, combined)
+
+    def test_pnpm_home_is_preserved_as_independent_pnpm_infrastructure(self):
+        profile = PROFILE.read_text()
+        finalizer = FINALIZER.read_text()
+        self.assertIn('export PNPM_HOME="${PNPM_HOME:-$HOME/.local/share/pnpm}"', profile)
+        self.assertIn('$PNPM_HOME/bin', profile)
+        self.assertIn('export PNPM_HOME="${PNPM_HOME:-$HOME/.local/share/pnpm}"', finalizer)
+        self.assertIn('$PNPM_HOME/bin', finalizer)
 
 
 if __name__ == "__main__":

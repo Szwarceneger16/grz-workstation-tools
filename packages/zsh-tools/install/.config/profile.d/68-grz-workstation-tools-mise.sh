@@ -20,4 +20,14 @@ if [ -d "$mise_shims" ]; then
 fi
 
 unset mise_shims
+
+# pnpm global package executables are independent of the pnpm CLI provider.
+# Keep the CLI selected by mise, but retain the global-bin directory at the
+# lowest PATH priority for commands installed with pnpm add -g.
+export PNPM_HOME="${PNPM_HOME:-$HOME/.local/share/pnpm}"
+case ":$PATH:" in
+    *":$PNPM_HOME/bin:"*) ;;
+    *) PATH="$PATH:$PNPM_HOME/bin" ;;
+esac
+
 export PATH
