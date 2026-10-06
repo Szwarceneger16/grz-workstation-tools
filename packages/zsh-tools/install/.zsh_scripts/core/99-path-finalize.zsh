@@ -63,7 +63,7 @@ done
 
 # pnpm global package executables are not tied to Volta. Keep them available
 # after the hard Volta cutover, below mise-managed and inherited commands.
-__grz_path_add_existing "$__grz_pnpm_bin"
+__grz_path_add "$__grz_pnpm_bin"
 
 export PATH="${(j/:/)__grz_path_normalized}"
 

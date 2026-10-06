@@ -8,6 +8,7 @@ This repository owns the public Zsh runtime. It does not own `~/.zshrc` or `~/.p
 
 - **GNU Stow** (`apt install stow`)
 - Zsh
+- **mise >= 2026.10.3** for the `zsh-tools` Node/npm/pnpm runtime integration
 
 ## Install
 

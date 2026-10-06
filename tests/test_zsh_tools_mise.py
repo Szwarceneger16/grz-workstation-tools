@@ -17,7 +17,7 @@ def source_profile(home, path, **extra):
     env = {"HOME": str(home), "PATH": path}
     env.update(extra)
     result = subprocess.run(
-        ["sh", "-c", '. "$1"; printf "%s\\n%s\\n" "$PATH" "$PNPM_HOME"', "sh", str(PROFILE)],
+        ["sh", "-c", '. "$1"; . "$1"; printf "%s\\n%s\\n" "$PATH" "$PNPM_HOME"', "sh", str(PROFILE)],
         env=env,
         capture_output=True,
         text=True,
@@ -87,6 +87,22 @@ class MiseProfileTests(unittest.TestCase):
             self.assertNotIn(str(xdg / "mise/shims"), entries)
             self.assertEqual(pnpm_home, str(home / ".local/share/pnpm"))
             self.assertEqual(entries[-1], str(home / ".local/share/pnpm/bin"))
+
+    def test_custom_pnpm_home_is_preserved_at_lowest_priority_idempotently(self):
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp) / "home"
+            custom_pnpm = Path(temp) / "pnpm-global"
+            result = source_profile(
+                home,
+                "/usr/bin:/bin",
+                PNPM_HOME=str(custom_pnpm),
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            path_value, pnpm_home = result.stdout.splitlines()
+            entries = path_value.split(":")
+            self.assertEqual(pnpm_home, str(custom_pnpm))
+            self.assertEqual(entries[-1], str(custom_pnpm / "bin"))
+            self.assertEqual(entries.count(str(custom_pnpm / "bin")), 1)
 
 
 @unittest.skipUnless(shutil.which("zsh"), "requires zsh")
