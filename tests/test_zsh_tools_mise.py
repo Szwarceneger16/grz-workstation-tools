@@ -37,6 +37,25 @@ class MiseProfileTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout.strip().split(":")[0], str(shims))
 
+    def test_mise_data_dir_is_used_before_xdg_default(self):
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp) / "home"
+            data = Path(temp) / "mise-data"
+            xdg = Path(temp) / "xdg"
+            shims = data / "shims"
+            shims.mkdir(parents=True)
+            (xdg / "mise/shims").mkdir(parents=True)
+            result = source_profile(
+                home,
+                "/usr/bin:/bin",
+                MISE_DATA_DIR=str(data),
+                XDG_DATA_HOME=str(xdg),
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            entries = result.stdout.strip().split(":")
+            self.assertEqual(entries[0], str(shims))
+            self.assertNotIn(str(xdg / "mise/shims"), entries)
+
     def test_mise_shims_dir_overrides_data_and_xdg_locations_idempotently(self):
         with tempfile.TemporaryDirectory() as temp:
             home = Path(temp) / "home"
