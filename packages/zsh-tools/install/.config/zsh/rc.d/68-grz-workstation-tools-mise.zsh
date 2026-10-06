@@ -16,6 +16,9 @@ if [[ -n "${__grz_mise_bin:-}" ]]; then
   autoload -Uz is-at-least
 
   if [[ -n "$__grz_mise_version" ]] && is-at-least 2026.10.3 "$__grz_mise_version"; then
+    # A nested shell can inherit mise's old baseline PATH from a pre-migration
+    # parent. Rebuild activation from the already-sanitized current PATH.
+    unset __MISE_ORIG_PATH
     eval "$("$__grz_mise_bin" activate zsh)"
   else
     print -u2 -- "grz-workstation-tools: mise >= 2026.10.3 required; found ${__grz_mise_version:-unknown}"

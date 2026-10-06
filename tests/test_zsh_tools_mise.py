@@ -17,7 +17,13 @@ def source_profile(home, path, **extra):
     env = {"HOME": str(home), "PATH": path}
     env.update(extra)
     result = subprocess.run(
-        ["sh", "-c", '. "$1"; . "$1"; printf "%s\\n%s\\n" "$PATH" "$PNPM_HOME"', "sh", str(PROFILE)],
+        [
+            "sh",
+            "-c",
+            '. "$1"; . "$1"; printf "%s\\n%s\\n%s\\n" "$PATH" "$PNPM_HOME" "${VOLTA_HOME-unset}"',
+            "sh",
+            str(PROFILE),
+        ],
         env=env,
         capture_output=True,
         text=True,
@@ -35,7 +41,7 @@ class MiseProfileTests(unittest.TestCase):
             shims.mkdir(parents=True)
             result = source_profile(home, "/usr/bin:/bin", XDG_DATA_HOME=str(xdg))
             self.assertEqual(result.returncode, 0, result.stderr)
-            path_value, pnpm_home = result.stdout.splitlines()
+            path_value, pnpm_home, _ = result.stdout.splitlines()
             self.assertEqual(path_value.split(":")[0], str(shims))
             self.assertEqual(pnpm_home, str(home / ".local/share/pnpm"))
             self.assertEqual(path_value.split(":")[-1], str(home / ".local/share/pnpm/bin"))
@@ -55,7 +61,7 @@ class MiseProfileTests(unittest.TestCase):
                 XDG_DATA_HOME=str(xdg),
             )
             self.assertEqual(result.returncode, 0, result.stderr)
-            path_value, pnpm_home = result.stdout.splitlines()
+            path_value, pnpm_home, _ = result.stdout.splitlines()
             entries = path_value.split(":")
             self.assertEqual(entries[0], str(shims))
             self.assertNotIn(str(xdg / "mise/shims"), entries)
@@ -80,13 +86,52 @@ class MiseProfileTests(unittest.TestCase):
                 XDG_DATA_HOME=str(xdg),
             )
             self.assertEqual(result.returncode, 0, result.stderr)
-            path_value, pnpm_home = result.stdout.splitlines()
+            path_value, pnpm_home, _ = result.stdout.splitlines()
             entries = path_value.split(":")
             self.assertEqual(entries.count(str(dedicated)), 1)
             self.assertNotIn(str(data / "shims"), entries)
             self.assertNotIn(str(xdg / "mise/shims"), entries)
             self.assertEqual(pnpm_home, str(home / ".local/share/pnpm"))
             self.assertEqual(entries[-1], str(home / ".local/share/pnpm/bin"))
+
+    def test_inherited_volta_is_removed_and_pnpm_bin_is_moved_to_tail(self):
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp) / "home"
+            default_volta = home / ".volta/bin"
+            custom_volta_home = Path(temp) / "custom-volta"
+            custom_volta_bin = custom_volta_home / "bin"
+            pnpm_home = Path(temp) / "pnpm"
+            pnpm_bin = pnpm_home / "bin"
+            shims = home / ".local/share/mise/shims"
+            for directory in (default_volta, custom_volta_bin, pnpm_bin, shims):
+                directory.mkdir(parents=True)
+
+            initial = os.pathsep.join(
+                (
+                    str(pnpm_bin),
+                    "/usr/bin",
+                    str(default_volta),
+                    str(pnpm_bin),
+                    str(custom_volta_bin),
+                    "/bin",
+                )
+            )
+            result = source_profile(
+                home,
+                initial,
+                VOLTA_HOME=str(custom_volta_home),
+                PNPM_HOME=str(pnpm_home),
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            path_value, exported_pnpm_home, volta_home = result.stdout.splitlines()
+            entries = path_value.split(os.pathsep)
+
+            self.assertNotIn(str(default_volta), entries)
+            self.assertNotIn(str(custom_volta_bin), entries)
+            self.assertEqual(volta_home, "unset")
+            self.assertEqual(exported_pnpm_home, str(pnpm_home))
+            self.assertEqual(entries[-1], str(pnpm_bin))
+            self.assertEqual(entries.count(str(pnpm_bin)), 1)
 
     def test_custom_pnpm_home_is_preserved_at_lowest_priority_idempotently(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -98,11 +143,64 @@ class MiseProfileTests(unittest.TestCase):
                 PNPM_HOME=str(custom_pnpm),
             )
             self.assertEqual(result.returncode, 0, result.stderr)
-            path_value, pnpm_home = result.stdout.splitlines()
+            path_value, pnpm_home, _ = result.stdout.splitlines()
             entries = path_value.split(":")
             self.assertEqual(pnpm_home, str(custom_pnpm))
             self.assertEqual(entries[-1], str(custom_pnpm / "bin"))
             self.assertEqual(entries.count(str(custom_pnpm / "bin")), 1)
+
+
+@unittest.skipUnless(shutil.which("zsh"), "requires zsh")
+class PathFinalizerTests(unittest.TestCase):
+    def test_strips_default_and_custom_inherited_volta_and_normalizes_pnpm_tail(self):
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp) / "home"
+            default_volta = home / ".volta/bin"
+            custom_volta_home = Path(temp) / "custom-volta"
+            custom_volta_bin = custom_volta_home / "bin"
+            pnpm_home = Path(temp) / "pnpm"
+            pnpm_bin = pnpm_home / "bin"
+            for directory in (default_volta, custom_volta_bin, pnpm_bin):
+                directory.mkdir(parents=True)
+
+            env = {
+                "HOME": str(home),
+                "PATH": os.pathsep.join(
+                    (
+                        str(default_volta),
+                        "/usr/bin",
+                        str(pnpm_bin),
+                        str(custom_volta_bin),
+                        str(pnpm_bin),
+                        "/bin",
+                    )
+                ),
+                "VOLTA_HOME": str(custom_volta_home),
+                "PNPM_HOME": str(pnpm_home),
+            }
+            result = subprocess.run(
+                [
+                    "zsh",
+                    "-dfc",
+                    'source "$1"; print -r -- "$PATH"; print -r -- "${VOLTA_HOME-unset}"; print -r -- "$PNPM_HOME"',
+                    "zsh",
+                    str(FINALIZER),
+                ],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            path_value, volta_home, exported_pnpm_home = result.stdout.splitlines()
+            entries = path_value.split(os.pathsep)
+
+            self.assertNotIn(str(default_volta), entries)
+            self.assertNotIn(str(custom_volta_bin), entries)
+            self.assertEqual(volta_home, "unset")
+            self.assertEqual(exported_pnpm_home, str(pnpm_home))
+            self.assertEqual(entries[-1], str(pnpm_bin))
+            self.assertEqual(entries.count(str(pnpm_bin)), 1)
 
 
 @unittest.skipUnless(shutil.which("zsh"), "requires zsh")
@@ -153,13 +251,15 @@ class MiseInteractiveTests(unittest.TestCase):
 
 
 class HardCutoverTests(unittest.TestCase):
-    def test_active_runtime_does_not_restore_volta_or_corepack_pnpm_selection(self):
+    def test_active_runtime_does_not_export_volta_or_restore_corepack_pnpm_selection(self):
         combined = "\n".join(
             path.read_text()
             for path in (PROFILE, RC, FINALIZER, PNPM_COMPLETION)
         )
-        for legacy in ("VOLTA_HOME", ".volta/bin", "corepack which pnpm"):
-            self.assertNotIn(legacy, combined)
+        self.assertNotIn("export VOLTA_HOME", combined)
+        self.assertNotIn("corepack which pnpm", combined)
+        self.assertIn("unset VOLTA_HOME", combined)
+        self.assertIn("unset __MISE_ORIG_PATH", RC.read_text())
 
     def test_pnpm_home_is_preserved_as_independent_pnpm_infrastructure(self):
         profile = PROFILE.read_text()

@@ -40,8 +40,11 @@ Installed target:
 
 The fragment runs after the public PATH finalizer. It resolves mise from
 `~/.local/bin/mise` first, otherwise from `PATH`. It activates mise only when
-the resolved version is at least 2026.10.3. An older version prints a diagnostic
-and is not activated; no legacy tool-manager fallback is attempted.
+the resolved version is at least 2026.10.3. Before activation it clears an
+inherited `__MISE_ORIG_PATH`, so a nested shell cannot restore a pre-migration
+Volta PATH after the finalizer has sanitized the current PATH. An older mise
+prints a diagnostic and is not activated; no legacy tool-manager fallback is
+attempted.
 
 ### Login and GUI/IDE processes
 
@@ -64,8 +67,10 @@ interactive Zsh activation. Shim path resolution follows this precedence:
 2. `$MISE_DATA_DIR/shims`
 3. `${XDG_DATA_HOME:-$HOME/.local/share}/mise/shims`
 
-The directory is added only when it exists and is not already present in
-`PATH`.
+Before adding mise shims, the profile fragment strips both the default
+`$HOME/.volta/bin` and an inherited custom `$VOLTA_HOME/bin`, then clears
+`VOLTA_HOME`. Existing copies of the resolved mise shim directory are removed
+before exactly one copy is prepended.
 
 The same profile fragment exports:
 
@@ -73,8 +78,8 @@ The same profile fragment exports:
 PNPM_HOME="${PNPM_HOME:-$HOME/.local/share/pnpm}"
 ```
 
-and keeps `$PNPM_HOME/bin` at the end of `PATH`. This does not choose the
-pnpm CLI; mise shims remain higher priority.
+and normalizes `$PNPM_HOME/bin` to exactly one entry at the end of `PATH`.
+This does not choose the pnpm CLI; mise shims remain higher priority.
 
 For interactive Zsh, `99-path-finalize.zsh` preserves the same contract and
 normalizes `$PNPM_HOME/bin` to a single lowest-priority entry.
