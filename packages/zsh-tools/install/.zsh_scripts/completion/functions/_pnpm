@@ -9,8 +9,9 @@ if type compdef &>/dev/null; then
     local si=$IFS
     local _pnpm_bin
 
-    # 1) Znajdź realną binarkę pnpm (Corepack > system PATH)
-    _pnpm_bin="$(corepack which pnpm 2>/dev/null)" || _pnpm_bin="$(command -v pnpm)"
+    # 1) Znajdź pnpm wybrane przez aktualny PATH/tool manager.
+    _pnpm_bin="$(command -v pnpm 2>/dev/null)"
+    [[ -n "$_pnpm_bin" ]] || return 1
 
     # 2) Zapytaj completion-server o podpowiedzi
     IFS=$'\n'
