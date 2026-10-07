@@ -11,6 +11,7 @@ PROFILE = ROOT / "packages/zsh-tools/install/.config/profile.d/68-grz-workstatio
 RC = ROOT / "packages/zsh-tools/install/.config/zsh/rc.d/68-grz-workstation-tools-mise.zsh"
 FINALIZER = ROOT / "packages/zsh-tools/install/.zsh_scripts/core/99-path-finalize.zsh"
 PNPM_COMPLETION = ROOT / "packages/zsh-tools/install/.zsh_scripts/completion/functions/_pnpm"
+VERIFY_HOOK = ROOT / "packages/zsh-tools/verify.hook.sh"
 
 
 def source_profile(home, path, **extra):
@@ -238,6 +239,7 @@ class MiseInteractiveTests(unittest.TestCase):
         binary.write_text(
             "#!/bin/sh\n"
             f"version='{version}'\n"
+            "[ \"${MISE_SELF_UPDATE_AVAILABLE:-}\" = false ] || exit 93\n"
             "case \"$1\" in\n"
             "  --version) printf '%s linux-x64\\n' \"$version\" ;;\n"
             "  activate) [ \"$2\" = zsh ] || exit 91; printf '%s\\n' 'export GRZ_FAKE_MISE_ACTIVATED=1' ;;\n"
@@ -265,6 +267,31 @@ class MiseInteractiveTests(unittest.TestCase):
                 timeout=10,
             )
 
+    def test_startup_scopes_self_update_disable_without_overwriting_caller_value(self):
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp) / "home"
+            self.fake_mise(home, "2026.10.3")
+            env = {
+                "HOME": str(home),
+                "PATH": "/usr/bin:/bin",
+                "MISE_SELF_UPDATE_AVAILABLE": "caller-value",
+            }
+            result = subprocess.run(
+                [
+                    "zsh",
+                    "-dfc",
+                    'source "$1"; print -r -- "${GRZ_FAKE_MISE_ACTIVATED:-0}"; print -r -- "$MISE_SELF_UPDATE_AVAILABLE"',
+                    "zsh",
+                    str(RC),
+                ],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.splitlines(), ["1", "caller-value"])
+
     def test_supported_mise_is_activated(self):
         result = self.run_rc("2026.10.3")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -275,6 +302,48 @@ class MiseInteractiveTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         self.assertEqual(result.stdout.strip(), "0")
         self.assertIn("mise >= 2026.10.3 required", result.stderr)
+
+
+class MiseVerifyHookTests(unittest.TestCase):
+    def test_verify_version_probe_disables_self_update_network_check(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repo = root / "repo"
+            target = root / "home"
+            scripts = repo / "scripts"
+            scripts.mkdir(parents=True)
+            target.mkdir()
+
+            ensure = scripts / "ensure-rcd-loaders"
+            ensure.write_text("#!/bin/sh\nexit 0\n")
+            ensure.chmod(0o755)
+
+            mise = target / ".local/bin/mise"
+            mise.parent.mkdir(parents=True)
+            mise.write_text(
+                "#!/bin/sh\n"
+                '[ "${MISE_SELF_UPDATE_AVAILABLE:-}" = false ] || exit 93\n'
+                '[ "$1" = --version ] || exit 94\n'
+                "printf '%s\\n' '2026.10.3 linux-x64'\n"
+            )
+            mise.chmod(0o755)
+
+            env = os.environ.copy()
+            env.update(
+                GRZ_REPO_ROOT=str(repo),
+                STOW_TARGET=str(target),
+                HOME=str(target),
+                MISE_SELF_UPDATE_AVAILABLE="caller-value",
+            )
+            result = subprocess.run(
+                ["bash", str(VERIFY_HOOK)],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("mise 2026.10.3 satisfies", result.stdout)
 
 
 class HardCutoverTests(unittest.TestCase):

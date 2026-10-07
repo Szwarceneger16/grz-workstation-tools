@@ -39,12 +39,15 @@ Installed target:
 ```
 
 The fragment runs after the public PATH finalizer. It resolves mise from
-`~/.local/bin/mise` first, otherwise from `PATH`. It activates mise only when
-the resolved version is at least 2026.10.3. Before activation it clears an
-inherited `__MISE_ORIG_PATH`, so a nested shell cannot restore a pre-migration
-Volta PATH after the finalizer has sanitized the current PATH. An older mise
-prints a diagnostic and is not activated; no legacy tool-manager fallback is
-attempted.
+`~/.local/bin/mise` first, otherwise from `PATH`. Both the startup version
+probe and `mise activate zsh` run with a command-scoped
+`MISE_SELF_UPDATE_AVAILABLE=false`, preventing self-update availability checks
+from adding network latency to shell startup without changing the caller's
+environment. It activates mise only when the resolved version is at least
+2026.10.3. Before activation it clears an inherited `__MISE_ORIG_PATH`, so a
+nested shell cannot restore a pre-migration Volta PATH after the finalizer has
+sanitized the current PATH. An older mise prints a diagnostic and is not
+activated; no legacy tool-manager fallback is attempted.
 
 ### Login and GUI/IDE processes
 
@@ -122,12 +125,15 @@ Repository/static validation:
 
 The package test command executes the mise regression suite through
 `packages/zsh-tools/tests/mise-regression.sh`. CI also discovers the same
-Python suite directly as `tests/test_runner_zsh_tools_mise.py`.
+Python suite directly as `tests/test_runner_zsh_tools_mise.py`. The suite
+verifies that startup and verification version probes disable mise self-update
+availability checks without overwriting a caller-provided
+`MISE_SELF_UPDATE_AVAILABLE` value.
 
 Runtime validation in a fresh Zsh:
 
 ```sh
-zsh -lic 'mise --version; command -v node; command -v npm; command -v pnpm; mise current'
+MISE_SELF_UPDATE_AVAILABLE=false zsh -lic 'mise --version; command -v node; command -v npm; command -v pnpm; mise current'
 ```
 
 The expected state contains no `VOLTA_HOME` or `.volta/bin`. Node/npm and

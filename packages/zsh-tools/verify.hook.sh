@@ -43,7 +43,7 @@ if [[ -z "$mise_bin" ]]; then
   exit 1
 fi
 
-mise_version="$("$mise_bin" --version 2>/dev/null | awk '{print $1}')"
+mise_version="$(MISE_SELF_UPDATE_AVAILABLE=false "$mise_bin" --version 2>/dev/null | awk '{print $1}')"
 if ! version_at_least "$mise_version" "$MISE_MIN_VERSION"; then
   printf 'not ok - mise %s is too old; zsh-tools requires >= %s\n' \
     "${mise_version:-unknown}" "$MISE_MIN_VERSION" >&2
