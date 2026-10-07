@@ -116,6 +116,26 @@ semantics. The completion invokes `__GRZ_MISE_BIN`, so completion and activation
 use the same validated executable. Dispatcher cleanup occurs before invoking
 completion, preserving a failed completion's return status.
 
+An empty successful `__complete_word__` response still returns completion status
+1. That status reaches the caller on both the first autoload call and subsequent
+calls, allowing later completers to run. The dispatcher removes itself before
+calling `_mise`; no trailing cleanup command replaces the completion status.
+
+The companion pnpm completion is also owned by `zsh-tools`:
+
+```text
+packages/zsh-tools/install/.zsh_scripts/completion/functions/_pnpm
+~/.zsh_scripts/completion/functions/_pnpm
+```
+
+It selects an executable from the current PATH with `builtin whence -p`, so a
+`pnpm` alias or shell function cannot supply an alias definition or replace the
+completion-server executable. The selected path must be a regular executable
+file. Missing executables return status 1. Both its dispatcher and completion
+function use local Zsh emulation, including on the first autoload invocation
+when the caller already enabled `KSH_ARRAYS`. Existing server-provided
+candidates, file markers and static subcommand fallback remain supported.
+
 ## Activation
 
 Install/update the package manually:

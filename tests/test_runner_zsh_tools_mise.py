@@ -407,6 +407,133 @@ class MiseCompletionTests(unittest.TestCase):
             env={"PATH": "/usr/bin:/bin"}, text=True, capture_output=True, timeout=10)
         self.assertEqual(result.returncode, 1, result.stderr)
 
+    def test_empty_response_reaches_later_completer_on_first_and_second_call(self):
+        for mode in ("source", "autoload"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                mise = root / "mise"
+                mise.write_text(
+                    "#!/bin/sh\n"
+                    '[ "$1" = __complete_word__ ] || exit 91\n'
+                    'printf "called\\n" >> "$MISE_CALLS"\n'
+                    "exit 0\n"
+                )
+                mise.chmod(0o755)
+                script = (
+                    'compdef() { :; }; compadd() { return 92; }; '
+                    'typeset -g __GRZ_MISE_BIN="$2"; '
+                    'setopt KSH_ARRAYS SH_WORD_SPLIT; '
+                    'BUFFER="mise unknown"; CURSOR=${#BUFFER}; '
+                    'words=(mise unknown); CURRENT=2; '
+                    'if [[ "$3" == source ]]; then source "$1"; '
+                    'else fpath=("${1:h}" $fpath); autoload -Uz _mise; fi; '
+                    '_later_completer() { print -r -- fallback >> "$LATER_CALLS"; }; '
+                    'for invocation in first second; do '
+                    'if _mise; then exit 93; else completion_rc=$?; fi; '
+                    '[[ $completion_rc == 1 ]] || exit 94; '
+                    '_later_completer; '
+                    '[[ ${+functions[__grz_mise_dispatch]} == 0 ]] || exit 95; '
+                    '[[ -o KSH_ARRAYS && -o SH_WORD_SPLIT ]] || exit 96; done'
+                )
+                result = subprocess.run(
+                    [shutil.which("zsh"), "-dfc", script, "test", str(MISE_COMPLETION),
+                     str(mise), mode],
+                    env={"PATH": "/usr/bin:/bin", "HOME": str(root),
+                         "MISE_CALLS": str(root / "mise-calls"),
+                         "LATER_CALLS": str(root / "later-calls")},
+                    text=True, capture_output=True, timeout=10,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual((root / "mise-calls").read_text(), "called\ncalled\n")
+                self.assertEqual((root / "later-calls").read_text(), "fallback\nfallback\n")
+
+
+@unittest.skipUnless(shutil.which("zsh"), "requires zsh")
+class PnpmCompletionTests(unittest.TestCase):
+    def test_aliases_and_functions_do_not_replace_the_path_executable(self):
+        for mode in ("source", "autoload"):
+            for shadow in ("alias", "function", "both"):
+                with self.subTest(mode=mode, shadow=shadow):
+                    with tempfile.TemporaryDirectory() as temp:
+                        root = Path(temp)
+                        bin_dir = root / "bin with spaces"
+                        bin_dir.mkdir()
+                        pnpm = bin_dir / "pnpm"
+                        pnpm.write_text(
+                            "#!/bin/sh\n"
+                            '[ "$1" = completion-server ] || exit 91\n'
+                            '[ "$2" = -- ] || exit 92\n'
+                            'printf "%s\\n" "$@" >> "$PNPM_CALLS"\n'
+                            "printf 'server-candidate\\n'\n"
+                        )
+                        pnpm.chmod(0o755)
+                        script = (
+                            'compdef() { :; }; '
+                            'compadd() { builtin emulate -L \'zsh\'; '
+                            'print -rl -- "${(@P)2}" >> "$PNPM_CANDIDATES"; }; '
+                            'if [[ "$3" == function || "$3" == both ]]; then '
+                            'pnpm() { print function >> "$PNPM_SHADOW"; return 93; }; fi; '
+                            'if [[ "$3" == alias || "$3" == both ]]; then '
+                            'alias pnpm=\'print alias >> "$PNPM_SHADOW"\'; fi; '
+                            'emulate() { return 94; }; whence() { return 95; }; '
+                            'alias -g zsh=wrong-shell; '
+                            'setopt KSH_ARRAYS SH_WORD_SPLIT; '
+                            'BUFFER="pnpm a"; CURSOR=${#BUFFER}; words=(pnpm a); CURRENT=2; '
+                            'original_ifs=$IFS; '
+                            'if [[ "$2" == source ]]; then source "$1"; '
+                            'else fpath=("${1:h}" $fpath); autoload -Uz _pnpm; fi; '
+                            'for invocation in first second; do '
+                            'if [[ "$2" == source ]]; then _pnpm_completion || exit 96; '
+                            'else _pnpm || exit 97; fi; '
+                            '[[ -o KSH_ARRAYS && -o SH_WORD_SPLIT && "$IFS" == "$original_ifs" ]] '
+                            '|| exit 98; done'
+                        )
+                        result = subprocess.run(
+                            [shutil.which("zsh"), "-dfc", script, "test",
+                             str(PNPM_COMPLETION), mode, shadow],
+                            env={"HOME": str(root), "PATH": str(bin_dir),
+                                 "PNPM_CALLS": str(root / "calls"),
+                                 "PNPM_CANDIDATES": str(root / "candidates"),
+                                 "PNPM_SHADOW": str(root / "shadow")},
+                            text=True, capture_output=True, timeout=10,
+                        )
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertFalse((root / "shadow").exists())
+                        self.assertEqual((root / "candidates").read_text(),
+                                         "server-candidate\nserver-candidate\n")
+                        self.assertEqual((root / "calls").read_text(),
+                                         "completion-server\n--\npnpm\na\n" * 2)
+
+    def test_alias_without_an_executable_fails_without_offering_fallback_candidates(self):
+        for mode in ("source", "autoload"):
+            for kind in ("missing", "directory", "non-executable"):
+                with self.subTest(mode=mode, kind=kind):
+                    with tempfile.TemporaryDirectory() as temp:
+                        root = Path(temp)
+                        if kind == "directory":
+                            (root / "pnpm").mkdir()
+                        elif kind == "non-executable":
+                            (root / "pnpm").write_text("#!/bin/sh\nexit 99\n")
+                        script = (
+                            'compdef() { :; }; '
+                            'compadd() { print fallback > "$PNPM_CANDIDATES"; }; '
+                            'alias pnpm=\'print shadow > "$PNPM_SHADOW"\'; '
+                            'BUFFER="pnpm a"; CURSOR=${#BUFFER}; words=(pnpm a); CURRENT=2; '
+                            'if [[ "$2" == source ]]; then source "$1"; _pnpm_completion; '
+                            'else fpath=("${1:h}" $fpath); autoload -Uz _pnpm; _pnpm; fi'
+                        )
+                        result = subprocess.run(
+                            [shutil.which("zsh"), "-dfc", script, "test",
+                             str(PNPM_COMPLETION), mode],
+                            env={"HOME": str(root), "PATH": str(root),
+                                 "PNPM_CANDIDATES": str(root / "candidates"),
+                                 "PNPM_SHADOW": str(root / "shadow")},
+                            text=True, capture_output=True, timeout=10,
+                        )
+                        self.assertEqual(result.returncode, 1, result.stderr)
+                        self.assertFalse((root / "candidates").exists())
+                        self.assertFalse((root / "shadow").exists())
+
 
 class MiseVerifyHookTests(unittest.TestCase):
     def test_verify_checks_required_completion_capability_without_version_probe(self):

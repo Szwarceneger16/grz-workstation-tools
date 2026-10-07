@@ -2,7 +2,7 @@
 ###-begin-pnpm-completion-###
 if type compdef &>/dev/null; then
   _pnpm_completion () {
-    emulate -L zsh
+    builtin emulate -L 'zsh'
     setopt noshwordsplit
 
     local -a reply
@@ -10,8 +10,8 @@ if type compdef &>/dev/null; then
     local _pnpm_bin
 
     # 1) Resolve the pnpm binary selected by the current PATH/tool manager.
-    _pnpm_bin="$(command -v pnpm 2>/dev/null)"
-    [[ -n "$_pnpm_bin" ]] || return 1
+    _pnpm_bin="$(builtin whence -p 'pnpm' 2>/dev/null)" || return 1
+    [[ -f "$_pnpm_bin" && -x "$_pnpm_bin" ]] || return 1
 
     # 2) Ask the completion server for candidates.
     IFS=$'\n'
@@ -85,10 +85,15 @@ if type compdef &>/dev/null; then
     compadd -a reply
   }
 
-  if [[ $zsh_eval_context == *func ]]; then
-    _pnpm_completion "$@"
-  else
-    compdef _pnpm_completion pnpm
-  fi
+  # Isolate dispatch too: with KSH_ARRAYS the caller's evaluation context and
+  # array indexing cannot distinguish the first autoload call reliably.
+  () {
+    builtin emulate -L 'zsh'
+    if [[ "${funcstack[2]:-}" == '_pnpm' ]]; then
+      _pnpm_completion "$@"
+    else
+      compdef _pnpm_completion 'pnpm'
+    fi
+  } "$@"
 fi
 ###-end-pnpm-completion-###
