@@ -38,12 +38,15 @@ The fragment runs after the public PATH finalizer. It resolves mise from
 `~/.local/bin/mise` first, otherwise from `PATH`. Startup deliberately avoids
 `mise --version`, because version output may trigger update-notice availability
 checks. Instead it validates the local `help __complete_word__` capability
-required by the vendored completion. Both that capability probe and
-`mise activate zsh` use command-scoped `MISE_SELF_UPDATE_AVAILABLE=false`,
-so the caller's environment is not overwritten. Before activation the fragment
-clears an inherited `__MISE_ORIG_PATH`, preventing a nested shell from
-restoring a pre-migration Volta PATH. Unsupported mise releases are diagnosed
-and not activated; no legacy tool-manager fallback is attempted.
+required by the vendored completion. The validated executable path is retained
+in the non-exported internal Zsh variable `__GRZ_MISE_BIN`; completion uses
+that exact path instead of resolving `mise` again from `PATH`. Both the
+capability probe and `mise activate zsh` use command-scoped
+`MISE_SELF_UPDATE_AVAILABLE=false`, so the caller's environment is not
+overwritten. Before activation the fragment clears an inherited
+`__MISE_ORIG_PATH`, preventing a nested shell from restoring a pre-migration
+Volta PATH. Unsupported mise releases are diagnosed and not activated; no
+legacy tool-manager fallback is attempted.
 
 ### Login and GUI/IDE processes
 
@@ -93,7 +96,10 @@ packages/zsh-tools/install/.zsh_scripts/completion/functions/_mise
 ```
 
 The completion is vendored from mise 2026.10.3 and shares the same
-`__complete_word__` capability contract.
+`__complete_word__` capability contract. Its `_mise` function starts with
+`emulate -L zsh` so caller options such as `KSH_ARRAYS` cannot alter generated
+array semantics, and it invokes `__GRZ_MISE_BIN` so completion and activation
+use the same validated executable.
 
 ## Activation
 
