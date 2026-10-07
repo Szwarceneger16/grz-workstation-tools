@@ -92,8 +92,8 @@ packages/zsh-tools/install/.zsh_scripts/completion/functions/_mise
 ~/.zsh_scripts/completion/functions/_mise
 ```
 
-The completion is vendored from mise 2026.10.3 and shares the same minimum
-version contract.
+The completion is vendored from mise 2026.10.3 and shares the same
+`__complete_word__` capability contract.
 
 ## Activation
 
