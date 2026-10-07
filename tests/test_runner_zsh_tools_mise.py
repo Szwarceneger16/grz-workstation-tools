@@ -374,7 +374,8 @@ class MiseCompletionTests(unittest.TestCase):
                 'compadd() { return 0; }; '
                 '_files() { return 0; }; '
                 '_command_names() { return 0; }; '
-                'source "$1"; '
+                'fpath=("$1" $fpath); '
+                'autoload -Uz _mise; '
                 'typeset -g __GRZ_MISE_BIN="$2"; '
                 'setopt KSH_ARRAYS; '
                 'BUFFER="mise a"; CURSOR=${#BUFFER}; words=(mise a); CURRENT=2; '
@@ -383,7 +384,7 @@ class MiseCompletionTests(unittest.TestCase):
                 'exit $status'
             )
             result = subprocess.run(
-                ["zsh", "-dfc", script, "zsh", str(MISE_COMPLETION), str(selected)],
+                ["zsh", "-dfc", script, "zsh", str(MISE_COMPLETION.parent), str(selected)],
                 env=env,
                 capture_output=True,
                 text=True,
@@ -451,6 +452,7 @@ class HardCutoverTests(unittest.TestCase):
         self.assertNotIn(" --version", VERIFY_HOOK.read_text())
         completion = MISE_COMPLETION.read_text()
         self.assertIn("_mise() {\n    emulate -L zsh", completion)
+        self.assertIn("__grz_mise_dispatch() {\n    emulate -L zsh", completion)
         self.assertIn("__GRZ_MISE_BIN", completion)
         self.assertNotIn("command 'mise' __complete_word__", completion)
 
