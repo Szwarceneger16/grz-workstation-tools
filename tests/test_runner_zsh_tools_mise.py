@@ -33,6 +33,33 @@ def source_profile(home, path, **extra):
 
 
 class MiseProfileTests(unittest.TestCase):
+    def test_profile_preserves_caller_mise_variables(self):
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp) / "home"
+            shims = home / ".local/share/mise/shims"
+            shims.mkdir(parents=True)
+            env = {
+                "HOME": str(home),
+                "PATH": "/usr/bin:/bin",
+                "mise_shims": "caller-shims",
+                "mise_data_dir": "caller-data",
+            }
+            result = subprocess.run(
+                [
+                    "sh",
+                    "-c",
+                    '. "$1"; printf "%s\\n%s\\n" "$mise_shims" "$mise_data_dir"',
+                    "sh",
+                    str(PROFILE),
+                ],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.splitlines(), ["caller-shims", "caller-data"])
+
     def test_xdg_data_home_is_used_when_no_mise_overrides_exist(self):
         with tempfile.TemporaryDirectory() as temp:
             home = Path(temp) / "home"

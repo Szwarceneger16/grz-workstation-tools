@@ -38,19 +38,19 @@ fi
 unset VOLTA_HOME _grz_profile_volta_bin
 
 if [ -n "${MISE_SHIMS_DIR:-}" ]; then
-    mise_shims="$MISE_SHIMS_DIR"
+    _grz_profile_mise_shims="$MISE_SHIMS_DIR"
 else
-    mise_data_dir="${MISE_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/mise}"
-    mise_shims="$mise_data_dir/shims"
-    unset mise_data_dir
+    _grz_profile_mise_data_dir="${MISE_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/mise}"
+    _grz_profile_mise_shims="$_grz_profile_mise_data_dir/shims"
+    unset _grz_profile_mise_data_dir
 fi
 
-if [ -d "$mise_shims" ]; then
-    _grz_profile_path_remove "$mise_shims"
-    PATH="$mise_shims${PATH:+:$PATH}"
+if [ -d "$_grz_profile_mise_shims" ]; then
+    _grz_profile_path_remove "$_grz_profile_mise_shims"
+    PATH="$_grz_profile_mise_shims${PATH:+:$PATH}"
 fi
 
-unset mise_shims
+unset _grz_profile_mise_shims
 
 # pnpm global package executables are independent of the pnpm CLI provider.
 # Remove inherited copies first, then append exactly one lowest-priority entry.
