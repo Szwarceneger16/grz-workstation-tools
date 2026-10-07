@@ -11,3 +11,9 @@ Mise PATH/activation regressions are stored in `tests/test_runner_zsh_tools_mise
 CI discovers them through the repository `test_runner_*.py` pattern, while
 `packages/zsh-tools/tests/mise-regression.sh` exposes the same suite through
 `./run.sh test zsh-tools`.
+
+Squash-aware branch cleanup and linked-worktree preservation are tested in
+`tests/test_runner_branchclear.py`. The tests run entirely in disposable Git
+repositories with a stubbed GitHub CLI; CI discovers them alongside other
+`test_runner_*.py` suites. Use `python3 -m unittest tests/test_runner_branchclear.py -v`
+from the repository root with Zsh available, or run the normal CI suite.
