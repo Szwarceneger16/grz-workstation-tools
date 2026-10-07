@@ -117,7 +117,12 @@ Repository/static validation:
 ```sh
 ./scripts/check-repo
 ./run.sh verify zsh-tools
+./run.sh test zsh-tools
 ```
+
+The package test command executes the mise regression suite through
+`packages/zsh-tools/tests/mise-regression.sh`. CI also discovers the same
+Python suite directly as `tests/test_runner_zsh_tools_mise.py`.
 
 Runtime validation in a fresh Zsh:
 
