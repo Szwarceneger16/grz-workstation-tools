@@ -96,9 +96,10 @@ packages/zsh-tools/install/.zsh_scripts/completion/functions/_mise
 ```
 
 The completion is vendored from mise 2026.10.3 and shares the same
-`__complete_word__` capability contract. Its `_mise` function starts with
-`emulate -L zsh` so caller options such as `KSH_ARRAYS` cannot alter generated
-array semantics, and it invokes `__GRZ_MISE_BIN` so completion and activation
+`__complete_word__` capability contract. Both its autoload dispatcher and the
+`_mise` function use local Zsh emulation so caller options such as
+`KSH_ARRAYS` cannot alter dispatcher stack indexing or generated array
+semantics. The completion invokes `__GRZ_MISE_BIN`, so completion and activation
 use the same validated executable.
 
 ## Activation
