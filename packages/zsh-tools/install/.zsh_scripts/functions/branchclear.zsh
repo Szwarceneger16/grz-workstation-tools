@@ -68,12 +68,12 @@ _branchclear_merged_pr_number() {
 
 _branchclear_worktree_for() {
   emulate -L zsh
-  local branch="$1" line path=''
+  local branch="$1" line worktree_path=''
   while IFS= read -r line; do
     case "$line" in
-      'worktree '*) path="${line#worktree }" ;;
+      'worktree '*) worktree_path="${line#worktree }" ;;
       'branch '*) [[ "${line#branch }" == "refs/heads/$branch" ]] && {
-        print -r -- "$path"
+        print -r -- "$worktree_path"
         return 0
       } ;;
     esac
