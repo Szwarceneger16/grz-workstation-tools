@@ -240,9 +240,10 @@ class MiseInteractiveTests(unittest.TestCase):
             "#!/bin/sh\n"
             f"version='{version}'\n"
             "[ \"${MISE_SELF_UPDATE_AVAILABLE:-}\" = false ] || exit 93\n"
-            "case \"$1\" in\n"
-            "  --version) printf '%s linux-x64\\n' \"$version\" ;;\n"
-            "  activate) [ \"$2\" = zsh ] || exit 91; printf '%s\\n' 'export GRZ_FAKE_MISE_ACTIVATED=1' ;;\n"
+            "case \"$1:$2\" in\n"
+            "  help:__complete_word__) [ \"$version\" = 2026.10.3 ] || exit 98 ;;\n"
+            "  activate:zsh) printf '%s\\n' 'export GRZ_FAKE_MISE_ACTIVATED=1' ;;\n"
+            "  --version:*) exit 99 ;;\n"
             "  *) exit 92 ;;\n"
             "esac\n"
         )
@@ -301,11 +302,11 @@ class MiseInteractiveTests(unittest.TestCase):
         result = self.run_rc("2026.4.28")
         self.assertEqual(result.returncode, 0)
         self.assertEqual(result.stdout.strip(), "0")
-        self.assertIn("mise >= 2026.10.3 required", result.stderr)
+        self.assertIn("mise with __complete_word__ support is required", result.stderr)
 
 
 class MiseVerifyHookTests(unittest.TestCase):
-    def test_verify_version_probe_disables_self_update_network_check(self):
+    def test_verify_checks_required_completion_capability_without_version_probe(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             repo = root / "repo"
@@ -323,8 +324,9 @@ class MiseVerifyHookTests(unittest.TestCase):
             mise.write_text(
                 "#!/bin/sh\n"
                 '[ "${MISE_SELF_UPDATE_AVAILABLE:-}" = false ] || exit 93\n'
-                '[ "$1" = --version ] || exit 94\n'
-                "printf '%s\\n' '2026.10.3 linux-x64'\n"
+                '[ "$1" = help ] || exit 94\n'
+                '[ "$2" = __complete_word__ ] || exit 95\n'
+                "exit 0\n"
             )
             mise.chmod(0o755)
 
@@ -343,7 +345,7 @@ class MiseVerifyHookTests(unittest.TestCase):
                 timeout=10,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("mise 2026.10.3 satisfies", result.stdout)
+            self.assertIn("mise completion capability satisfies", result.stdout)
 
 
 class HardCutoverTests(unittest.TestCase):
@@ -356,6 +358,8 @@ class HardCutoverTests(unittest.TestCase):
         self.assertNotIn("corepack which pnpm", combined)
         self.assertIn("unset VOLTA_HOME", combined)
         self.assertIn("unset __MISE_ORIG_PATH", RC.read_text())
+        self.assertNotIn(" --version", RC.read_text())
+        self.assertNotIn(" --version", VERIFY_HOOK.read_text())
 
     def test_pnpm_home_is_preserved_as_independent_pnpm_infrastructure(self):
         profile = PROFILE.read_text()
