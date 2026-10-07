@@ -86,7 +86,7 @@ branchclear() {
   local mode='safe' base_ref='' base_branch='' github_repo=''
   local current_branch branch tracking_status upstream_remote branch_ref branch_oid base_tree
   local merge_base_oid merged_tree_oid merge_rc reason note pr_number
-  local worktree_dir worktree_status observed_oid
+  local worktree_dir worktree_status observed_oid inside_worktree
 
   if (( $# > 1 )); then
     print -u2 -- 'Usage: branchclear [--force|--help]'
@@ -99,10 +99,11 @@ branchclear() {
     *) print -u2 -- 'Usage: branchclear [--force|--help]'; return 2 ;;
   esac
 
-  git rev-parse --is-inside-work-tree >/dev/null 2>&1 || {
+  inside_worktree=$(git rev-parse --is-inside-work-tree 2>/dev/null) || inside_worktree=''
+  if [[ "$inside_worktree" != 'true' ]]; then
     print -u2 -- 'branchclear: not inside a Git working tree.'
     return 1
-  }
+  fi
   git fetch --prune origin || return 1
 
   current_branch=$(git symbolic-ref --quiet --short HEAD 2>/dev/null) || current_branch=''
