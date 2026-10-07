@@ -135,6 +135,15 @@ class BranchclearTests(unittest.TestCase):
         self.assertIn("verified merged GitHub PR #76", self.invoke())
         self.assertFalse(self.exists(branch))
 
+    def test_fetches_pr_head_if_local_object_was_pruned(self):
+        branch, _, head, _ = self.squash("codex/head-fetched-from-pr")
+        self.git("reflog", "expire", "--expire=now", "--all")
+        self.git("gc", "--prune=now")
+        missing = self.git("cat-file", "-e", f"{head}^{{commit}}", check=False)
+        self.assertNotEqual(missing.returncode, 0, "Fixture must lack PR head")
+        self.assertIn("verified merged GitHub PR #76", self.invoke())
+        self.assertFalse(self.exists(branch))
+
     def test_local_extra_commit_is_retained(self):
         branch, *_ = self.squash()
         self.git("switch", "-q", branch)
