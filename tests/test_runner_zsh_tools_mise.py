@@ -11,6 +11,7 @@ PROFILE = ROOT / "packages/zsh-tools/install/.config/profile.d/68-grz-workstatio
 RC = ROOT / "packages/zsh-tools/install/.config/zsh/rc.d/68-grz-workstation-tools-mise.zsh"
 FINALIZER = ROOT / "packages/zsh-tools/install/.zsh_scripts/core/99-path-finalize.zsh"
 PNPM_COMPLETION = ROOT / "packages/zsh-tools/install/.zsh_scripts/completion/functions/_pnpm"
+MISE_COMPLETION = ROOT / "packages/zsh-tools/install/.zsh_scripts/completion/functions/_mise"
 VERIFY_HOOK = ROOT / "packages/zsh-tools/verify.hook.sh"
 
 
@@ -248,6 +249,7 @@ class MiseInteractiveTests(unittest.TestCase):
             "esac\n"
         )
         binary.chmod(0o755)
+        return binary
 
     def run_rc(self, version):
         with tempfile.TemporaryDirectory() as temp:
@@ -293,6 +295,36 @@ class MiseInteractiveTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout.splitlines(), ["1", "caller-value"])
 
+    def test_validated_binary_is_retained_for_completion(self):
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp) / "home"
+            selected = self.fake_mise(home, "2026.10.3")
+            competing_dir = Path(temp) / "competing"
+            competing_dir.mkdir()
+            competing = competing_dir / "mise"
+            competing.write_text("#!/bin/sh\nexit 97\n")
+            competing.chmod(0o755)
+
+            env = {
+                "HOME": str(home),
+                "PATH": os.pathsep.join((str(competing_dir), "/usr/bin", "/bin")),
+            }
+            result = subprocess.run(
+                [
+                    "zsh",
+                    "-dfc",
+                    'source "$1"; print -r -- "${__GRZ_MISE_BIN:-unset}"',
+                    "zsh",
+                    str(RC),
+                ],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), str(selected))
+
     def test_supported_mise_is_activated(self):
         result = self.run_rc("2026.10.3")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -303,6 +335,63 @@ class MiseInteractiveTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         self.assertEqual(result.stdout.strip(), "0")
         self.assertIn("mise with __complete_word__ support is required", result.stderr)
+
+
+@unittest.skipUnless(shutil.which("zsh"), "requires zsh")
+class MiseCompletionTests(unittest.TestCase):
+    def test_completion_isolates_zsh_options_and_uses_validated_binary(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            selected_marker = root / "selected"
+            competing_marker = root / "competing"
+
+            selected = root / "selected-mise"
+            selected.write_text(
+                "#!/bin/sh\n"
+                'touch "$SELECTED_MARKER"\n'
+                '[ "$1" = __complete_word__ ] || exit 91\n'
+                "printf 'alpha\\tdescription\\talpha\\n'\n"
+            )
+            selected.chmod(0o755)
+
+            competing_dir = root / "bin"
+            competing_dir.mkdir()
+            competing = competing_dir / "mise"
+            competing.write_text(
+                "#!/bin/sh\n"
+                'touch "$COMPETING_MARKER"\n'
+                "exit 92\n"
+            )
+            competing.chmod(0o755)
+
+            env = {
+                "PATH": os.pathsep.join((str(competing_dir), "/usr/bin", "/bin")),
+                "SELECTED_MARKER": str(selected_marker),
+                "COMPETING_MARKER": str(competing_marker),
+            }
+            script = (
+                'compdef() { :; }; '
+                'compadd() { return 0; }; '
+                '_files() { return 0; }; '
+                '_command_names() { return 0; }; '
+                'source "$1"; '
+                'typeset -g __GRZ_MISE_BIN="$2"; '
+                'setopt KSH_ARRAYS; '
+                'BUFFER="mise a"; CURSOR=${#BUFFER}; words=(mise a); CURRENT=2; '
+                '_mise; status=$?; '
+                '[[ -o KSH_ARRAYS ]] || exit 98; '
+                'exit $status'
+            )
+            result = subprocess.run(
+                ["zsh", "-dfc", script, "zsh", str(MISE_COMPLETION), str(selected)],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(selected_marker.exists())
+            self.assertFalse(competing_marker.exists())
 
 
 class MiseVerifyHookTests(unittest.TestCase):
@@ -360,6 +449,10 @@ class HardCutoverTests(unittest.TestCase):
         self.assertIn("unset __MISE_ORIG_PATH", RC.read_text())
         self.assertNotIn(" --version", RC.read_text())
         self.assertNotIn(" --version", VERIFY_HOOK.read_text())
+        completion = MISE_COMPLETION.read_text()
+        self.assertIn("_mise() {\n    emulate -L zsh", completion)
+        self.assertIn("__GRZ_MISE_BIN", completion)
+        self.assertNotIn("command 'mise' __complete_word__", completion)
 
     def test_pnpm_home_is_preserved_as_independent_pnpm_infrastructure(self):
         profile = PROFILE.read_text()
