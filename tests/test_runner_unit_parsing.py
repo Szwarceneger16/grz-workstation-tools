@@ -111,12 +111,24 @@ class UnitParserPolicyTests(unittest.TestCase):
                      '[Socket]\nAccept=yes\\\n', '[Socket]\nService=demo.service\\\n',
                      '[Socket]\nAccept=yes # not a whole-line comment\n',
                      '[Socket]\nAccept=yes; not a whole-line comment\n',
-                     '[Socket]\nAccept=garbage\n'):
+                     '[Socket]\nAccept=garbage\n',
+                     '[Socket]\nAccept=yes trailing text\n',
+                     '[Socket]\nAccept=garbage on\n',
+                     '[Socket]\nAccept=no # reset value is not a comment\n'):
             with self.subTest(text=text):
                 self.setUp()
                 self.units({'demo.socket': text, 'demo.service': '[Service]\n'},
                            'demo.socket\ndemo.service\n')
                 self.invalid_both()
+
+    def test_empty_accept_reset_still_selects_the_nonaccepting_service(self):
+        for value in ('', '   ', '\t'):
+            with self.subTest(value=value):
+                self.setUp()
+                self.units({'demo.socket': f'[Socket]\nAccept={value}\n',
+                            'demo.service': '[Service]\n'},
+                           'demo.socket\ndemo.service\n')
+                self.valid_both()
 
     def test_reopened_sections_comments_and_single_bom_preserve_valid_contract(self):
         for bom in ('', '\ufeff'):
