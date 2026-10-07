@@ -42,6 +42,20 @@ class ZshCompletionPackageTests(unittest.TestCase):
                                         ("profile.snippet.sh", ".profile")):
                 (target / destination).write_bytes((ROOT / "bootstrap" / source).read_bytes())
 
+            # Package verification runs before package tests. Provide the exact
+            # local mise capability required by zsh-tools without bypassing
+            # verification or touching the real user environment.
+            fake_mise = target / ".local/bin/mise"
+            fake_mise.parent.mkdir(parents=True, exist_ok=True)
+            fake_mise.write_text(
+                "#!/bin/sh\n"
+                '[ "${MISE_SELF_UPDATE_AVAILABLE:-}" = false ] || exit 93\n'
+                '[ "$1" = help ] || exit 94\n'
+                '[ "$2" = __complete_word__ ] || exit 95\n'
+                "exit 0\n"
+            )
+            fake_mise.chmod(0o755)
+
             env = os.environ.copy()
             env.update(HOME=str(home), STOW_TARGET=str(target),
                        GRZ_STOW_TARGET=str(target), TMPDIR=str(temp))
