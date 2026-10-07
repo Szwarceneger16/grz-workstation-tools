@@ -97,8 +97,19 @@ _mise() {
 # Installed either way. Dropped in `$fpath` as `_mise`, compinit autoloads the file and calls
 # the function named after it — which is why the function is `_mise` and not something tidier.
 # Sourced from a config instead, nothing has called it yet, so it registers itself.
-if [ "$funcstack[1]" = "_mise" ]; then
-    _mise "$@"
-else
-    compdef _mise 'mise'
-fi
+#
+# The dispatcher also needs local Zsh emulation: it executes before _mise() on
+# the autoload path, so caller options such as KSH_ARRAYS must not affect
+# funcstack indexing here either.
+__grz_mise_dispatch() {
+    emulate -L zsh
+
+    if [[ "${funcstack[2]:-}" == "_mise" ]]; then
+        _mise "$@"
+    else
+        compdef _mise 'mise'
+    fi
+}
+
+__grz_mise_dispatch "$@"
+unfunction __grz_mise_dispatch
