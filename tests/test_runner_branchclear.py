@@ -115,7 +115,7 @@ class BranchclearTests(unittest.TestCase):
         self.git("push", "-q", "origin", "main")
         self.git("branch", "-f", branch, old)
         self.git("push", "-q", "origin", "--delete", branch)
-        self.env["GH_TEST_ROWS"] = f"76|{head}|{REPO}|main|{branch}|{merged}"
+        self.env["GH_TEST_ROWS"] = f"76\t{head}\t{REPO}\tmain\t{branch}\t{merged}"
         return branch, old, head, merged
 
     def test_stale_local_tip_is_deleted_after_verified_squash(self):
@@ -127,6 +127,11 @@ class BranchclearTests(unittest.TestCase):
             "origin/main", branch, check=False,
         )
         self.assertEqual(conflict.returncode, 1)
+        self.assertIn("verified merged GitHub PR #76", self.invoke())
+        self.assertFalse(self.exists(branch))
+
+    def test_pipe_is_valid_inside_deleted_branch_name(self):
+        branch, *_ = self.squash("codex/pipe|name")
         self.assertIn("verified merged GitHub PR #76", self.invoke())
         self.assertFalse(self.exists(branch))
 
@@ -146,7 +151,7 @@ class BranchclearTests(unittest.TestCase):
         self.env["GH_TEST_ROWS"] = valid.replace(REPO, "attacker/fork")
         self.invoke()
         self.assertTrue(self.exists(branch))
-        self.env["GH_TEST_ROWS"] = f"76|{head}|{REPO}|main|{branch}|{head}"
+        self.env["GH_TEST_ROWS"] = f"76\t{head}\t{REPO}\tmain\t{branch}\t{head}"
         self.invoke()
         self.assertTrue(self.exists(branch))
         self.env["GH_TEST_ROWS"] = valid
