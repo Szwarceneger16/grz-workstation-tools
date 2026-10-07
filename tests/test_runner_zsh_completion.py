@@ -21,6 +21,16 @@ class ZshCompletionPackageTests(unittest.TestCase):
                                             text=True, capture_output=True, timeout=10)
                     self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_reload_help_isolates_caller_array_options_and_preserves_failure(self):
+        reload_file = ROOT / "packages/zsh-tools/install/.zsh_scripts/functions/zshreloadcomp.zsh"
+        result = subprocess.run(
+            ["zsh", "-dfc", 'source "$1"; cmdhelp() { print -r -- "$1"; return 23; }; '
+             'setopt KSH_ARRAYS SH_WORD_SPLIT; zshreloadcomp --help; reload_rc=$?; '
+             '[[ -o KSH_ARRAYS && -o SH_WORD_SPLIT ]] || exit 99; exit $reload_rc',
+             "zsh", str(reload_file)], text=True, capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 23, result.stderr)
+        self.assertEqual(result.stdout.strip(), "zshreloadcomp")
+
     def test_runner_discovers_and_executes_completion_regressions(self):
         with tempfile.TemporaryDirectory() as directory:
             sandbox = Path(directory)

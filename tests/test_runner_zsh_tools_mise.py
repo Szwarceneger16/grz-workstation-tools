@@ -344,6 +344,7 @@ class MiseCompletionTests(unittest.TestCase):
             root = Path(temp)
             selected_marker = root / "selected"
             competing_marker = root / "competing"
+            candidates_marker = root / "candidates"
 
             selected = root / "selected-mise"
             selected.write_text(
@@ -368,10 +369,11 @@ class MiseCompletionTests(unittest.TestCase):
                 "PATH": os.pathsep.join((str(competing_dir), "/usr/bin", "/bin")),
                 "SELECTED_MARKER": str(selected_marker),
                 "COMPETING_MARKER": str(competing_marker),
+                "CANDIDATES_MARKER": str(candidates_marker),
             }
             script = (
                 'compdef() { :; }; '
-                'compadd() { return 0; }; '
+                'compadd() { print -rl -- "${inserts[@]}" > "$CANDIDATES_MARKER"; return 0; }; '
                 '_files() { return 0; }; '
                 '_command_names() { return 0; }; '
                 'fpath=("$1" $fpath); '
@@ -379,9 +381,9 @@ class MiseCompletionTests(unittest.TestCase):
                 'typeset -g __GRZ_MISE_BIN="$2"; '
                 'setopt KSH_ARRAYS; '
                 'BUFFER="mise a"; CURSOR=${#BUFFER}; words=(mise a); CURRENT=2; '
-                '_mise; status=$?; '
+                '_mise; completion_rc=$?; '
                 '[[ -o KSH_ARRAYS ]] || exit 98; '
-                'exit $status'
+                'exit $completion_rc'
             )
             result = subprocess.run(
                 ["zsh", "-dfc", script, "zsh", str(MISE_COMPLETION.parent), str(selected)],
@@ -393,6 +395,17 @@ class MiseCompletionTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertTrue(selected_marker.exists())
             self.assertFalse(competing_marker.exists())
+            self.assertEqual(candidates_marker.read_text(), "alpha\n")
+
+    def test_autoload_completion_retains_failure_and_removes_dispatcher(self):
+        result = subprocess.run(
+            ["zsh", "-dfc", 'fpath=("$1" $fpath); autoload -Uz _mise; '
+             'setopt KSH_ARRAYS; _mise; completion_rc=$?; '
+             '[[ -o KSH_ARRAYS ]] || exit 98; '
+             '[[ ${+functions[__grz_mise_dispatch]} == 0 ]] || exit 99; '
+             'exit $completion_rc', "zsh", str(MISE_COMPLETION.parent)],
+            env={"PATH": "/usr/bin:/bin"}, text=True, capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 1, result.stderr)
 
 
 class MiseVerifyHookTests(unittest.TestCase):
@@ -438,6 +451,199 @@ class MiseVerifyHookTests(unittest.TestCase):
             self.assertIn("mise completion capability satisfies", result.stdout)
 
 
+
+class MisePathSpellingTests(unittest.TestCase):
+    def test_profile_and_finalizer_share_managed_path_identity_policy(self):
+        shells = [("sh", PROFILE), ("bash", PROFILE)]
+        if shutil.which("zsh"):
+            shells.extend((("zsh", PROFILE), ("zsh", FINALIZER)))
+        for shell, fragment in shells:
+            for suffix in ("/", "///", "/./", "/.//"):
+                with self.subTest(shell=shell, fragment=fragment.name, suffix=suffix):
+                    with tempfile.TemporaryDirectory() as temp:
+                        home = Path(temp) / "home"
+                        volta = Path(temp) / "custom volta[*]"
+                        pnpm = Path(temp) / "pnpm global"
+                        shims = Path(temp) / "mise shims"
+                        # Leave managed directories absent: identity must not depend on stat.
+                        initial = ":".join((str(volta) + "/bin/", "/usr/bin",
+                                            str(home) + "/.volta//bin/./",
+                                            str(pnpm) + "/", str(pnpm) + "//bin/",
+                                            "/bin", str(pnpm) + "/bin"))
+                        env = {"HOME": str(home), "PATH": initial,
+                               "VOLTA_HOME": str(volta) + suffix,
+                               "PNPM_HOME": str(pnpm) + suffix,
+                               "MISE_SHIMS_DIR": str(shims) + suffix}
+                        flags = "-dfc" if shell == "zsh" else "-c"
+                        script = ('. "$1"; . "$1"; '
+                                  'printf "%s\\n%s\\n%s\\n" "$PATH" "$PNPM_HOME" "${VOLTA_HOME-unset}"')
+                        result = subprocess.run([shell, flags, script, shell, str(fragment)],
+                                                env=env, text=True, capture_output=True, timeout=10)
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        path, pnpm_home, volta_home = result.stdout.splitlines()
+                        expected = ["/usr/bin", "/bin", str(pnpm / "bin")]
+                        if fragment == PROFILE:
+                            expected.insert(0, str(shims))
+                        self.assertEqual(path.split(":"), expected)
+                        self.assertEqual(pnpm_home, str(pnpm) + suffix)
+                        self.assertEqual(volta_home, "unset")
+
+    def test_shims_created_after_profile_are_immediately_reachable(self):
+        for override in ("default", "XDG_DATA_HOME", "MISE_DATA_DIR", "MISE_SHIMS_DIR"):
+            with self.subTest(override=override), tempfile.TemporaryDirectory() as temp:
+                home = Path(temp) / "home"
+                base = Path(temp) / "data"
+                env = {"HOME": str(home), "PATH": "/usr/bin:/bin"}
+                if override == "default":
+                    shims = home / ".local/share/mise/shims"
+                else:
+                    env[override] = str(base) + "///"
+                    shims = {"XDG_DATA_HOME": base / "mise/shims",
+                             "MISE_DATA_DIR": base / "shims",
+                             "MISE_SHIMS_DIR": base}[override]
+                result = subprocess.run(
+                    ["sh", "-c", '. "$1"; mkdir -p "$2"; '
+                     'printf "#!/bin/sh\\nprintf reachable" > "$2/node"; '
+                     'chmod +x "$2/node"; node', "sh", str(PROFILE), str(shims)],
+                    env=env, text=True, capture_output=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, "reachable")
+
+    def test_profile_retains_unmanaged_empty_entries_spelling_and_caller_state(self):
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp) / "home"
+            result = subprocess.run(
+                ["sh", "-c", 'IFS=,; . "$1"; . "$1"; '
+                 'printf "%s\\n%s\\n" "$PATH" "$IFS"', "sh", str(PROFILE)],
+                env={"HOME": str(home), "PATH": ":/usr//bin::/bin:"},
+                text=True, capture_output=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.splitlines(),
+                             [f"{home}/.local/share/mise/shims::/usr//bin::/bin::{home}/.local/share/pnpm/bin", ","])
+
+
+@unittest.skipUnless(shutil.which("zsh"), "requires zsh")
+class MiseStartupFailureTests(unittest.TestCase):
+    def test_activation_failure_preserves_status_and_never_evaluates_partial_output(self):
+        for phase in ("generation", "evaluation", "capability"):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as temp:
+                home = Path(temp) / "home"
+                binary = home / ".local/bin/mise"
+                binary.parent.mkdir(parents=True)
+                binary.write_text(
+                    "#!/bin/sh\n"
+                    '[ "$MISE_SELF_UPDATE_AVAILABLE" = false ] || exit 93\n'
+                    '[ "$MISE_DISABLE_UPDATE_WARNING" = true ] || exit 94\n'
+                    'case "$1:$2" in\n'
+                    f'help:__complete_word__) exit {17 if phase == "capability" else 0} ;;\n'
+                    'activate:zsh)\n'
+                    + ("printf '%s\\n' 'export PARTIAL_ACTIVATION=1'; exit 42\n"
+                       if phase == "generation" else "printf '%s\\n' '(exit 43)'\n")
+                    + ";;\nesac\n")
+                binary.chmod(0o755)
+                script = ('typeset -gx __GRZ_MISE_BIN=stale; '
+                          'source "$1"; activation_rc=$?; '
+                          'print -r -- "$activation_rc:${__GRZ_MISE_BIN-unset}:${PARTIAL_ACTIVATION-unset}"')
+                result = subprocess.run(["zsh", "-dfc", script, "zsh", str(RC)],
+                                        env={"HOME": str(home), "PATH": "/usr/bin:/bin"},
+                                        text=True, capture_output=True, timeout=10)
+                expected_rc = {"generation": 42, "evaluation": 43, "capability": 1}[phase]
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), f"{expected_rc}:unset:unset")
+                self.assertIn("grz-workstation-tools: mise", result.stderr)
+
+    def test_successful_activation_survives_option_isolation_and_resourcing(self):
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp) / "home"
+            binary = home / ".local/bin/mise"
+            binary.parent.mkdir(parents=True)
+            binary.write_text(
+                "#!/bin/sh\n"
+                '[ "$MISE_SELF_UPDATE_AVAILABLE" = false ] || exit 93\n'
+                '[ "$MISE_DISABLE_UPDATE_WARNING" = true ] || exit 94\n'
+                'case "$1:$2" in\n'
+                'help:__complete_word__) exit 0 ;;\n'
+                'activate:zsh) [ -z "${__MISE_ORIG_PATH:-}" ] || exit 95\n'
+                "printf '%s\\n' 'export __MISE_ORIG_PATH=clean' 'mise() { print -r -- activated; }' "
+                "'autoload -Uz add-zsh-hook' '_mise_hook_precmd() { :; }' "
+                "'add-zsh-hook precmd _mise_hook_precmd' ;;\nesac\n")
+            binary.chmod(0o755)
+            script = ('setopt KSH_ARRAYS SH_WORD_SPLIT NO_UNSET; '
+                      'export __MISE_ORIG_PATH=pre-migration; '
+                      'source "$1" || exit $?; source "$1" || exit $?; '
+                      '[[ -o KSH_ARRAYS && -o SH_WORD_SPLIT && -o NO_UNSET ]] || exit 96; '
+                      'mise; print -r -- "$__GRZ_MISE_BIN"; '
+                      '[[ ${precmd_functions[*]} == _mise_hook_precmd ]] || exit 97; '
+                      '[[ ${(t)__GRZ_MISE_BIN} != *export* ]] || exit 98')
+            result = subprocess.run(["zsh", "-dfc", script, "zsh", str(RC)],
+                                    env={"HOME": str(home), "PATH": "/usr/bin:/bin"},
+                                    text=True, capture_output=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.splitlines(), ["activated", str(binary)])
+
+    def test_finalizer_retains_caller_options_and_temporaries(self):
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp) / "home"
+            (home / ".local/bin").mkdir(parents=True)
+            (home / ".local/my-custom-bin").mkdir()
+            script = ('setopt KSH_ARRAYS SH_WORD_SPLIT NO_UNSET; '
+                      '__grz_path_seen=caller; REPLY=caller-reply; '
+                      'source "$1" || exit $?; source "$1" || exit $?; '
+                      '[[ -o KSH_ARRAYS && -o SH_WORD_SPLIT && -o NO_UNSET ]] || exit 96; '
+                      'print -r -- "$PATH"; print -r -- "$__grz_path_seen:$REPLY"')
+            result = subprocess.run(["zsh", "-dfc", script, "zsh", str(FINALIZER)],
+                                    env={"HOME": str(home), "PATH": "/usr/bin:/bin:/usr/bin"},
+                                    text=True, capture_output=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.splitlines(),
+                             [f"{home}/.local/my-custom-bin:{home}/.local/bin:/usr/bin:/bin:{home}/.local/share/pnpm/bin",
+                              "caller:caller-reply"])
+
+
+class MiseTargetVerificationTests(unittest.TestCase):
+    def test_verification_uses_target_home_and_rejects_caller_private_mise(self):
+        for source in ("target", "target-custom", "caller", "symlink-to-caller", "directory", "unsupported"):
+            with self.subTest(source=source), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                repo = root / "repo"
+                target = root / "target"
+                caller = root / "caller"
+                for directory in (repo / "scripts", target / ".local/bin", caller / ".local/bin"):
+                    directory.mkdir(parents=True)
+                ensure = repo / "scripts/ensure-rcd-loaders"
+                ensure.write_text("#!/bin/sh\nexit 0\n")
+                ensure.chmod(0o755)
+                marker = root / "invoked"
+                fake = ('#!/bin/sh\nprintf "%s" "$HOME" > "$MARKER"\n'
+                        '[ "$MISE_DISABLE_UPDATE_WARNING" = true ] || exit 94\n'
+                        '[ "$MISE_SELF_UPDATE_AVAILABLE" = false ] || exit 93\n'
+                        '[ "$1:$2" = help:__complete_word__ ] || exit 95\n'
+                        + ('exit 96\n' if source == "unsupported" else 'exit 0\n'))
+                binary = caller / ".local/bin/mise" if source in ("caller", "symlink-to-caller") else target / ".local/bin/mise"
+                if source == "target-custom":
+                    binary = target / ".local/my-custom-bin/mise"
+                    binary.parent.mkdir()
+                if source == "directory":
+                    binary.mkdir()
+                else:
+                    binary.write_text(fake)
+                    binary.chmod(0o755)
+                if source == "symlink-to-caller":
+                    (target / ".local/bin/mise").symlink_to(binary)
+                env = {"HOME": str(caller), "STOW_TARGET": str(target), "GRZ_REPO_ROOT": str(repo),
+                       "PATH": f"{caller}/.local/bin:/usr/bin:/bin", "MARKER": str(marker)}
+                result = subprocess.run(["bash", str(VERIFY_HOOK)], env=env,
+                                        text=True, capture_output=True, timeout=10)
+                if source in ("target", "target-custom"):
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertEqual(marker.read_text(), str(target))
+                else:
+                    self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                    if source != "unsupported":
+                        self.assertFalse(marker.exists(), result.stdout + result.stderr)
+                    self.assertIn("not ok - mise", result.stderr)
+
+
 class HardCutoverTests(unittest.TestCase):
     def test_active_runtime_does_not_export_volta_or_restore_corepack_pnpm_selection(self):
         combined = "\n".join(
@@ -451,8 +657,8 @@ class HardCutoverTests(unittest.TestCase):
         self.assertNotIn(" --version", RC.read_text())
         self.assertNotIn(" --version", VERIFY_HOOK.read_text())
         completion = MISE_COMPLETION.read_text()
-        self.assertIn("_mise() {\n    emulate -L zsh", completion)
-        self.assertIn("__grz_mise_dispatch() {\n    emulate -L zsh", completion)
+        self.assertIn("_mise() {\n    builtin emulate -L 'zsh'", completion)
+        self.assertIn("__grz_mise_dispatch() {\n    builtin emulate -L 'zsh'", completion)
         self.assertIn("__GRZ_MISE_BIN", completion)
         self.assertNotIn("command 'mise' __complete_word__", completion)
 

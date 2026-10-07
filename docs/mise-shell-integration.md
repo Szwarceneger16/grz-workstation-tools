@@ -38,12 +38,17 @@ The fragment runs after the public PATH finalizer. It resolves mise from
 `~/.local/bin/mise` first, otherwise from `PATH`. Startup deliberately avoids
 `mise --version`, because version output may trigger update-notice availability
 checks. Instead it validates the local `help __complete_word__` capability
-required by the vendored completion. The validated executable path is retained
+required by the vendored completion. After activation succeeds, the validated
+executable path is retained
 in the non-exported internal Zsh variable `__GRZ_MISE_BIN`; completion uses
 that exact path instead of resolving `mise` again from `PATH`. Both the
 capability probe and `mise activate zsh` use command-scoped
-`MISE_SELF_UPDATE_AVAILABLE=false`, so the caller's environment is not
-overwritten. Before activation the fragment clears an inherited
+`MISE_SELF_UPDATE_AVAILABLE=false` and `MISE_DISABLE_UPDATE_WARNING=true`,
+so the caller's environment is not overwritten. Generation failures return their
+nonzero status without evaluating any partial output; evaluation failures also
+return nonzero and leave no completion binding. The fragment uses local Zsh
+emulation and local temporaries to preserve caller options and shell state.
+Before activation the fragment clears an inherited
 `__MISE_ORIG_PATH`, preventing a nested shell from restoring a pre-migration
 Volta PATH. Unsupported mise releases are diagnosed and not activated; no
 legacy tool-manager fallback is attempted.
@@ -72,7 +77,9 @@ interactive Zsh activation. Shim path resolution follows this precedence:
 Before adding mise shims, the profile fragment strips both the default
 `$HOME/.volta/bin` and an inherited custom `$VOLTA_HOME/bin`, then clears
 `VOLTA_HOME`. Existing copies of the resolved mise shim directory are removed
-before exactly one copy is prepended.
+before exactly one copy is prepended, even if the directory does not exist yet.
+Tools installed later in the same login session can therefore be found without
+logging in again.
 
 The same profile fragment exports:
 
@@ -80,11 +87,17 @@ The same profile fragment exports:
 PNPM_HOME="${PNPM_HOME:-$HOME/.local/share/pnpm}"
 ```
 
-and normalizes `$PNPM_HOME/bin` to exactly one entry at the end of `PATH`.
+and normalizes `$PNPM_HOME/bin` to exactly one entry at the end of `PATH`,
+removing the obsolete direct `$PNPM_HOME` entry.
 This does not choose the pnpm CLI; mise shims remain higher priority.
 
 For interactive Zsh, `99-path-finalize.zsh` preserves the same contract and
-normalizes `$PNPM_HOME/bin` to a single lowest-priority entry.
+normalizes `$PNPM_HOME/bin` to a single lowest-priority entry. Both fragments
+compare managed paths after removing repeated separators, `/./` components and
+trailing slashes, including directories that do not exist yet. They do not
+collapse `..` or resolve symlinks during startup. Caller-provided `PNPM_HOME`
+keeps its original value; only its PATH entry is normalized. The Zsh finalizer
+isolates array and glob options from the caller.
 
 ### Completion
 
@@ -100,7 +113,8 @@ The completion is vendored from mise 2026.10.3 and shares the same
 `_mise` function use local Zsh emulation so caller options such as
 `KSH_ARRAYS` cannot alter dispatcher stack indexing or generated array
 semantics. The completion invokes `__GRZ_MISE_BIN`, so completion and activation
-use the same validated executable.
+use the same validated executable. Dispatcher cleanup occurs before invoking
+completion, preserving a failed completion's return status.
 
 ## Activation
 
@@ -131,7 +145,18 @@ The package test command executes the mise regression suite through
 Python suite directly as `tests/test_runner_zsh_tools_mise.py`. The suite
 verifies the supported/unsupported `__complete_word__` capability path,
 prevents reintroducing `mise --version` into startup or verification, and
-checks that command-scoped mise settings do not overwrite caller values.
+checks that command-scoped mise settings do not overwrite caller values. It
+also exercises lexical path variants in sh/Bash/Zsh, missing shim directories,
+activation failures, re-sourcing, option isolation, actual completion candidates
+and alternate target homes.
+
+`./run.sh verify zsh-tools` validates mise against the selected `STOW_TARGET`.
+It first checks that target's `.local/bin/mise`. When the target is the current
+HOME, it may fall back to the caller's PATH. For an alternate home, fallback is
+limited to the target's `.local/my-custom-bin` and shared `/usr/local/bin`,
+`/usr/bin`, `/bin` directories; an arbitrary caller PATH is not used. Candidates
+pointing into the caller's private home are rejected unless they reside within
+the selected target. The capability probe runs with the selected target as HOME.
 
 Runtime validation in a fresh Zsh:
 

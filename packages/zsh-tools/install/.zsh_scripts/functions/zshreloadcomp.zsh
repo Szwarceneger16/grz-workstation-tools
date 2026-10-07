@@ -1,4 +1,6 @@
 zshreloadcomp() {
+  builtin emulate -L 'zsh'
+
   if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
     cmdhelp "${funcstack[1]}"
     return $?
@@ -49,8 +51,8 @@ zshreloadcomp() {
     fi
   done
 
-  # Capture invocation modes before any option localization. Explicit -i is
-  # needed for interactive shells whose stdin is a pipe or file.
+  # Local emulation preserves LOGIN/INTERACTIVE. Explicit -i is needed for
+  # interactive shells whose stdin is a pipe or file.
   [[ -o login ]] && shell_flags+=(-l)
   if [[ -o interactive ]]; then
     shell_flags+=(-i)

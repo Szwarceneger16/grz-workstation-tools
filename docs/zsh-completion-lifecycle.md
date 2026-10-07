@@ -209,6 +209,8 @@ deleted functions loaded from digests, basename shadowing and secure duplicate a
 service overrides and owner implementations with/without source paths, explicit
 owner-pinned autoloads, non-file sinks and symlinks in every cleanup path,
 dump-removal failure, and all four LOGIN/INTERACTIVE combinations.
+`zshreloadcomp` also uses local Zsh emulation so caller array options cannot
+change its help dispatch or cleanup behavior; failed help retains its status.
 
 `tests/test_runner_zsh_completion.py` exercises `./run.sh test zsh-tools` against
 a temporary installation fixture. It proves the shell regression is discovered
