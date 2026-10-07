@@ -21,6 +21,16 @@ class ZshCompletionPackageTests(unittest.TestCase):
                                             text=True, capture_output=True, timeout=10)
                     self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_reload_help_isolates_caller_array_options_and_preserves_failure(self):
+        reload_file = ROOT / "packages/zsh-tools/install/.zsh_scripts/functions/zshreloadcomp.zsh"
+        result = subprocess.run(
+            ["zsh", "-dfc", 'source "$1"; cmdhelp() { print -r -- "$1"; return 23; }; '
+             'setopt KSH_ARRAYS SH_WORD_SPLIT; zshreloadcomp --help; reload_rc=$?; '
+             '[[ -o KSH_ARRAYS && -o SH_WORD_SPLIT ]] || exit 99; exit $reload_rc',
+             "zsh", str(reload_file)], text=True, capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 23, result.stderr)
+        self.assertEqual(result.stdout.strip(), "zshreloadcomp")
+
     def test_runner_discovers_and_executes_completion_regressions(self):
         with tempfile.TemporaryDirectory() as directory:
             sandbox = Path(directory)
@@ -41,6 +51,20 @@ class ZshCompletionPackageTests(unittest.TestCase):
             for source, destination in (("zshrc.snippet.zsh", ".zshrc"),
                                         ("profile.snippet.sh", ".profile")):
                 (target / destination).write_bytes((ROOT / "bootstrap" / source).read_bytes())
+
+            # Package verification runs before package tests. Provide the exact
+            # local mise capability required by zsh-tools without bypassing
+            # verification or touching the real user environment.
+            fake_mise = target / ".local/bin/mise"
+            fake_mise.parent.mkdir(parents=True, exist_ok=True)
+            fake_mise.write_text(
+                "#!/bin/sh\n"
+                '[ "${MISE_SELF_UPDATE_AVAILABLE:-}" = false ] || exit 93\n'
+                '[ "$1" = help ] || exit 94\n'
+                '[ "$2" = __complete_word__ ] || exit 95\n'
+                "exit 0\n"
+            )
+            fake_mise.chmod(0o755)
 
             env = os.environ.copy()
             env.update(HOME=str(home), STOW_TARGET=str(target),

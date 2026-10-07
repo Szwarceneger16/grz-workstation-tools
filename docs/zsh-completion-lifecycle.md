@@ -209,6 +209,8 @@ deleted functions loaded from digests, basename shadowing and secure duplicate a
 service overrides and owner implementations with/without source paths, explicit
 owner-pinned autoloads, non-file sinks and symlinks in every cleanup path,
 dump-removal failure, and all four LOGIN/INTERACTIVE combinations.
+`zshreloadcomp` also uses local Zsh emulation so caller array options cannot
+change its help dispatch or cleanup behavior; failed help retains its status.
 
 `tests/test_runner_zsh_completion.py` exercises `./run.sh test zsh-tools` against
 a temporary installation fixture. It proves the shell regression is discovered
@@ -237,6 +239,7 @@ pre/post rc.d loaders. These related cases were fixed together:
 | Owner overrides | Normal mappings, pattern/post-pattern mappings, command/service aliases, file-backed and source-less implementations, empty definitions versus unresolved autoload stubs, explicit outside-runtime autoload pins |
 | Dump cleanup | Active/configured/default paths, HOME/ZDOTDIR globs, independent `.zwc` companions, directories/FIFOs, dangling/directory symlinks, absolute-path preflight for all configuration sources after cd |
 | Shell invocation | Login/non-login and interactive/noninteractive, including redirected stdin; external lookup/replacement bypasses functions and aliases; missing/non-executable interpreters retain dumps and the session |
+| Tool completion dispatch | PATH-only pnpm lookup despite aliases/functions; first and subsequent autoload candidates with caller KSH_ARRAYS; missing/non-executable providers; empty mise responses retain status 1 and allow later completers |
 | Executable regression coverage | Glob and `_pnpmls` syntax errors, all runtime/completion syntax, a test-local variable shadowing Zsh's special `functions` parameter, actual package-runner discovery in CI |
 
 The PR intentionally does not modify `.github/workflows/`; repository policy
