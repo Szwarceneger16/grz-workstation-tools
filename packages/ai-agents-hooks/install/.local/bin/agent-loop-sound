@@ -10,8 +10,10 @@ sound="${2:?sound path required}"
 # 3. 15 sekund
 duration="${AGENT_SOUND_DURATION_SECONDS:-${3:-15}}"
 
-# 80 = inne aplikacje grają na 80% swojej aktualnej głośności.
+# Apply one shared temporary mixing factor, never saved application volume.
 duck_percent="${AGENT_DUCK_PERCENT:-80}"
+script_dir="$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")"
+duck_helper="${script_dir}/../lib/agent-loop-sounds/ducking.py"
 
 # 100 = nasz dźwięk agenta wymuszamy na 100%.
 agent_volume_percent="${AGENT_SOUND_VOLUME_PERCENT:-100}"
@@ -66,93 +68,13 @@ PY
 loop_sound="${cache_dir}/${safe_agent}-${cache_key}-${duration}s.wav"
 
 stop_file="$(mktemp "${runtime_dir}/${safe_agent}.stop.XXXXXX")"
-duck_state="$(mktemp "${runtime_dir}/${safe_agent}.duck.XXXXXX")"
+signal_id="$(basename -- "$stop_file")"
 
 rm -f "$stop_file"
-: > "$duck_state"
 
 player_pid=""
 notify_pid=""
 duck_monitor_pid=""
-
-duck_supported() {
-  command -v pactl >/dev/null 2>&1
-}
-
-restore_ducked_streams() {
-  duck_supported || return 0
-
-  python3 - "$duck_state" <<'PY'
-import re
-import subprocess
-import sys
-
-state_path = sys.argv[1]
-
-entries = []
-seen = set()
-
-try:
-    with open(state_path, "r", encoding="utf-8") as f:
-        for line in f:
-            parts = line.rstrip("\n").split("\t")
-            if len(parts) != 3:
-                continue
-
-            idx, saved_pid, vols = parts
-
-            if idx in seen:
-                continue
-
-            seen.add(idx)
-            entries.append((idx, saved_pid, vols.split()))
-except FileNotFoundError:
-    sys.exit(0)
-
-try:
-    out = subprocess.check_output(
-        ["pactl", "list", "sink-inputs"],
-        text=True,
-        stderr=subprocess.DEVNULL,
-    )
-except Exception:
-    sys.exit(0)
-
-blocks = re.split(r"\n(?=Sink Input #)", out)
-current = {}
-
-for block in blocks:
-    m = re.search(r"Sink Input #(\d+)", block)
-    if not m:
-        continue
-
-    idx = m.group(1)
-
-    pid_match = re.search(r'application\.process\.id = "([^"]+)"', block)
-    proc_pid = pid_match.group(1) if pid_match else ""
-
-    current[idx] = proc_pid
-
-for idx, saved_pid, vols in reversed(entries):
-    if not vols:
-        continue
-
-    if idx not in current:
-        continue
-
-    # Nie przywracaj, jeśli PipeWire/Pulse zdążył użyć tego numeru dla innego procesu.
-    if saved_pid and current.get(idx) != saved_pid:
-        continue
-
-    subprocess.run(
-        ["pactl", "set-sink-input-volume", idx, *vols],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        check=False,
-    )
-PY
-}
-
 cleanup() {
   if [ -n "${duck_monitor_pid:-}" ]; then
     kill "$duck_monitor_pid" >/dev/null 2>&1 || true
@@ -169,9 +91,7 @@ cleanup() {
     wait "$notify_pid" 2>/dev/null || true
   fi
 
-  restore_ducked_streams || true
-
-  rm -f "$stop_file" "$duck_state"
+  rm -f "$stop_file"
 }
 
 trap cleanup EXIT INT TERM
@@ -230,163 +150,41 @@ PY
   mv -f "$tmp_loop" "$loop_sound" 2>/dev/null || true
 fi
 
-find_agent_stream() {
-  duck_supported || return 1
+# Identify this invocation by its private stream tag or exact player PID.
+# Native PipeWire streams may omit the PID from the Pulse-compatible view.
+set_agent_volume() {
+  command -v pactl >/dev/null 2>&1 || return 0
 
-  local pid="$1"
-  local file="$2"
-
-  python3 - "$pid" "$file" <<'PY'
-import os
-import re
+  python3 - "$player_pid" "$agent_volume_percent" "$signal_id" <<'PYCODE'
+import json
 import subprocess
 import sys
 
-agent_pid, agent_file = sys.argv[1:3]
-agent_base = os.path.basename(agent_file)
+player_pid, requested, signal_id = sys.argv[1:4]
+try:
+    volume = max(1, min(150, int(requested)))
+except ValueError:
+    volume = 100
 
 try:
-    out = subprocess.check_output(
-        ["pactl", "list", "sink-inputs"],
-        text=True,
-        stderr=subprocess.DEVNULL,
+    result = subprocess.run(
+        ["pactl", "--format=json", "list", "sink-inputs"],
+        capture_output=True, text=True, timeout=1, check=True,
     )
-except Exception:
-    sys.exit(1)
-
-blocks = re.split(r"\n(?=Sink Input #)", out)
-
-for block in blocks:
-    pid_match = re.search(r'application\.process\.id = "([^"]+)"', block)
-    proc_pid = pid_match.group(1) if pid_match else ""
-
-    if proc_pid == agent_pid:
-        sys.exit(0)
-
-    # Fallback: pw-play bywa widoczny jako pw-cat,
-    # ale często w bloku zostaje nazwa/ścieżka pliku.
-    if agent_base and agent_base in block:
-        sys.exit(0)
-
-    if agent_file and agent_file in block:
-        sys.exit(0)
-
-sys.exit(1)
-PY
-}
-
-duck_other_streams() {
-  duck_supported || return 0
-
-  local agent_pid="$1"
-  local agent_file="$2"
-
-  python3 - "$duck_state" "$duck_percent" "$agent_volume_percent" "$agent_pid" "$agent_file" <<'PY'
-import os
-import re
-import subprocess
-import sys
-
-state_path, duck_percent_s, agent_volume_s, agent_pid, agent_file = sys.argv[1:6]
-agent_base = os.path.basename(agent_file)
-
-try:
-    duck_percent = int(duck_percent_s)
-except Exception:
-    duck_percent = 80
-
-try:
-    agent_volume = int(agent_volume_s)
-except Exception:
-    agent_volume = 100
-
-duck_percent = max(1, min(100, duck_percent))
-agent_volume = max(1, min(150, agent_volume))
-
-saved_indexes = set()
-
-try:
-    with open(state_path, "r", encoding="utf-8") as f:
-        for line in f:
-            idx = line.split("\t", 1)[0].strip()
-            if idx:
-                saved_indexes.add(idx)
-except FileNotFoundError:
-    pass
-
-try:
-    out = subprocess.check_output(
-        ["pactl", "list", "sink-inputs"],
-        text=True,
-        stderr=subprocess.DEVNULL,
-    )
-except Exception:
-    sys.exit(0)
-
-blocks = re.split(r"\n(?=Sink Input #)", out)
-new_state = []
-
-for block in blocks:
-    m = re.search(r"Sink Input #(\d+)", block)
-    if not m:
-        continue
-
-    idx = m.group(1)
-
-    pid_match = re.search(r'application\.process\.id = "([^"]+)"', block)
-    proc_pid = pid_match.group(1) if pid_match else ""
-
-    is_agent_stream = False
-
-    if agent_pid and proc_pid == agent_pid:
-        is_agent_stream = True
-    elif agent_base and agent_base in block:
-        is_agent_stream = True
-    elif agent_file and agent_file in block:
-        is_agent_stream = True
-
-    # Nasz dźwięk: nie duckuj, tylko wymuś pełną głośność.
-    if is_agent_stream:
-        subprocess.run(
-            ["pactl", "set-sink-input-volume", idx, f"{agent_volume}%"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
+    for stream in json.loads(result.stdout):
+        props = stream.get("properties", {})
+        if (str(props.get("application.process.id", "")) != player_pid
+                and props.get("agent.loop-sound.id") != signal_id):
+            continue
+        result = subprocess.run(
+            ["pactl", "set-sink-input-volume", str(int(stream["index"])), f"{volume}%"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=1,
         )
-        continue
-
-    if idx in saved_indexes:
-        continue
-
-    volume_line = None
-    for line in block.splitlines():
-        if line.strip().startswith("Volume:"):
-            volume_line = line
-            break
-
-    if not volume_line:
-        continue
-
-    volumes = [int(x) for x in re.findall(r":\s*(\d+)\s*/", volume_line)]
-
-    if not volumes:
-        continue
-
-    ducked = [max(0, int(v * duck_percent / 100)) for v in volumes]
-
-    subprocess.run(
-        ["pactl", "set-sink-input-volume", idx, *map(str, ducked)],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        check=False,
-    )
-
-    new_state.append(idx + "\t" + proc_pid + "\t" + " ".join(map(str, volumes)) + "\n")
-
-if new_state:
-    with open(state_path, "a", encoding="utf-8") as f:
-        f.writelines(new_state)
-PY
+        sys.exit(0 if result.returncode == 0 else 1)
+except (OSError, ValueError, TypeError, KeyError, AttributeError, subprocess.SubprocessError):
+    pass
+sys.exit(1)
+PYCODE
 }
 
 expire_ms="$(
@@ -427,32 +225,22 @@ PY
 ) &
 notify_pid="$!"
 
-pw-play "$loop_sound" >/dev/null 2>&1 &
+pw-play --media-role Notification --properties "{ application.name = \"agent-loop-sound\" agent.loop-sound.id = \"$signal_id\" state.restore-props = false }" "$loop_sound" >/dev/null 2>&1 &
 player_pid="$!"
 
-# Daj PipeWire chwilę na utworzenie sink-inputu.
-# Ducking odpalamy dopiero gdy umiemy rozpoznać nasz stream,
-# żeby nie przyciszyć własnego dźwięku.
-agent_stream_found=0
-
+# Set this signal's own stream volume once. The shared coordinator below
+# manages temporary software mixing without changing other application sliders.
 for _ in $(seq 1 30); do
-  if find_agent_stream "$player_pid" "$loop_sound"; then
-    agent_stream_found=1
+  kill -0 "$player_pid" >/dev/null 2>&1 || break
+  [ -e "$stop_file" ] && break
+  if set_agent_volume; then
     break
   fi
   sleep 0.05
 done
 
-if [ "$agent_stream_found" -eq 1 ]; then
-  duck_other_streams "$player_pid" "$loop_sound" || true
-
-  (
-    while kill -0 "$player_pid" >/dev/null 2>&1; do
-      [ -e "$stop_file" ] && break
-      duck_other_streams "$player_pid" "$loop_sound" || true
-      sleep 0.25
-    done
-  ) &
+if command -v pw-dump >/dev/null 2>&1 && command -v pw-cli >/dev/null 2>&1; then
+  python3 "$duck_helper" "$runtime_dir" "$$" "$player_pid" "$duck_percent" &
   duck_monitor_pid="$!"
 fi
 

@@ -1,31 +1,25 @@
 # ai-agents-hooks
 
-Dźwiękowe powiadomienia "agent skończył zadanie" dla asystentów CLI (Claude Code, Codex).
-Odtwarzają zapętlony dźwięk przez PipeWire, przyciszają (ducking) pozostałe strumienie audio
-na czas grania i pokazują powiadomienie `notify-send` z akcją **Stop**. Pełny opis: `README.md`.
+Completion sounds for CLI coding assistants (Claude Code and Codex). The package loops
+a WAV through PipeWire, temporarily attenuates other playback in the software mixer,
+and shows a desktop notification with a **Stop** action. See `README.md` for details.
 
-## Zawartość
+## Installed files
 
-- `agent-loop-sound` — silnik: buduje zapętlony WAV o zadanej długości, gra go przez `pw-play`,
-  duckuje inne strumienie przez `pactl`, wyświetla `notify-send` z akcją Stop.
-- `claude-done-sound` — wrapper: `agent-loop-sound "Claude" ~/.local/share/agent-sounds/claude.wav 15`.
-- `codex-done-sound` — wrapper: `agent-loop-sound "Codex" ~/.local/share/agent-sounds/codex.wav 15`.
+- `~/.local/bin/agent-loop-sound` — sound, notification and coordinated ducking engine.
+- `~/.local/bin/{claude-done-sound,codex-done-sound}` — detached agent wrappers.
+- `~/.local/lib/agent-loop-sounds/ducking.py` — shared temporary mixing coordinator.
+- `~/.local/share/agent-sounds/{claude.wav,codex.wav}` — packaged completion sounds.
 
-## Ścieżki po instalacji (stow)
-
-```text
-~/.local/bin/agent-loop-sound
-~/.local/bin/claude-done-sound
-~/.local/bin/codex-done-sound
-~/.local/share/agent-sounds/claude.wav
-~/.local/share/agent-sounds/codex.wav
-```
-
-## Instalacja
+## Installation
 
 ```sh
 ./run.sh install ai-agents-hooks
 ```
 
-Wymaga `~/.local/bin` na `PATH`. Runtime: PipeWire (`pw-play`), `pactl` (opcjonalny ducking),
-`notify-send`, `python3`, `setsid`.
+The source of truth is this package's `install/` tree; `stow/ai-agents-hooks` exposes it
+to the ordinary installer. No service or autostart activation is required.
+
+Requires `~/.local/bin` on `PATH`, PipeWire (`pw-play`), `python3`, `notify-send` and
+`setsid`. `pw-dump` and `pw-cli` provide optional ducking; `pactl` optionally sets only
+the completion sound's own stream volume. Saved application volume sliders are preserved.
