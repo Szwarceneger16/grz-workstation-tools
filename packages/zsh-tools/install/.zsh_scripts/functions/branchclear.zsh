@@ -3,19 +3,50 @@
 
 _branchclear_origin_github_repo() {
   emulate -L zsh
-  local url repo
+  local url repo authority ssh_host='' ssh_port='' resolved_host line
+  local -a ssh_options=()
 
   # Read the declared origin, not "git remote get-url", which expands insteadOf
   # aliases and can hide a GitHub URL mapped to a local test transport.
   url=$(git config --get remote.origin.url 2>/dev/null) || return 1
   case "$url" in
     https://github.com/*) repo="${url#https://github.com/}" ;;
-    git@github.com:*) repo="${url#git@github.com:}" ;;
-    ssh://git@github.com/*) repo="${url#ssh://git@github.com/}" ;;
-    *) return 1 ;;
+    git@*:*)
+      authority="${url#git@}"
+      ssh_host="${authority%%:*}"
+      repo="${authority#*:}"
+      ;;
+    ssh://git@*/*)
+      authority="${url#ssh://git@}"
+      repo="${authority#*/}"
+      authority="${authority%%/*}"
+      ssh_host="${authority%%:*}"
+      if [[ "$authority" == *:* ]]; then
+        ssh_port="${authority#*:}"
+        [[ "$ssh_port" =~ '^[0-9]+$' ]] || return 1
+        ssh_options=(-p "$ssh_port")
+      fi
+      ;;
+    *) print -r -- 'origin is not a supported github.com URL'; return 1 ;;
   esac
   repo="${repo%.git}"
   [[ "$repo" =~ '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$' ]] || return 1
+  if [[ -n "$ssh_host" ]]; then
+    [[ "$ssh_host" =~ '^[A-Za-z0-9][A-Za-z0-9_.-]*$' ]] || return 1
+    # Resolve aliases from the owner's SSH config, never from a github-* name.
+    # -G prints effective configuration without connecting/authenticating.
+    resolved_host=$(command ssh -G -l git "${ssh_options[@]}" "$ssh_host" 2>/dev/null) || {
+      print -r -- 'cannot resolve origin SSH hostname with ssh -G'; return 1
+    }
+    while IFS= read -r line; do
+      [[ "$line" == 'hostname '* ]] || continue
+      resolved_host="${line#hostname }"
+      break
+    done <<< "$resolved_host"
+    if [[ "${(L)resolved_host}" != 'github.com' ]]; then
+      print -r -- 'origin SSH hostname does not resolve to github.com'; return 1
+    fi
+  fi
   print -r -- "$repo"
 }
 
@@ -24,19 +55,26 @@ _branchclear_merged_pr_number() {
   local branch="$1" branch_oid="$2" base_ref="$3" repo="$4" base_branch="$5"
   local rows number head_oid head_repo target_branch head_branch merge_oid fetched_oid
   local owner="${repo%%/*}"
+  local failure='merged PR did not prove local-tip ancestry and merge reachability'
 
-  command -v gh >/dev/null 2>&1 || return 1
+  command -v gh >/dev/null 2>&1 || {
+    print -r -- 'GitHub CLI (gh) is unavailable'; return 1
+  }
 
   # Explicit repository and head owner: never trust a similarly named fork PR.
   # GitHub retains closed PR metadata even after its source branch is deleted.
   rows=$(
-    gh api --method GET --paginate "repos/$repo/pulls" \
+    gh api --hostname github.com --method GET --paginate "repos/$repo/pulls" \
       -f 'state=closed' -f "head=$owner:$branch" \
       -f "base=$base_branch" -f 'per_page=100' \
       --jq '.[] | select(.merged_at != null) | [.number, (.head.sha // "-"), (.head.repo.full_name // "-"), (.base.ref // "-"), (.head.ref // "-"), (.merge_commit_sha // "-")] | @tsv' \
       2>/dev/null
-  ) || return 1
-  [[ -n "$rows" ]] || return 1
+  ) || {
+    print -r -- 'GitHub API request failed (check gh authentication/access)'; return 1
+  }
+  [[ -n "$rows" ]] || {
+    print -r -- 'no merged PR found for this branch and base'; return 1
+  }
 
   while IFS=$'\t' read -r number head_oid head_repo target_branch head_branch merge_oid; do
     [[ "$number" =~ '^[1-9][0-9]*$' ]] || continue
@@ -52,7 +90,10 @@ _branchclear_merged_pr_number() {
     if ! git cat-file -e "${head_oid}^{commit}" 2>/dev/null; then
       # GitHub preserves refs/pull/N/head after merging/deleting the source.
       # FETCH_HEAD must match the API's exact head; never trust a reused name.
-      git fetch --no-tags --quiet origin "refs/pull/$number/head" 2>/dev/null || continue
+      git fetch --no-tags --quiet origin "refs/pull/$number/head" 2>/dev/null || {
+        failure='cannot fetch merged PR head (check origin transport access)'
+        continue
+      }
       fetched_oid=$(git rev-parse --verify -q 'FETCH_HEAD^{commit}' 2>/dev/null) || continue
       [[ "$fetched_oid" == "$head_oid" ]] || continue
     fi
@@ -63,6 +104,7 @@ _branchclear_merged_pr_number() {
       return 0
     fi
   done <<< "$rows"
+  print -r -- "$failure"
   return 1
 }
 
@@ -83,21 +125,20 @@ _branchclear_worktree_for() {
 
 branchclear() {
   emulate -L zsh
-  local mode='safe' base_ref='' base_branch='' github_repo=''
+  local mode='safe' dry_run=0 base_ref='' base_branch='' github_repo='' github_note=''
   local current_branch branch tracking_status upstream_remote branch_ref branch_oid base_tree
   local merge_base_oid merged_tree_oid merge_rc reason note pr_number
   local worktree_dir worktree_status observed_oid inside_worktree
 
-  if (( $# > 1 )); then
-    print -u2 -- 'Usage: branchclear [--force|--help]'
-    return 2
-  fi
-  case "${1-}" in
+  while (( $# )); do
+    case "$1" in
     -h|--help) cmdhelp "${funcstack[1]}"; return $? ;;
     -f|--force) mode='force' ;;
-    '') ;;
-    *) print -u2 -- 'Usage: branchclear [--force|--help]'; return 2 ;;
-  esac
+    -n|--dry-run) dry_run=1 ;;
+    *) print -u2 -- 'Usage: branchclear [--dry-run] [--force|--help]'; return 2 ;;
+    esac
+    shift
+  done
 
   inside_worktree=$(git rev-parse --is-inside-work-tree 2>/dev/null) || inside_worktree=''
   if [[ "$inside_worktree" != 'true' ]]; then
@@ -119,7 +160,10 @@ branchclear() {
   }
   base_branch="${base_ref#origin/}"
   base_tree=$(git rev-parse --verify "$base_ref^{tree}") || return 1
-  github_repo=$(_branchclear_origin_github_repo) || github_repo=''
+  if ! github_repo=$(_branchclear_origin_github_repo); then
+    github_note="${github_repo:-origin URL could not be resolved safely}"
+    github_repo=''
+  fi
 
   while IFS=$'\t' read -r branch tracking_status upstream_remote; do
     [[ "$tracking_status" == '[gone]' ]] || continue
@@ -159,13 +203,19 @@ branchclear() {
         if pr_number=$(_branchclear_merged_pr_number \
           "$branch" "$branch_oid" "$base_ref" "$github_repo" "$base_branch"); then
           reason="verified merged GitHub PR #$pr_number"
+        else
+          note+="; $pr_number"
         fi
+      elif [[ -z "$reason" && "$upstream_remote" != 'origin' ]]; then
+        note+='; PR verification requires an origin upstream'
+      elif [[ -z "$reason" ]]; then
+        note+="; $github_note"
       fi
     fi
 
     if [[ -z "$reason" ]]; then
       [[ -n "$note" ]] || note='not provably merged'
-      print -r -- "Skipping '$branch': $note; no verified merged PR (requires authenticated gh for GitHub origins)."
+      print -r -- "Skipping '$branch': $note."
       continue
     fi
 
@@ -186,6 +236,12 @@ branchclear() {
     observed_oid=$(git rev-parse --verify -q "$branch_ref^{commit}") || observed_oid=''
     if [[ "$observed_oid" != "$branch_oid" ]]; then
       print -r -- "Skipping '$branch': branch tip changed during verification."
+      continue
+    fi
+
+    if (( dry_run )); then
+      print -r -- "Would delete '$branch' ($reason)."
+      [[ -z "$worktree_dir" ]] || print -r -- "Would remove linked worktree: $worktree_dir."
       continue
     fi
 

@@ -36,6 +36,9 @@ class BranchclearTests(unittest.TestCase):
             "GH_PROMPT_DISABLED": "1",
             "GH_TEST_ROWS": "",
             "GH_TEST_FAIL": "0",
+            "GH_TEST_CALL_LOG": str(self.root / "gh-calls"),
+            "SSH_TEST_HOST": "github.com",
+            "SSH_TEST_FAIL": "0",
             "PATH": str(fakebin) + os.pathsep + os.environ["PATH"],
         }
         self.git("init", "-q", "-b", "main", str(self.seed), cwd=self.root)
@@ -58,14 +61,24 @@ class BranchclearTests(unittest.TestCase):
         gh.write_text(
             "#!/bin/sh\n"
             '[ "$1" = api ] || exit 20\n'
+            '[ "$2" = --hostname ] && [ "$3" = github.com ] || exit 23\n'
             'case "$*" in\n'
             '  *"repos/test-owner/branchclear-test/pulls"*) ;;\n'
             "  *) exit 21 ;;\n"
             "esac\n"
+            'printf "%s\\n" "$*" >> "$GH_TEST_CALL_LOG"\n'
             '[ "$GH_TEST_FAIL" = 1 ] && exit 22\n'
             'printf "%s\\n" "$GH_TEST_ROWS"\n'
         )
         gh.chmod(0o755)
+        ssh = fakebin / "ssh"
+        ssh.write_text(
+            "#!/bin/sh\n"
+            '[ "$1" = -G ] || exit 30\n'
+            '[ "$SSH_TEST_FAIL" = 1 ] && exit 31\n'
+            'printf "hostname %s\\n" "$SSH_TEST_HOST"\n'
+        )
+        ssh.chmod(0o755)
 
     def git(self, *args, cwd=None, check=True):
         result = subprocess.run(
@@ -135,6 +148,83 @@ class BranchclearTests(unittest.TestCase):
         self.assertIn("verified merged GitHub PR #76", self.invoke())
         self.assertFalse(self.exists(branch))
 
+    def alias_origin(self, url):
+        self.git("remote", "set-url", "origin", url)
+        self.git("config", f"url.file://{self.bare}.insteadOf", url)
+
+    def test_ssh_alias_resolved_by_config_supports_squash_cleanup(self):
+        branch, *_ = self.squash()
+        self.alias_origin(f"git@github-personal:{REPO}.git")
+        self.assertIn("verified merged GitHub PR #76", self.invoke())
+        self.assertFalse(self.exists(branch))
+
+    def test_ssh_url_alias_with_port_supports_squash_cleanup(self):
+        branch, *_ = self.squash()
+        self.alias_origin(f"ssh://git@personal:2222/{REPO}.git")
+        self.assertIn("verified merged GitHub PR #76", self.invoke())
+        self.assertFalse(self.exists(branch))
+
+    def test_github_like_alias_to_foreign_host_is_rejected_without_api(self):
+        branch, *_ = self.squash()
+        self.alias_origin(f"git@github-personal:{REPO}.git")
+        self.env["SSH_TEST_HOST"] = "attacker.example.invalid"
+        self.assertIn("does not resolve to github.com", self.invoke())
+        self.assertTrue(self.exists(branch))
+        self.assertFalse((self.root / "gh-calls").exists())
+
+    def test_ssh_config_failure_preserves_branch_without_api(self):
+        branch, *_ = self.squash()
+        self.alias_origin(f"git@personal:{REPO}.git")
+        self.env["SSH_TEST_FAIL"] = "1"
+        self.assertIn("cannot resolve origin SSH hostname", self.invoke())
+        self.assertTrue(self.exists(branch))
+        self.assertFalse((self.root / "gh-calls").exists())
+
+    def test_api_is_pinned_to_github_com_despite_gh_host(self):
+        branch, *_ = self.squash()
+        self.env["GH_HOST"] = "attacker.example.invalid"
+        self.assertIn("verified merged GitHub PR #76", self.invoke())
+        self.assertFalse(self.exists(branch))
+
+    def test_successful_api_with_no_merged_pr_is_not_an_auth_error(self):
+        branch, *_ = self.squash()
+        self.env["GH_TEST_ROWS"] = ""
+        output = self.invoke()
+        self.assertIn("no merged PR found", output)
+        self.assertNotIn("authentication", output)
+        self.assertTrue(self.exists(branch))
+
+    def test_dry_run_preserves_branch_and_clean_worktree(self):
+        branch, *_ = self.squash()
+        linked = self.root / "linked"
+        self.git("worktree", "add", "-q", str(linked), branch)
+        output = self.invoke("--dry-run")
+        self.assertIn("Would delete", output)
+        self.assertIn("Would remove linked worktree", output)
+        self.assertTrue(self.exists(branch))
+        self.assertTrue(linked.exists())
+
+    def test_force_dry_run_preserves_unmerged_commits_and_dirty_files(self):
+        branch, *_ = self.squash()
+        linked = self.root / "linked"
+        self.git("worktree", "add", "-q", str(linked), branch)
+        (linked / "important.txt").write_text("important\n")
+        self.env["GH_TEST_FAIL"] = "1"
+        self.assertIn("Would delete", self.invoke("--force", "--dry-run"))
+        self.assertTrue(self.exists(branch))
+        self.assertEqual((linked / "important.txt").read_text(), "important\n")
+
+    def test_ignored_worktree_files_remain_protected(self):
+        branch, *_ = self.squash()
+        linked = self.root / "linked"
+        self.git("worktree", "add", "-q", str(linked), branch)
+        self.git("config", "core.excludesFile", str(self.root / "ignore"))
+        (self.root / "ignore").write_text("audit.log\n")
+        (linked / "audit.log").write_text("local evidence\n")
+        self.assertIn("untracked/ignored files", self.invoke())
+        self.assertTrue(self.exists(branch))
+        self.assertEqual((linked / "audit.log").read_text(), "local evidence\n")
+
     def test_fetches_pr_head_if_local_object_was_pruned(self):
         branch, _, head, _ = self.squash("codex/head-fetched-from-pr")
         self.git("reflog", "expire", "--expire=now", "--all")
@@ -154,6 +244,18 @@ class BranchclearTests(unittest.TestCase):
         self.assertIn("Skipping", self.invoke())
         self.assertTrue(self.exists(branch))
 
+    def test_inaccessible_pr_ref_is_reported_as_transport_failure(self):
+        branch, _, head, _ = self.squash()
+        self.git("reflog", "expire", "--expire=now", "--all")
+        self.git("gc", "--prune=now")
+        self.assertNotEqual(
+            self.git("cat-file", "-e", f"{head}^{{commit}}", check=False).returncode, 0,
+        )
+        self.git("update-ref", "-d", "refs/pull/76/head", cwd=self.bare)
+        output = self.invoke()
+        self.assertIn("cannot fetch merged PR head", output)
+        self.assertTrue(self.exists(branch))
+
     def test_foreign_head_and_invalid_merge_are_rejected(self):
         branch, _, head, merged = self.squash()
         valid = self.env["GH_TEST_ROWS"]
@@ -170,7 +272,9 @@ class BranchclearTests(unittest.TestCase):
         linked = self.root / "linked"
         self.git("worktree", "add", "-q", str(linked), branch)
         self.env["GH_TEST_FAIL"] = "1"
-        self.assertIn("merge conflicts", self.invoke())
+        output = self.invoke()
+        self.assertIn("merge conflicts", output)
+        self.assertIn("GitHub API request failed", output)
         self.assertTrue(linked.is_dir())
         self.assertTrue(self.exists(branch))
 

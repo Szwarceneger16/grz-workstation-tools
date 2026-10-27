@@ -3,6 +3,7 @@
 _branchclear() {
   _arguments \
     '(-h --help)'{-h,--help}'[pokaż help]' \
+    '(-n --dry-run)'{-n,--dry-run}'[preview cleanup without deleting branches or worktrees]' \
     '(-f --force)'{-f,--force}'[force remove worktree jeśli potrzebne]'
 }
 
