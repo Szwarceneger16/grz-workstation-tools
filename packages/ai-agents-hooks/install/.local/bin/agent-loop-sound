@@ -74,13 +74,7 @@ rm -f "$stop_file"
 
 player_pid=""
 notify_pid=""
-duck_monitor_pid=""
 cleanup() {
-  if [ -n "${duck_monitor_pid:-}" ]; then
-    kill "$duck_monitor_pid" >/dev/null 2>&1 || true
-    wait "$duck_monitor_pid" 2>/dev/null || true
-  fi
-
   if [ -n "${player_pid:-}" ]; then
     kill "$player_pid" >/dev/null 2>&1 || true
     wait "$player_pid" 2>/dev/null || true
@@ -239,9 +233,9 @@ for _ in $(seq 1 30); do
   sleep 0.05
 done
 
-if command -v pw-dump >/dev/null 2>&1 && command -v pw-cli >/dev/null 2>&1; then
-  python3 "$duck_helper" "$runtime_dir" "$$" "$player_pid" "$duck_percent" &
-  duck_monitor_pid="$!"
+if command -v pw-dump >/dev/null 2>&1 && command -v pw-cli >/dev/null 2>&1 &&
+   command -v systemd-run >/dev/null 2>&1; then
+  python3 "$duck_helper" "$runtime_dir" "$$" "$player_pid" "$duck_percent" "$duration"
 fi
 
 while kill -0 "$player_pid" >/dev/null 2>&1; do

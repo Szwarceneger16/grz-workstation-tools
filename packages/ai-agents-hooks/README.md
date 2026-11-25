@@ -31,7 +31,8 @@ Installed paths:
 ## Dependencies
 
 - **PipeWire** (`pw-play`) — required for playback.
-- `pw-dump` and `pw-cli` — optional; enable temporary PipeWire software ducking.
+- `pw-dump`, `pw-cli` and a working `systemd-run --user` — optional; enable supervised
+  temporary PipeWire software ducking.
 - `pactl` — optional; sets only the completion sound's own stream volume.
 - `notify-send` — desktop notification with the Stop action.
 - `python3` — WAV loop generation and stream bookkeeping.
@@ -70,19 +71,24 @@ The helper picks up new streams, slider changes and mute changes every 200 ms. I
 the latest channel values rather than an old snapshot. The effective ducking corresponds
 to the former Pulse percentage; the temporary linear mixing factor is `(percent/100)^3`.
 
-The helper checks the PipeWire server generation and object serial before mutations,
-and preserves a competing software mixer's observed changes. Intent is saved before a
-write. SIGTERM, Stop, normal completion and a dead parent/player release the invocation;
-a later invocation can recover journaled temporary mixing after a helper crash. A complete
-SIGKILL of all related processes cannot run immediate cleanup; the next invocation recovers
-that state. A restarted server invalidates the old node identities. Command failures keep
-pending recovery in the journal. Without the PipeWire tools, playback and notifications
-continue without ducking; there is no fallback that changes application sliders.
+The watcher runs in a transient service managed by the user's systemd, separate from
+the notification and player. Stop, normal completion, process exit and the playback
+deadline release that notification's request. If the watcher is killed, systemd
+restarts it with the original process identities. It retries restoration after
+temporary audio errors even after the notification has ended.
+
+Before changing a stream, the watcher journals its last confirmed software mix and the
+proposed values. A restarted watcher can recover either side of an interrupted write.
+It checks the PipeWire server generation and stream serial and respects changes by
+another mixer. Restarting PipeWire or the computer discards the old temporary mix.
+If the PipeWire tools or user service manager are unavailable, the sound plays at the
+existing mix.
 
 The source is `packages/ai-agents-hooks/install/.local/bin/agent-loop-sound`; its helper is
 installed from `packages/ai-agents-hooks/install/.local/lib/agent-loop-sounds/ducking.py`.
 Existing Stow symlinks use updated source immediately. Ordinary installation still uses
-`./run.sh install ai-agents-hooks`; no new service or autostart is required. To roll back,
+`./run.sh install ai-agents-hooks`. The watcher starts on demand with each notification.
+To roll back,
 restore both source files to the previous revision after currently playing signals finish.
 
 ## Validation
