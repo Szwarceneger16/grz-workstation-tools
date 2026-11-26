@@ -53,7 +53,12 @@ def nodes_from_dump(raw):
         props = info.get("props", {})
         params = info.get("params", {}).get("Props", [])
         if (props.get("media.class") != "Stream/Output/Audio"
-                or "object.serial" not in props or not params):
+                or "object.serial" not in props):
+            continue
+        serial = str(props["object.serial"])
+        # A known stream may briefly report no usable mixer properties.
+        nodes[serial] = None
+        if not params:
             continue
         values = params[0]
         channels = values.get("channelVolumes", [])
@@ -62,7 +67,7 @@ def nodes_from_dump(raw):
                 or not all(isinstance(v, (int, float)) and math.isfinite(v) and v >= 0
                            for v in channels + soft)):
             continue
-        nodes[str(props["object.serial"])] = {
+        nodes[serial] = {
             "id": obj["id"], "serial": props["object.serial"],
             "channels": channels, "soft": soft,
             "mute": values.get("mute", False),
@@ -112,7 +117,8 @@ class Coordinator:
 
     @staticmethod
     def owner_alive(owner):
-        return (birth(owner["parent"]) == owner["parent_birth"]
+        return (time.monotonic() < owner.get("deadline", math.inf)
+                and birth(owner["parent"]) == owner["parent_birth"]
                 and birth(owner["player"]) == owner["player_birth"])
 
     @contextlib.contextmanager
@@ -166,6 +172,12 @@ class Coordinator:
                 state["owners"][owner_id] = owner
             else:
                 state["owners"].pop(owner_id, None)
+            active = bool(state["owners"])
+            if not active:
+                state["nodes"] = {key: record for key, record in state["nodes"].items()
+                                  if not record["released"]}
+                if all(record.get("idle") for record in state["nodes"].values()):
+                    return False, False
             generation, nodes = self.audio.snapshot()
             if generation is None:
                 raise ValueError("missing PipeWire server identity")
@@ -173,7 +185,6 @@ class Coordinator:
                 # Serial numbers from a previous server are never authority.
                 state["nodes"] = {}
                 state["generation"] = generation
-            active = bool(state["owners"])
             percent = min((o["percent"] for o in state["owners"].values()), default=100)
             # Pulse volume percentages are cubic; preserve the former audible
             # attenuation while keeping its stored/UI channelVolumes untouched.
@@ -182,7 +193,7 @@ class Coordinator:
                 if serial not in nodes:
                     del state["nodes"][serial]
             for serial, node in nodes.items():
-                if node["signal"]:
+                if node is None or node["signal"]:
                     continue
                 record = state["nodes"].get(serial)
                 if record is None:
@@ -198,35 +209,45 @@ class Coordinator:
                     state["nodes"][serial] = record
                 if record["released"]:
                     continue
+                if not active and record.get("idle"):
+                    continue
+                pending = record.get("pending")
+                if (pending is not None and same(node["soft"], pending["volumes"])
+                        and node["soft_mute"] == pending["mute"]):
+                    # The write landed before its verification or journal update.
+                    record.update(expected=pending["volumes"], expected_mute=pending["mute"])
+                    del record["pending"]
+                    pending = None
                 if (not same(node["soft"], record["expected"])
                         or node["soft_mute"] != record["expected_mute"]):
                     # Another software mixer took ownership: do not undo it.
-                    record["released"] = True
+                    if active:
+                        record["released"] = True
+                    else:
+                        del state["nodes"][serial]
                     continue
-                if active:
-                    record["idle"] = False
+                record["idle"] = False
                 desired = [value * factor for value in node["channels"]]
-                if not same(desired, node["soft"]) or node["soft_mute"] != node["mute"]:
-                    previous = dict(record)
-                    record["expected"] = desired
-                    record["expected_mute"] = node["mute"]
-                    # Journal intent before the audio write, for crash recovery.
+                if (pending is not None or not same(desired, node["soft"])
+                        or node["soft_mute"] != node["mute"]):
+                    # Keep both the last confirmed value and the proposed write
+                    # until a fresh observation can resolve an interrupted call.
+                    record["pending"] = {"volumes": desired, "mute": node["mute"]}
                     self.save(state)
                     if not self.audio.set_soft(generation, node, desired, node["mute"]):
-                        record.update(previous)
-                if not active and same(record["expected"], node["channels"]):
+                        continue
+                    record.update(expected=desired, expected_mute=node["mute"])
+                    del record["pending"]
+                if not active:
                     # Keep provenance of our restored software parameters. A
                     # later user slider update clears PipeWire's software override
                     # but leaves these parameter values visible in Props.
                     record["idle"] = True
-            if not active:
-                state["nodes"] = {key: item for key, item in state["nodes"].items()
-                                  if not item["released"]}
-            return active, any(not record.get("idle", False) for record in state["nodes"].values())
+            return active, any(not record.get("idle") and not record["released"]
+                               for record in state["nodes"].values())
 
 
-def main():
-    directory, parent_s, player_s, percent_s = sys.argv[1:5]
+def launch(directory, parent_s, player_s, percent_s, duration_s=None):
     parent, player = int(parent_s), int(player_s)
     try:
         percent = max(1, min(100, int(percent_s)))
@@ -236,7 +257,33 @@ def main():
              "player_birth": birth(player), "percent": percent}
     if owner["parent_birth"] is None or owner["player_birth"] is None:
         return
-    owner_id = f"{parent}:{owner['parent_birth']}:{player}:{owner['player_birth']}"
+    if duration_s is not None:
+        duration = float(duration_s)
+        if not math.isfinite(duration) or duration <= 0:
+            return
+        # Release a player that has stopped making progress before it exits.
+        owner["deadline"] = time.monotonic() + duration + 2
+    environment = [f"--setenv={name}={os.environ[name]}" for name in (
+        "XDG_RUNTIME_DIR", "PIPEWIRE_RUNTIME_DIR", "PIPEWIRE_REMOTE", "PIPEWIRE_CONFIG_DIR",
+    ) if name in os.environ]
+    try:
+        subprocess.run(
+            ["systemd-run", "--user", "--quiet", "--collect", "--no-ask-password",
+             "--expand-environment=no", "--property=Type=exec",
+             "--property=Restart=on-failure", "--property=RestartSec=500ms",
+             "--property=StartLimitIntervalSec=0", *environment, "--",
+             sys.executable, "-B", str(Path(__file__).resolve()), "--watch",
+             os.path.abspath(directory), json.dumps(owner, allow_nan=False)],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            check=True, timeout=4,
+        )
+    except (OSError, subprocess.SubprocessError):
+        # Without a supervised owner, play the notification without attenuation.
+        pass
+
+
+def watch(directory, owner):
+    owner_id = f"{owner['parent']}:{owner['parent_birth']}:{owner['player']}:{owner['player_birth']}"
     coordinator = Coordinator(directory)
     stopping = False
 
@@ -246,21 +293,24 @@ def main():
 
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
-    try:
-        while not stopping and coordinator.owner_alive(owner):
-            coordinator.step(owner_id, owner)
-            time.sleep(0.2)
-    finally:
-        # Retry temporary server/command errors on release without hanging the hook.
-        for attempt in range(5):
-            try:
-                active, pending = coordinator.step(owner_id)
-                if active or not pending:
-                    break
-            except (OSError, ValueError, subprocess.SubprocessError):
-                if attempt == 4:
-                    print("agent-loop-sound: temporary mixing recovery pending", file=sys.stderr)
-            time.sleep(0.2)
+    signal.signal(signal.SIGHUP, stop)
+    while True:
+        listening = not stopping and coordinator.owner_alive(owner)
+        try:
+            active, pending = coordinator.step(owner_id, owner if listening else None)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            time.sleep(0.5)
+            continue
+        if not listening and (active or not pending):
+            return
+        time.sleep(0.2 if listening else 0.5)
+
+
+def main():
+    if sys.argv[1:2] == ["--watch"]:
+        watch(sys.argv[2], json.loads(sys.argv[3]))
+    else:
+        launch(*sys.argv[1:])
 
 
 if __name__ == "__main__":

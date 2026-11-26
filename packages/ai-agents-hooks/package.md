@@ -21,5 +21,7 @@ The source of truth is this package's `install/` tree; `stow/ai-agents-hooks` ex
 to the ordinary installer. No service or autostart activation is required.
 
 Requires `~/.local/bin` on `PATH`, PipeWire (`pw-play`), `python3`, `notify-send` and
-`setsid`. `pw-dump` and `pw-cli` provide optional ducking; `pactl` optionally sets only
-the completion sound's own stream volume. Saved application volume sliders are preserved.
+`setsid`. A working `systemd-run --user`, `pw-dump` and `pw-cli` provide optional
+ducking with automatic restoration after notification or watcher failure.
+`pactl` optionally sets only the completion sound's own stream volume. Saved
+application volume sliders are preserved.
