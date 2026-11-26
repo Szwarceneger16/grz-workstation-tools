@@ -40,5 +40,11 @@
     "category": "secret-word",
     "sha256": "37dbf40428fd643ca2ab854db10d0467a917ae5515ae5442a16e20f0dfda7bb8",
     "reason": "Reviewed f-string references to disposable signing-key paths generated for cryptographic regression tests."
+  },
+  {
+    "path": "packages/ai-agents-hooks/install/.local/lib/agent-loop-sounds/ducking.py",
+    "category": "secret-word",
+    "sha256": "1526257465819014f36b9d7bcc7af9d098acedb601ca1bcf71942e0e2eaa6b5e",
+    "reason": "Standard systemd-run option disabling interactive authorization for a transient user service."
   }
 ]
