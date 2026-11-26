@@ -17,3 +17,6 @@ Squash-aware branch cleanup and linked-worktree preservation are tested in
 repositories with a stubbed GitHub CLI; CI discovers them alongside other
 `test_runner_*.py` suites. Use `python3 -m unittest tests/test_runner_branchclear.py -v`
 from the repository root with Zsh available, or run the normal CI suite.
+
+Opt-in shared Codex App Server environment propagation is documented in
+[`docs/codex-shared-shell.md`](../../docs/codex-shared-shell.md).
