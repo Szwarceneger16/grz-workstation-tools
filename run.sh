@@ -504,7 +504,10 @@ systemd_directive_value() {
             ((expected == "Timer" || expected == "Path") && key == "Unit")) {
           if (++seen[key] > 1 || joined) { bad = 1; return }
           values[key] = trim(substr(value, position + 1))
-          if (key == "Accept" && tolower(values[key]) !~ /^(|1|yes|y|true|t|on|0|no|n|false|f|off)$/)
+          # An empty alternative misanchors some mawk regexes. Handle the
+          # empty/reset value separately and anchor every nonempty boolean.
+          if (key == "Accept" && values[key] != "" &&
+              tolower(values[key]) !~ /^(1|yes|y|true|t|on|0|no|n|false|f|off)$/)
             bad = 1
         }
       }
